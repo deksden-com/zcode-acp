@@ -35,6 +35,8 @@ export interface ToolCallNewEvent {
    * the final status via out-of-band `session.updated` events.
    */
   background?: boolean;
+  /** Trusted native runtime identity carried by mirrored ZCode child events. */
+  runtimeMeta?: Record<string, unknown>;
 }
 
 export interface ToolCallUpdateEvent {
@@ -55,6 +57,8 @@ export interface ToolCallUpdateEvent {
    * `tool.updated { kind:"result" }` omits the input.
    */
   background?: boolean;
+  /** Trusted native runtime identity carried by mirrored ZCode child events. */
+  runtimeMeta?: Record<string, unknown>;
 }
 
 export interface UsageDeltaEvent {

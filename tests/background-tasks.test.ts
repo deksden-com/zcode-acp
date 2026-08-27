@@ -60,7 +60,10 @@ describe("BackgroundTaskListener", () => {
         status: "running",
         description: "research src/",
         outputPath: "/tmp/out.txt",
-        terminalId: "agent_abc",
+        terminalId: "agent_fallback",
+        agentId: "agent_abc",
+        childSessionId: "sess_child",
+        parentToolCallId: "call_orig",
       }),
     );
     // notifyByZcodeSid is async; flush microtasks.
@@ -76,6 +79,8 @@ describe("BackgroundTaskListener", () => {
     const meta = update["_meta"] as { backgroundTask: Record<string, unknown> };
     expect(meta.backgroundTask.taskId).toBe("agent_abc");
     expect(meta.backgroundTask.agentId).toBe("agent_abc");
+    expect(meta.backgroundTask.childSessionId).toBe("sess_child");
+    expect(meta.backgroundTask.parentToolCallId).toBe("call_orig");
     expect(meta.backgroundTask.outputPath).toBe("/tmp/out.txt");
   });
 

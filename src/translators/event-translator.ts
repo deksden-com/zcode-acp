@@ -154,8 +154,7 @@ export class EventTranslator {
     const mode = (patch["mode"] as Record<string, unknown> | undefined)?.current;
     if (typeof mode === "string") ev.mode = mode;
     const model = (patch["model"] as Record<string, unknown> | undefined)?.current as
-      | Record<string, unknown>
-      | undefined;
+      Record<string, unknown> | undefined;
     if (model && typeof model["providerId"] === "string" && typeof model["modelId"] === "string") {
       ev.model = { providerId: model["providerId"], modelId: model["modelId"] };
     }
@@ -194,6 +193,7 @@ export class EventTranslator {
     const tkind = (payload["kind"] as string) ?? "";
     const callId = (payload["toolCallId"] as string) ?? "";
     let toolName = (payload["toolName"] as string) ?? "";
+    const runtimeMeta = zcodeRuntimeMeta(payload);
 
     if (tkind === "scheduled") {
       if (callId && !this.seenToolIds.has(callId)) {
@@ -222,6 +222,7 @@ export class EventTranslator {
           status: "pending",
           title,
           ...(isBackground ? { background: true } : {}),
+          ...(runtimeMeta ? { runtimeMeta } : {}),
         };
         if (inp !== undefined) (newEv as { input?: unknown }).input = inp;
         const locs = extractLocations(toolName, inp);
@@ -230,7 +231,12 @@ export class EventTranslator {
       }
     } else if (tkind === "started") {
       if (callId) {
-        results.push({ kind: "ToolCallUpdate", callId, status: "in_progress" });
+        results.push({
+          kind: "ToolCallUpdate",
+          callId,
+          status: "in_progress",
+          ...(runtimeMeta ? { runtimeMeta } : {}),
+        });
       }
     } else if (tkind === "progress") {
       if (callId) {
@@ -243,6 +249,7 @@ export class EventTranslator {
           status: "in_progress",
           output: renderToolOutput(output),
           rawOutput: output,
+          ...(runtimeMeta ? { runtimeMeta } : {}),
         });
       }
     } else if (tkind === "result") {
@@ -257,6 +264,7 @@ export class EventTranslator {
           output: renderToolOutput(resultPayload),
           rawResult: resultPayload,
           ...(this.backgroundCallIds.has(callId) ? { background: true } : {}),
+          ...(runtimeMeta ? { runtimeMeta } : {}),
         };
         // Bash content handled by the terminal path in dispatch; skip here.
         if (tn !== "Bash" && tn !== "bash") {
@@ -277,6 +285,7 @@ export class EventTranslator {
           status: "failed",
           output: renderToolOutput(errPayload),
           ...(this.backgroundCallIds.has(callId) ? { background: true } : {}),
+          ...(runtimeMeta ? { runtimeMeta } : {}),
         };
         const content = buildResultContent(tn, errPayload, true);
         if (content.length > 0) (ev as { content?: typeof content }).content = content;
@@ -308,4 +317,12 @@ export class EventTranslator {
     const size = (usage["contextWindow"] as number) || 0;
     return [{ kind: "UsageDelta", used, size }];
   }
+}
+
+function zcodeRuntimeMeta(payload: Record<string, unknown>): Record<string, unknown> | null {
+  const keys = ["source", "childSessionId", "agentId", "parentToolCallId", "taskId"];
+  const meta = Object.fromEntries(
+    keys.flatMap((key) => (payload[key] === undefined ? [] : [[key, payload[key]]])),
+  );
+  return Object.keys(meta).length > 0 ? meta : null;
 }

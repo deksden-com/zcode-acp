@@ -49,6 +49,38 @@ interface ExtensionParams {
 
 type Result = Record<string, unknown>;
 
+/** Resolve a lazy ACP locator to the native ZCode Session identity. */
+export async function resolveSession(
+  server: ZcodeAcpServer,
+  params: ExtensionParams,
+): Promise<Result> {
+  const providerSessionId = await resolveSidOrThrow(server, params);
+  return { adapterSessionId: params.sessionId, providerSessionId };
+}
+
+async function inspectSession(
+  server: ZcodeAcpServer,
+  params: ExtensionParams,
+  method: "session/read" | "session/subagents" | "session/usage" | "session/events",
+): Promise<Result> {
+  const zcodeSid = await resolveSidOrThrow(server, params);
+  const { sessionId: _adapterSessionId, ...options } = params;
+  const resp = await server
+    .ensureBackend()
+    .request(server.nextId(), method, { ...options, sessionId: zcodeSid }, 15000);
+  if (resp.error) throw new Error(`${method} failed: ${resp.error.message}`);
+  return (resp.result ?? {}) as Result;
+}
+
+export const readSession = (server: ZcodeAcpServer, params: ExtensionParams) =>
+  inspectSession(server, params, "session/read");
+export const subagents = (server: ZcodeAcpServer, params: ExtensionParams) =>
+  inspectSession(server, params, "session/subagents");
+export const usage = (server: ZcodeAcpServer, params: ExtensionParams) =>
+  inspectSession(server, params, "session/usage");
+export const events = (server: ZcodeAcpServer, params: ExtensionParams) =>
+  inspectSession(server, params, "session/events");
+
 /** session/fork → zcode session/fork: branch a new session from a checkpoint. */
 export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
   const zcodeSid = await resolveSidOrThrow(server, params);

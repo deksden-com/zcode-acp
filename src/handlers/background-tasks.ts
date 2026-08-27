@@ -54,6 +54,9 @@ interface TaskStatusPayload {
   pid?: number;
   startedAt?: string;
   completedAt?: string;
+  childSessionId?: string;
+  agentId?: string;
+  parentToolCallId?: string;
 }
 
 /** Tracked background task → the ACP tool_call_id we address its updates with. */
@@ -221,7 +224,9 @@ export class BackgroundTaskListener implements EventListener {
       const meta: Record<string, unknown> = {
         backgroundTask: {
           taskId,
-          agentId: p.terminalId ?? undefined,
+          agentId: p.agentId ?? p.terminalId ?? undefined,
+          childSessionId: p.childSessionId ?? undefined,
+          parentToolCallId: p.parentToolCallId ?? p.toolCallId ?? undefined,
           outputPath: p.outputPath ?? undefined,
           sourceToolCallId: p.toolCallId ?? undefined,
         },
@@ -259,7 +264,12 @@ export class BackgroundTaskListener implements EventListener {
     if (task.lastStatus === acpStatus && !task.reusesLaunchCard) return;
 
     const meta: Record<string, unknown> = {
-      backgroundTask: { taskId: p.taskId },
+      backgroundTask: {
+        taskId: p.taskId,
+        agentId: p.agentId ?? p.terminalId ?? undefined,
+        childSessionId: p.childSessionId ?? undefined,
+        parentToolCallId: p.parentToolCallId ?? p.toolCallId ?? undefined,
+      },
     };
     if (p.outputPath) (meta.backgroundTask as Record<string, unknown>)["outputPath"] = p.outputPath;
 

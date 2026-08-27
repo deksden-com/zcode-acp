@@ -30,12 +30,17 @@ import {
 import {
   cancelBackgroundTask,
   compact,
+  events,
   fork,
   goal,
+  readSession,
+  resolveSession,
   setMode,
   setModel,
   setThoughtLevel,
+  subagents,
   updateRuntimeModelConfig,
+  usage,
 } from "./handlers/extensions.js";
 import { echoUserPromptToOthers, sendAvailableCommandsDeferred } from "./handlers/io.js";
 import { loadEarlier } from "./handlers/replay.js";
@@ -224,6 +229,11 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       // zcode app-server 0.16+ (steer/rewind moved to the v4 conversation API);
       // the bridge dropped its passthroughs accordingly.
       .onRequest("session/fork", extParams, (ctx) => fork(server, ctx.params))
+      .onRequest("zcode/session/resolve", extParams, (ctx) => resolveSession(server, ctx.params))
+      .onRequest("zcode/session/read", extParams, (ctx) => readSession(server, ctx.params))
+      .onRequest("zcode/session/subagents", extParams, (ctx) => subagents(server, ctx.params))
+      .onRequest("zcode/session/usage", extParams, (ctx) => usage(server, ctx.params))
+      .onRequest("zcode/session/events", extParams, (ctx) => events(server, ctx.params))
       .onRequest("session/goal", extParams, (ctx) => goal(server, ctx.params))
       .onRequest("session/compact", extParams, (ctx) =>
         compact(server, ctx.params, server.clients.broadcast()),

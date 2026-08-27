@@ -183,6 +183,7 @@ function dispatchToolCallNew(
   const termSupported =
     server.supportsTerminalOutput() && (ev.tool === "Bash" || ev.tool === "bash");
   const meta: Record<string, unknown> = { claudeCode: { toolName: ev.tool } };
+  if (ev.runtimeMeta) meta["zcodeRuntime"] = ev.runtimeMeta;
   if (termSupported) meta["terminal_info"] = { terminal_id: ev.callId };
   // Mark sub-agent dispatch cards so editors can badge them from creation.
   if (ev.tool === "Agent" || ev.tool === "Task") meta["subagent"] = true;
@@ -240,6 +241,7 @@ function dispatchToolCallUpdate(
   };
   const meta: Record<string, unknown> = {};
   if (toolName) meta["claudeCode"] = { toolName };
+  if (ev.runtimeMeta) meta["zcodeRuntime"] = ev.runtimeMeta;
   // Sub-agent (Agent/Task tool) result: surface structured metadata so editors
   // can badge the card (agentId, background flag, token/tool/time usage). The
   // raw result text is left in `content` for the user-facing view.

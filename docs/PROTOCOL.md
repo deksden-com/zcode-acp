@@ -699,6 +699,24 @@ plan decline.
 
 ## Extension Methods (0.14.8+)
 
+### Harness inspection
+
+Controlled headless clients can resolve the lazy ACP locator and read native
+session evidence without reaching around the bridge:
+
+| Method | Result |
+| --- | --- |
+| `zcode/session/resolve` | `{ adapterSessionId, providerSessionId }` |
+| `zcode/session/read` | native `session/read` result |
+| `zcode/session/subagents` | native root/child topology |
+| `zcode/session/usage` | native usage result |
+| `zcode/session/events` | native event slice |
+
+All accept `sessionId`; inspection methods forward any additional native
+options. Tool call notifications also preserve `source`, `childSessionId`,
+`agentId`, `parentToolCallId`, and `taskId` under `_meta.zcodeRuntime` when the
+app-server supplies them.
+
 ### `session/fork`
 
 Fork a new session from a checkpoint.

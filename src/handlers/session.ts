@@ -519,6 +519,7 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
     }
     if (record?.zcodeSid) {
       server.registerSession(acpSid, record.zcodeSid);
+      if (record.cwd !== "/") server.sessionCwds.set(acpSid, record.cwd);
       return record.zcodeSid;
     }
     if (record) {
@@ -615,9 +616,11 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
     }
     // session/create loads the session into this backend process.
     server.markBackendLoaded(acpSid);
-    // Keep the durable alias in sync so a later bridge restart can still
-    // resume this session via the placeholder id.
+    // Keep durable aliases in sync so a later bridge restart can resume this
+    // session via either the ACP locator or the native id exposed to harness
+    // controllers.
     recordMaterializedSession(acpSid, sid, pending.cwd);
+    recordMaterializedSession(sid, sid, pending.cwd);
     log(`session/new ${acpSid} → created ${sid} (lazy, on first use)`);
     server.ensureBackgroundListener(sid);
 

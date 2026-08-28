@@ -149,6 +149,7 @@ describe("ensureRealSession", () => {
     });
     expect(mockUpsertCalls).toHaveLength(1);
     expect(mockUpsertCalls[0]).toMatchObject({ workspaceKey: "/tmp/ws", taskId: sid });
+    expect(mockStore.get(sid)).toMatchObject({ cwd: "/tmp/ws", zcodeSid: sid });
 
     // Idempotent: a second call reuses the mapping, no new create.
     await expect(ensureRealSession(server, resp.sessionId)).resolves.toBe(sid);

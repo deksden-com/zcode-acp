@@ -18,6 +18,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 import { emitInitialUsage } from "../config/model-cache.js";
 import { applyModelSwitch } from "../config/runtime-model.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
+import { recordMaterializedSession } from "../lazy-sessions.js";
 import { ProjectionDiffer } from "../translators/projection-differ.js";
 import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
@@ -97,6 +98,11 @@ export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Pro
   const result = (resp.result ?? {}) as { forkedSessionId?: string };
   if (result.forkedSessionId) {
     server.registerSession(result.forkedSessionId, result.forkedSessionId);
+    const cwd = server.sessionCwds.get(params.sessionId);
+    if (cwd && cwd !== "/") {
+      server.sessionCwds.set(result.forkedSessionId, cwd);
+      recordMaterializedSession(result.forkedSessionId, result.forkedSessionId, cwd);
+    }
     server.ensureBackgroundListener(result.forkedSessionId);
   }
   log(`session/fork → ${result.forkedSessionId ?? "?"}`);

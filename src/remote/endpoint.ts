@@ -247,6 +247,7 @@ export async function startRemoteEndpoint(
 
   // ---- hub registration (heartbeat loop) ----
   const instanceId = String(process.pid);
+  const instanceStartedAt = Date.now();
   let stopped = false;
   let authRejected = false;
   let spawnThrottledUntil = 0;
@@ -256,6 +257,7 @@ export async function startRemoteEndpoint(
     id: instanceId,
     port,
     pid: process.pid,
+    startedAt: instanceStartedAt,
     workspace: server.workspaceLabel(),
     sessions,
     // Lets the hub detect that it is older than this bridge and restart

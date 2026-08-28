@@ -625,7 +625,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           id,
           port: bridgePort,
           pid: typeof body.pid === "number" ? body.pid : 0,
-          startedAt: prev?.startedAt ?? Date.now(),
+          startedAt: prev?.startedAt ?? (typeof body.startedAt === "number" ? body.startedAt : Date.now()),
           workspace: typeof body.workspace === "string" ? body.workspace : "",
           sessions,
           lastSeen: Date.now(),

@@ -271,6 +271,7 @@ export async function startRemoteEndpoint(
 
   // ---- hub registration (heartbeat loop) ----
   const instanceId = String(process.pid);
+  const instanceStartedAt = Date.now();
   let stopped = false;
   let authRejected = false;
   // 401-spawn schedule: an independent ladder from the unreachable-path
@@ -299,6 +300,7 @@ export async function startRemoteEndpoint(
     id: instanceId,
     port,
     pid: process.pid,
+    startedAt: instanceStartedAt,
     workspace: server.workspaceLabel(),
     sessions,
     // "editor" (stdio bridge) or "serve" (headless, hub-spawned, ADR-0014):

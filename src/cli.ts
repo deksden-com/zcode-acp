@@ -21,6 +21,8 @@ import { main as runServer } from "./index.js";
 import { runRepl } from "./repl/run.js";
 import { AGENT_INFO } from "./utils.js";
 
+export const DD_HARNESS_CONTRACT = "dd-zcode-harness@1";
+
 /** What the dispatcher decided to run. `args` are the tokens after the subcommand. */
 export type Invocation =
   | { kind: "help" }
@@ -74,6 +76,7 @@ Commands:
                     alias without this subcommand).
   -h, --help        Show this help.
   --version         Show the package version.
+  --dd-harness-version  Show the dd-zcode inspection/control contract.
 
 Examples:
   zcode-acp                                # chat interactively in this repo
@@ -83,6 +86,10 @@ Examples:
 async function main(): Promise<void> {
   if (process.argv[2] === "--version") {
     process.stdout.write(`${AGENT_INFO.version}\n`);
+    return;
+  }
+  if (process.argv[2] === "--dd-harness-version") {
+    process.stdout.write(`${DD_HARNESS_CONTRACT}\n`);
     return;
   }
   const invocation = resolveInvocation(basename(process.argv[1] ?? ""), process.argv.slice(2));

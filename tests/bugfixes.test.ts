@@ -13,7 +13,7 @@ import { describe, expect, it, vi } from "vitest";
 import { EventStreamListener } from "../src/backend/listener.js";
 import { ZcodeBackend } from "../src/backend/client.js";
 import { ProjectionDiffer } from "../src/translators/projection-differ.js";
-import { flattenTodos } from "../src/handlers/session.js";
+import { cancel, flattenTodos } from "../src/handlers/session.js";
 import {
   buildConfigOptions,
   formatModelValue,
@@ -54,6 +54,17 @@ describe("Bug A: pollEvent zombie waiter", () => {
     listener.handleEvent(makeEvent(1, "turn.started"));
     const r = await pollP;
     expect(r?.type).toBe("turn.started");
+  });
+});
+
+describe("background root cancellation", () => {
+  it("stops an untracked backend turn after the ACP prompt already returned", async () => {
+    const server = new ZcodeAcpServer();
+    server.sessionMap.set("adapter-root", "native-root");
+    const send = vi.fn();
+    vi.spyOn(server, "ensureBackend").mockReturnValue({ send } as never);
+    await cancel(server, { sessionId: "adapter-root" });
+    expect(send).toHaveBeenCalledWith("session/stop", { sessionId: "native-root" });
   });
 });
 

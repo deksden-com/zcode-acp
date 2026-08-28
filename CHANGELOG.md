@@ -52,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `session/cancel` now sends an idempotent backend stop even when a background
+  completion starts a root turn after the ACP prompt request has returned.
 - Pressing ↓ with no completion menu open no longer zombifies the whole UI:
   the setState updater dereferenced a null menu during render, unmounting
   React's tree under ink without any crash signal (found by review,

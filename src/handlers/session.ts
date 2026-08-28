@@ -941,17 +941,26 @@ export async function cancel(
   // could leave the live one running. Each turn guards its own stopSent, so
   // multiple matching turns may each fire session/stop once — the backend
   // treats stop as idempotent, so the duplicate is harmless.
+  let stopSent = false;
   for (const [, turn] of server.pendingTurns) {
     if (turn.zcodeSid === zcodeSid) {
       turn.cancelled = true;
       if (!turn.stopSent) {
         stopBackendTurn(server, zcodeSid);
-        turn.stopSent = true;
+        turn.stopSent = true; stopSent = true;
       }
       // Record cancel time so a prompt arriving in the backend's ~20s
       // model-connection recovery window can fast-fail instead of hanging.
       server.lastCancelledAt.set(zcodeSid, Date.now());
     }
+  }
+  // Background-task completion can start a backend turn after the ACP prompt
+  // request has already returned. Such a turn has no pendingTurns entry, but
+  // the app-server still reports the root Session as running. Stop it eagerly;
+  // session/stop is idempotent when there is no active backend turn.
+  if (!stopSent) {
+    stopBackendTurn(server, zcodeSid);
+    server.lastCancelledAt.set(zcodeSid, Date.now());
   }
   log(`session/cancel → ${zcodeSid}`);
 }

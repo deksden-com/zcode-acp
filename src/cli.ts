@@ -12,8 +12,10 @@
  * user (or editor config) actually typed.
  */
 
-import { basename } from "node:path";
+import { execFileSync } from "node:child_process";
+import { basename, dirname } from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import { main as runHub } from "./bin/hub.js";
 import { main as runQuota } from "./bin/quota.js";
@@ -22,6 +24,18 @@ import { runRepl } from "./repl/run.js";
 import { AGENT_INFO } from "./utils.js";
 
 export const DD_HARNESS_CONTRACT = "dd-zcode-harness@1";
+
+function harnessCommit(): string {
+  try {
+    return execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: dirname(fileURLToPath(import.meta.url)),
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "unknown";
+  }
+}
 
 /** What the dispatcher decided to run. `args` are the tokens after the subcommand. */
 export type Invocation =
@@ -77,6 +91,7 @@ Commands:
   -h, --help        Show this help.
   --version         Show the package version.
   --dd-harness-version  Show the dd-zcode inspection/control contract.
+  --dd-harness-commit   Show the source commit of this harness build.
 
 Examples:
   zcode-acp                                # chat interactively in this repo
@@ -90,6 +105,10 @@ async function main(): Promise<void> {
   }
   if (process.argv[2] === "--dd-harness-version") {
     process.stdout.write(`${DD_HARNESS_CONTRACT}\n`);
+    return;
+  }
+  if (process.argv[2] === "--dd-harness-commit") {
+    process.stdout.write(`${harnessCommit()}\n`);
     return;
   }
   const invocation = resolveInvocation(basename(process.argv[1] ?? ""), process.argv.slice(2));

@@ -858,18 +858,9 @@ export async function prompt(
       }
     }
 
-    // All retries exhausted on a transient error → degrade gracefully. Keep the
-    // session usable so the user can resend the message instead of the editor
-    // surfacing a hard error and stopping. Skip auto-compact here: compaction
-    // after a failed turn is more likely to confuse state than help.
-    const errMsg = formatTurnError(lastTurnError) || "turn failed after retries";
-    await sendTextChunk(
-      cx,
-      params.sessionId,
-      `[请求失败：${errMsg}。会话仍可用，请重新发送消息重试。]`,
-      randomUUID(),
-    );
-    return { stopReason: "end_turn" };
+    // A retry budget is not successful completion. The native adapter must
+    // inspect/settle the same session before anybody can send another turn.
+    throw new TurnFailedError(lastTurnError ?? { message: "turn failed after retries" });
   } finally {
     backend.unregisterEventListener(zcodeSid, listener);
     server.pendingTurns.delete(requestId);
@@ -1673,9 +1664,9 @@ async function runEventTurn(
     }
   }
 
-  // 120s no progress: abandon.
+  // No progress is an unknown native outcome, not an ordinary end_turn.
   stopBackendTurn(server, turn.zcodeSid);
-  return { stopReason: "max_turn_requests" };
+  throw new TurnFailedError({ message: "turn made no observed progress before the stop request" });
 }
 
 /**

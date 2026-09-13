@@ -29,12 +29,14 @@ import {
 } from "./handlers/session.js";
 import {
   cancelBackgroundTask,
+  closeSession,
   compact,
   events,
   fork,
   goal,
   readSession,
   resolveSession,
+  residentSession,
   setMode,
   setModel,
   setThoughtLevel,
@@ -188,6 +190,8 @@ export async function main(): Promise<void> {
     .onRequest("zcode/session/subagents", extParams, (ctx) => subagents(server, ctx.params))
     .onRequest("zcode/session/usage", extParams, (ctx) => usage(server, ctx.params))
     .onRequest("zcode/session/events", extParams, (ctx) => events(server, ctx.params))
+    .onRequest("zcode/session/close", extParams, (ctx) => closeSession(server, ctx.params))
+    .onRequest("zcode/session/resident", extParams, (ctx) => residentSession(server, ctx.params))
     .onRequest("session/goal", extParams, (ctx) => goal(server, ctx.params))
     .onRequest("session/compact", extParams, (ctx) =>
       compact(server, ctx.params, server.clients.broadcast()),

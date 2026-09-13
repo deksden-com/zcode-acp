@@ -665,6 +665,12 @@ session evidence without reaching around the bridge:
 | `zcode/session/subagents` | native root/child topology |
 | `zcode/session/usage` | native usage result |
 | `zcode/session/events` | native event slice |
+| `zcode/session/close` | native close receipt for an already resolved Session; does not resume |
+| `zcode/session/resident` | native identity, residency and compact projection; never resumes a resident |
+
+After a bounded stop, controlled clients may close the owned resident and
+check root/child residency. Only native `-32004` means `resident:false`;
+transport errors remain errors. Root closure alone is not child settlement.
 
 All accept `sessionId`; inspection methods forward any additional native
 options. Tool call notifications also preserve `source`, `childSessionId`,

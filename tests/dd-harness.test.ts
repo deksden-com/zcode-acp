@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  closeSession,
   events,
   readSession,
   resolveSession,
+  residentSession,
   subagents,
   usage,
 } from "../src/handlers/extensions.js";
@@ -43,22 +45,88 @@ describe("dd harness extensions", () => {
     expect(request).toHaveBeenCalledWith(1, method, { sessionId: "sess_native", limit: 10 }, 15000);
   });
 
-  it("adds exact request and cache counters to the compact usage projection", async () => {
-    const request = vi.fn()
-      .mockResolvedValueOnce({ result: { sessionId: "sess_native", totalTokens: 12 } })
-      .mockResolvedValueOnce({ result: { messages: [
-        { info: { role: "assistant", tokens: { total: 10, input: 8, output: 2, reasoning: 1, cache: { read: 5, write: 1 } } } },
-        { info: { role: "user" } },
-        { info: { role: "assistant", tokens: { total: 20, input: 17, output: 3, cache: { read: 11, write: 0 } } } }
-      ] } });
-    const server = { resolveSid: () => "sess_native", isBackendSessionLive: () => true, pendingTurns: new Map(), nextId: vi.fn().mockReturnValueOnce(1).mockReturnValueOnce(2), ensureBackend: () => ({ request }) } as unknown as ZcodeAcpServer;
-    await expect(usage(server, { sessionId: "acp_1" })).resolves.toMatchObject({
-      totalTokens: 12, requestUsageStatus: "measured", requestCount: 2, requestTotalTokens: 30,
-      requestInputTokens: 25, requestOutputTokens: 5, requestReasoningTokens: 1,
-      requestCacheReadTokens: 16, requestCacheCreationTokens: 1
+  it("closes only the resolved native Session", async () => {
+    const { server, request } = serverWith({ closed: true });
+    await expect(closeSession(server, { sessionId: "acp_1" })).resolves.toEqual({ closed: true });
+    expect(request).toHaveBeenCalledWith(1, "session/close", { sessionId: "sess_native" }, 15000);
+  });
+
+  it("checks native child residency without resuming and accepts only inactive evidence", async () => {
+    const { server, request } = serverWith({});
+    request.mockResolvedValueOnce({
+      error: { code: -32004, message: "Session is not active" },
+    } as never);
+    await expect(residentSession(server, { sessionId: "acp_1" })).resolves.toEqual({
+      sessionId: "sess_native",
+      resident: false,
     });
-    expect(request).toHaveBeenNthCalledWith(1, 1, "session/usage", { sessionId: "sess_native" }, 15000);
-    expect(request).toHaveBeenNthCalledWith(2, 2, "session/read", { sessionId: "sess_native" }, 15000);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith(1, "session/read", { sessionId: "sess_native" }, 15000);
+    request.mockResolvedValueOnce({ error: { code: -1, message: "offline" } } as never);
+    await expect(residentSession(server, { sessionId: "acp_1" })).rejects.toThrow("offline");
+  });
+
+  it("adds exact request and cache counters to the compact usage projection", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({ result: { sessionId: "sess_native", totalTokens: 12 } })
+      .mockResolvedValueOnce({
+        result: {
+          messages: [
+            {
+              info: {
+                role: "assistant",
+                tokens: {
+                  total: 10,
+                  input: 8,
+                  output: 2,
+                  reasoning: 1,
+                  cache: { read: 5, write: 1 },
+                },
+              },
+            },
+            { info: { role: "user" } },
+            {
+              info: {
+                role: "assistant",
+                tokens: { total: 20, input: 17, output: 3, cache: { read: 11, write: 0 } },
+              },
+            },
+          ],
+        },
+      });
+    const server = {
+      resolveSid: () => "sess_native",
+      isBackendSessionLive: () => true,
+      pendingTurns: new Map(),
+      nextId: vi.fn().mockReturnValueOnce(1).mockReturnValueOnce(2),
+      ensureBackend: () => ({ request }),
+    } as unknown as ZcodeAcpServer;
+    await expect(usage(server, { sessionId: "acp_1" })).resolves.toMatchObject({
+      totalTokens: 12,
+      requestUsageStatus: "measured",
+      requestCount: 2,
+      requestTotalTokens: 30,
+      requestInputTokens: 25,
+      requestOutputTokens: 5,
+      requestReasoningTokens: 1,
+      requestCacheReadTokens: 16,
+      requestCacheCreationTokens: 1,
+    });
+    expect(request).toHaveBeenNthCalledWith(
+      1,
+      1,
+      "session/usage",
+      { sessionId: "sess_native" },
+      15000,
+    );
+    expect(request).toHaveBeenNthCalledWith(
+      2,
+      2,
+      "session/read",
+      { sessionId: "sess_native" },
+      15000,
+    );
   });
 });
 

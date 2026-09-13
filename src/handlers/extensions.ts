@@ -80,7 +80,12 @@ export const subagents = (server: ZcodeAcpServer, params: ExtensionParams) =>
 export async function usage(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
   const zcodeSid = await resolveSidOrThrow(server, params);
   const backend = server.ensureBackend();
-  const usageResponse = await backend.request(server.nextId(), "session/usage", { sessionId: zcodeSid }, 15000);
+  const usageResponse = await backend.request(
+    server.nextId(),
+    "session/usage",
+    { sessionId: zcodeSid },
+    15000,
+  );
   if (usageResponse.error) throw new Error(`session/usage failed: ${usageResponse.error.message}`);
   const result = (usageResponse.result ?? {}) as Result;
 
@@ -89,22 +94,41 @@ export async function usage(server: ZcodeAcpServer, params: ExtensionParams): Pr
   // export their exact sum instead of pretending that an unavailable value is
   // zero. Consumers can use these request* fields for provider-cost accounting
   // while retaining the backend's compact counters for compatibility.
-  const readResponse = await backend.request(server.nextId(), "session/read", { sessionId: zcodeSid }, 15000);
+  const readResponse = await backend.request(
+    server.nextId(),
+    "session/read",
+    { sessionId: zcodeSid },
+    15000,
+  );
   if (!readResponse.error) Object.assign(result, requestUsageFromRead(readResponse.result));
   return result;
 }
 
 function requestUsageFromRead(value: unknown): Result {
-  const messages = value && typeof value === "object" && Array.isArray((value as { messages?: unknown }).messages)
-    ? (value as { messages: unknown[] }).messages
-    : [];
-  const totals = { requestTotalTokens: 0, requestInputTokens: 0, requestOutputTokens: 0, requestReasoningTokens: 0, requestCacheCreationTokens: 0, requestCacheReadTokens: 0, requestCount: 0 };
+  const messages =
+    value && typeof value === "object" && Array.isArray((value as { messages?: unknown }).messages)
+      ? (value as { messages: unknown[] }).messages
+      : [];
+  const totals = {
+    requestTotalTokens: 0,
+    requestInputTokens: 0,
+    requestOutputTokens: 0,
+    requestReasoningTokens: 0,
+    requestCacheCreationTokens: 0,
+    requestCacheReadTokens: 0,
+    requestCount: 0,
+  };
   for (const message of messages) {
-    const info = message && typeof message === "object" ? (message as { info?: unknown }).info : null;
+    const info =
+      message && typeof message === "object" ? (message as { info?: unknown }).info : null;
     const tokens = info && typeof info === "object" ? (info as { tokens?: unknown }).tokens : null;
-    if (!tokens || typeof tokens !== "object" || (info as { role?: unknown }).role !== "assistant") continue;
+    if (!tokens || typeof tokens !== "object" || (info as { role?: unknown }).role !== "assistant")
+      continue;
     const record = tokens as Record<string, unknown>;
-    const cache = record.cache && typeof record.cache === "object" ? record.cache as Record<string, unknown> : {};
+    const cache =
+      record.cache && typeof record.cache === "object"
+        ? (record.cache as Record<string, unknown>)
+        : {};
     totals.requestTotalTokens += finite(record.total);
     totals.requestInputTokens += finite(record.input);
     totals.requestOutputTokens += finite(record.output);
@@ -116,9 +140,51 @@ function requestUsageFromRead(value: unknown): Result {
   return { ...totals, requestUsageStatus: totals.requestCount > 0 ? "measured" : "unavailable" };
 }
 
-function finite(value: unknown): number { return typeof value === "number" && Number.isFinite(value) ? value : 0; }
+function finite(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
 export const events = (server: ZcodeAcpServer, params: ExtensionParams) =>
   inspectSession(server, params, "session/events");
+
+/** Close the resident native session after a bounded cooperative stop failed.
+ * This is deliberately a narrow dd-flow extension, not a generic backend
+ * passthrough: callers can only close the Session they already own. */
+export async function closeSession(
+  server: ZcodeAcpServer,
+  params: ExtensionParams,
+): Promise<Result> {
+  const zcodeSid = server.resolveSid(params.sessionId);
+  if (!zcodeSid) throw new Error("session/close requires an already resolved Session");
+  const response = await server
+    .ensureBackend()
+    .request(server.nextId(), "session/close", { sessionId: zcodeSid }, 15000);
+  if (response.error) throw new Error(`session/close failed: ${response.error.message}`);
+  log(`session/close → ${zcodeSid}`);
+  return {
+    ...((response.result ?? {}) as Result),
+    closed: (response.result as Result | undefined)?.closed === true,
+  };
+}
+
+/** Read residency after close without ensureRealSession's implicit resume. */
+export async function residentSession(
+  server: ZcodeAcpServer,
+  params: ExtensionParams,
+): Promise<Result> {
+  const nativeId = server.resolveSid(params.sessionId) ?? params.sessionId;
+  if (!nativeId.startsWith("sess_"))
+    throw new Error("Residency inspection requires a native Session identity");
+  const response = await server
+    .ensureBackend()
+    .request(server.nextId(), "session/read", { sessionId: nativeId }, 15000);
+  if (response.error?.code === -32004) return { sessionId: nativeId, resident: false };
+  if (response.error) throw new Error(`session/read failed: ${response.error.message}`);
+  return {
+    sessionId: nativeId,
+    resident: true,
+    projection: (response.result as Result | undefined)?.projection ?? null,
+  };
+}
 
 /** session/fork → zcode session/fork: branch a new session from a checkpoint. */
 export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {

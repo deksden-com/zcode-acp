@@ -36,6 +36,7 @@ import {
   fork,
   goal,
   readSession,
+  retainedSubagents,
   residentSession,
   resolveSession,
   setMode,
@@ -265,6 +266,7 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .onRequest("zcode/session/events", extParams, (ctx) => events(server, ctx.params))
       .onRequest("zcode/session/close", extParams, (ctx) => closeSession(server, ctx.params))
       .onRequest("zcode/session/resident", extParams, (ctx) => residentSession(server, ctx.params))
+      .onRequest("zcode/session/retainedSubagents", extParams, (ctx) => retainedSubagents(server, ctx.params))
       .onRequest("session/goal", extParams, (ctx) => goal(server, ctx.params))
       .onRequest("session/compact", extParams, (ctx) =>
         compact(server, ctx.params, server.clients.broadcast()),

@@ -37,6 +37,7 @@ import {
   readSession,
   resolveSession,
   residentSession,
+  retainedSubagents,
   setMode,
   setModel,
   setThoughtLevel,
@@ -192,6 +193,7 @@ export async function main(): Promise<void> {
     .onRequest("zcode/session/events", extParams, (ctx) => events(server, ctx.params))
     .onRequest("zcode/session/close", extParams, (ctx) => closeSession(server, ctx.params))
     .onRequest("zcode/session/resident", extParams, (ctx) => residentSession(server, ctx.params))
+    .onRequest("zcode/session/retainedSubagents", extParams, (ctx) => retainedSubagents(server, ctx.params))
     .onRequest("session/goal", extParams, (ctx) => goal(server, ctx.params))
     .onRequest("session/compact", extParams, (ctx) =>
       compact(server, ctx.params, server.clients.broadcast()),

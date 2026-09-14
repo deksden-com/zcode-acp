@@ -702,10 +702,16 @@ session evidence without reaching around the bridge:
 | `zcode/session/events` | native event slice |
 | `zcode/session/close` | native close receipt for an already resolved Session; does not resume |
 | `zcode/session/resident` | native identity, residency and compact projection; never resumes a resident |
+| `zcode/session/retainedSubagents` | `{sessionId, topology}` from durable native subagents; never materializes/resumes |
 
 After a bounded stop, controlled clients may close the owned resident and
 check root/child residency. Only native `-32004` means `resident:false`;
 transport errors remain errors. Root closure alone is not child settlement.
+For closed-tree verification, read residency before retained topology for each
+node, recursively including previously retained and newly discovered children.
+Only inactive residents plus complete topology prove a closed tree. Historical
+`running` labels may remain after close. The ordinary `subagents` extension is
+not a substitute: its lazy resolution can resume a resident.
 
 All accept `sessionId`; inspection methods forward any additional native
 options. Tool call notifications also preserve `source`, `childSessionId`,

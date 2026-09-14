@@ -6,6 +6,7 @@ import {
   readSession,
   resolveSession,
   residentSession,
+  retainedSubagents,
   subagents,
   usage,
 } from "../src/handlers/extensions.js";
@@ -27,6 +28,15 @@ function serverWith(result: unknown) {
 }
 
 describe("dd harness extensions", () => {
+  it("reads retained topology without materializing or resuming a session", async () => {
+    const { server, request } = serverWith({ childSessionIds: [] });
+    server.isBackendSessionLive = () => false;
+    await expect(retainedSubagents(server, { sessionId: "sess_child" })).resolves.toEqual({ sessionId: "sess_native", topology: { childSessionIds: [] } });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith(1, "session/subagents", { sessionId: "sess_native" }, 15000);
+    request.mockResolvedValueOnce({ error: { code: -32004, message: "missing" } } as never);
+    await expect(retainedSubagents(server, { sessionId: "sess_child" })).rejects.toThrow("missing");
+  });
   it("resolves an adapter locator to the native Session", async () => {
     const { server } = serverWith({});
     await expect(resolveSession(server, { sessionId: "acp_1" })).resolves.toEqual({

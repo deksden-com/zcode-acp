@@ -85,6 +85,16 @@ export const readSession = (server: ZcodeAcpServer, params: ExtensionParams) =>
   inspectSession(server, params, "session/read");
 export const subagents = (server: ZcodeAcpServer, params: ExtensionParams) =>
   inspectSession(server, params, "session/subagents");
+
+/** Durable topology only: unlike ordinary inspection this must never load or
+ * resume a closed resident. Kept a distinct method so older bridges fail closed. */
+export async function retainedSubagents(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
+  const nativeId = server.resolveSid(params.sessionId) ?? params.sessionId;
+  if (!nativeId.startsWith("sess_")) throw new Error("Retained topology requires a native Session identity");
+  const response = await server.ensureBackend().request(server.nextId(), "session/subagents", { sessionId: nativeId }, 15000);
+  if (response.error) throw new Error(`session/subagents failed: ${response.error.message}`);
+  return { sessionId: nativeId, topology: response.result ?? null };
+}
 export async function usage(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
   const zcodeSid = await resolveSidOrThrow(server, params);
   const backend = server.ensureBackend();

@@ -13,10 +13,9 @@
  * user (or editor config) actually typed.
  */
 
-import { execFileSync } from "node:child_process";
-import { basename, dirname } from "node:path";
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
 
 import { main as runHub } from "./bin/hub.js";
 import { main as runQuota } from "./bin/quota.js";
@@ -25,15 +24,12 @@ import { reexecToBunIfEligible } from "./runtime.js";
 import { checkTuiRuntime, runTui } from "./tui.js";
 import { AGENT_INFO } from "./utils.js";
 
-export const DD_HARNESS_CONTRACT = "dd-zcode-harness@1";
+export const DD_HARNESS_CONTRACT = "dd-zcode-harness@2";
 
 function harnessCommit(): string {
   try {
-    return execFileSync("git", ["rev-parse", "HEAD"], {
-      cwd: dirname(fileURLToPath(import.meta.url)),
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
+    const build = JSON.parse(readFileSync(new URL("./dd-harness-build.json", import.meta.url), "utf8"));
+    return build.dirty ? "unknown" : build.source_commit ?? "unknown";
   } catch {
     return "unknown";
   }

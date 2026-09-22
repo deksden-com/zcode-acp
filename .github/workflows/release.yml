@@ -17,6 +17,7 @@ permissions:
 
 jobs:
   release-please:
+    if: github.repository == 'william0wang/zcode-acp'
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
@@ -30,7 +31,7 @@ jobs:
     # cut a release itself (e.g. its release PR was closed unmerged and the
     # version bump already sits on main), a dispatch publishes main's
     # package.json version — the tag/release must exist by then.
-    if: needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch'
+    if: github.repository == 'william0wang/zcode-acp' && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

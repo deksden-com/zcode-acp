@@ -57,6 +57,17 @@ describe("Bug A: pollEvent zombie waiter", () => {
   });
 });
 
+describe("background root cancellation", () => {
+  it("does not stop an unowned quiet-window turn through ordinary ACP cancel", async () => {
+    const server = new ZcodeAcpServer();
+    server.sessionMap.set("adapter-root", "native-root");
+    const send = vi.fn();
+    vi.spyOn(server, "ensureBackend").mockReturnValue({ send } as never);
+    await cancel(server, { sessionId: "adapter-root" });
+    expect(send).not.toHaveBeenCalled();
+  });
+});
+
 describe('subscribe error surfacing (no more misleading "0.14.8 required")', () => {
   // Before the fix, subscribe() returned null on ANY backend error and the
   // caller threw a hardcoded "session/subscribe failed (ZCode CLI 0.14.8+

@@ -36,7 +36,7 @@
     "docs"
   ],
   "scripts": {
-    "build": "tsc && node scripts/write-code-fingerprint.mjs && node dist/remote/hub-upgrade-notify.js",
+    "build": "tsc && node scripts/write-harness-build.mjs && node scripts/write-code-fingerprint.mjs",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

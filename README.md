@@ -1,5 +1,23 @@
 # zcode-acp-server
 
+## Downstream dd-zcode-acp fork
+
+This is [deksden-com/zcode-acp](https://github.com/deksden-com/zcode-acp), based on
+[william0wang/zcode-acp](https://github.com/william0wang/zcode-acp). This candidate
+incorporates upstream **v0.46.7** and exposes `dd-zcode-harness@2` native evidence
+through `src/handlers/harness.ts`. Usage accounting and integration policy live
+in the consumer adapter. The upstream badges below do not certify our fork.
+
+See [PATCHES.md](PATCHES.md), [fork updates](docs/FORK-UPDATES.md), the
+[adapter contract](https://github.com/deksden-com/dd-flow-cli/blob/refactor/dd-zcode-native-evidence/src/harness-runtime/DD-ZCODE.md)
+and [system upgrade runbook](https://github.com/deksden-com/dd-eval/blob/main/runbooks/update-zcode.md).
+Build identity is recorded in `dist/dd-harness-build.json`; the source commit
+comes from that file, including when the artifact is installed without Git.
+Dirty builds report an unknown harness commit. `dd-zcode-acp` is the downstream
+artifact identity; npm package/CLI names remain upstream-compatible for now.
+Upstream npm release automation is disabled in this fork. Build does not notify
+or restart an existing local hub. Qualification is separate from a passing build.
+
 [![CI](https://github.com/william0wang/zcode-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/william0wang/zcode-acp/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 

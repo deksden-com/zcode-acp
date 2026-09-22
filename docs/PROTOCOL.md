@@ -701,6 +701,13 @@ plan decline.
 
 ### Harness inspection
 
+The downstream implementation lives in `src/handlers/harness.ts`.
+`dd-zcode-harness@2` returns `zcode/session/usage` unchanged from the native
+backend; consumers calculate request-level totals from `zcode/session/read`.
+The @1 bridge's aggregated request fields are not part of @2. A bounded/partial
+history read must not be treated as complete cumulative usage. Native extension
+failures preserve method/session and native code/data in ACP RequestError data.
+
 Controlled headless clients can resolve the lazy ACP locator and read native
 session evidence without reaching around the bridge:
 

@@ -29,21 +29,23 @@ import {
 } from "./handlers/session.js";
 import {
   cancelBackgroundTask,
-  closeSession,
   compact,
-  events,
   fork,
   goal,
+  setMode,
+  setModel,
+  setThoughtLevel,
+} from "./handlers/extensions.js";
+import {
+  closeSession,
+  events,
   readSession,
   retainedSubagents,
   residentSession,
   resolveSession,
-  setMode,
-  setModel,
-  setThoughtLevel,
   subagents,
   usage,
-} from "./handlers/extensions.js";
+} from "./handlers/harness.js";
 import { echoUserPromptToOthers, sendAvailableCommandsDeferred } from "./handlers/io.js";
 import { loadEarlier } from "./handlers/replay.js";
 import { resendPendingInteractions } from "./handlers/server-requests.js";
@@ -246,7 +248,9 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .onRequest("zcode/session/events", extParams, (ctx) => events(server, ctx.params))
       .onRequest("zcode/session/close", extParams, (ctx) => closeSession(server, ctx.params))
       .onRequest("zcode/session/resident", extParams, (ctx) => residentSession(server, ctx.params))
-      .onRequest("zcode/session/retainedSubagents", extParams, (ctx) => retainedSubagents(server, ctx.params))
+      .onRequest("zcode/session/retainedSubagents", extParams, (ctx) =>
+        retainedSubagents(server, ctx.params),
+      )
       .onRequest("session/goal", extParams, (ctx) => goal(server, ctx.params))
       .onRequest("session/compact", extParams, (ctx) =>
         compact(server, ctx.params, server.clients.broadcast()),

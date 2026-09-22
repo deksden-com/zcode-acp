@@ -2250,11 +2250,6 @@ export async function cancel(
   // on the driver instead; it takes effect at the next round boundary.
   // Best-effort: never break cancel for non-goal sessions.
   if (!matched) {
-    // A background completion may own a native root turn after the ACP prompt
-    // request has settled, so no pendingTurns entry exists. Native stop is
-    // idempotent and is therefore safe for this quiet-window path.
-    stopBackendTurn(server, zcodeSid);
-    server.lastCancelledAt.set(zcodeSid, Date.now());
     try {
       server.goalLoops?.get(zcodeSid)?.requestPause();
     } catch (e) {

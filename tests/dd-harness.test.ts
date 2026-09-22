@@ -20,6 +20,8 @@ function serverWith(result: unknown) {
       resolveSid: () => "sess_native",
       isBackendSessionLive: () => true,
       pendingTurns: new Map(),
+      sessionMap: new Map(),
+      backendLoadedSessions: new Map(),
       nextId: () => 1,
       ensureBackend: () => ({ request }),
     } as unknown as ZcodeAcpServer,

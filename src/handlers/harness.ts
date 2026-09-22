@@ -1,5 +1,6 @@
 /** Downstream native-evidence transport. Consumer policy belongs in dd-zcode. */
-import { RequestError } from "@agentclientprotocol/sdk";
+import { backendError } from "../backend/errors.js";
+import type { ZcodeResponse } from "../backend/types.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { log } from "../utils.js";
 import { ensureRealSession } from "./session.js";
@@ -12,27 +13,17 @@ type Result = Record<string, unknown>;
 const resolveSidOrThrow = (server: ZcodeAcpServer, params: ExtensionParams) =>
   ensureRealSession(server, params.sessionId);
 
-function nativeFailure(
-  method: string,
-  sessionId: string,
-  response: { id?: unknown; error?: unknown },
-): never {
-  const error = response.error as { code?: unknown; message?: string; data?: unknown };
-  throw new RequestError(-32603, `${method} failed: ${error.message ?? "native request failed"}`, {
-    method,
-    session_id: sessionId,
-    request_id: response.id,
-    native_code: error.code ?? null,
-    native_data: error.data ?? null,
-  });
+function nativeFailure(method: string, sessionId: string, response: ZcodeResponse): never {
+  throw backendError(method, response, sessionId);
 }
 
 /** Resolve a lazy ACP locator to the native ZCode Session identity. */
 export async function resolveSession(
   server: ZcodeAcpServer,
   params: ExtensionParams,
+  onAllocated?: (sid: string) => void | Promise<void>,
 ): Promise<Result> {
-  const providerSessionId = await resolveSidOrThrow(server, params);
+  const providerSessionId = await ensureRealSession(server, params.sessionId, { onAllocated });
   return { adapterSessionId: params.sessionId, providerSessionId };
 }
 
@@ -84,10 +75,20 @@ export async function closeSession(
 ): Promise<Result> {
   const zcodeSid = server.resolveSid(params.sessionId);
   if (!zcodeSid) throw new Error("session/close requires an already resolved Session");
+  const turns = [...server.pendingTurns.values()].filter((turn) => turn.zcodeSid === zcodeSid);
   const response = await server
     .ensureBackend()
     .request(server.nextId(), "session/close", { sessionId: zcodeSid }, 15000);
   if (response.error) nativeFailure("session/close", zcodeSid, response);
+  if ((response.result as Result | undefined)?.closed === true) {
+    for (const [alias, nativeId] of server.sessionMap) {
+      if (nativeId === zcodeSid) server.backendLoadedSessions.delete(alias);
+    }
+    for (const turn of turns) {
+      turn.closed = true;
+      turn.cancelled = true;
+    }
+  }
   log(`session/close → ${zcodeSid}`);
   return {
     ...((response.result ?? {}) as Result),

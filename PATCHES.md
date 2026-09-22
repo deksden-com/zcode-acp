@@ -3,7 +3,7 @@
 ## Current candidate: upstream v0.46.7
 
 Base: `230dcdf74aa021f37dd6d8e69023e7e2a77aed2a` (`v0.46.7`).
-Branch: `upgrade/zcode-acp-0.46.7`. Contract: `dd-zcode-harness@2`.
+Integration branch: `main`. Contract: `dd-zcode-harness@2`.
 
 - Native inspection/control is isolated in `src/handlers/harness.ts`; registration
   and native tool identity metadata are the small upstream integration points.
@@ -22,25 +22,44 @@ Tests: dd-harness, session-lazy, background tasks, adapter usage and cancellatio
 regressions, plus upstream CI checks. Native qualification remains a separate
 requirement before selecting this tuple for a scored run.
 
-### Older uncommitted changes
+### Native recovery integration (reviewed archive)
 
-The old main checkout contains independent experiments: backend timeout/late
-allocation reconciliation, causal errors, lazy allocation persistence, provider
-registry synchronization, model readback and related tests. They are not silently
-included in this upgrade. Upstream now owns provider/model synchronization;
-extension causal error preservation is implemented in harness.ts. The larger
-late-allocation recovery experiment needs its own behavioral qualification and
-must not replace current upstream session mechanics by file overwrite. Preserve
-that work separately for review; it is not part of the @2 contract.
+The old experiment was reviewed by behavior, not transplanted by file:
 
-Preserved snapshot: `archive/zcode-0.13.1-native-recovery`, commit `c1d26da`.
-It is explicitly unqualified. Original checkout files were not overwritten.
+| Retained behavior | Implementation / regression | Upstream removal condition |
+| --- | --- | --- |
+| Bidirectional RPC correlation, causal errors and bounded late observation | `backend/client.ts`, `backend/errors.ts`, `native-recovery.test.ts` | Equivalent routing and serialized errors, including pipe death and late create |
+| No duplicate allocation after unknown outcome or restart | `session-allocation.ts`, `ensureRealSession`, native-recovery/session-lazy tests | Native idempotency key or equivalent durable reconciliation |
+| No resume replay or model overlay on unknown outcome | Shared error classifier, existing resume single-flight; native-recovery tests | Equivalent outcome-aware native recovery |
+| Confirmed close settles only the captured turns, without stop/revival | harness close + PendingTurn flag, native-recovery tests | Equivalent upstream close primitive and turn settlement |
+| Cleanup checks process group, not just exited leader | backend close; native-recovery test | Equivalent owned-group teardown |
+| Distinguish inferred/failed completion from success | `_meta.zcodeCompletionEvidence`; stale-running-recovery tests | Standard completion-evidence representation |
+
+The adapter decides whether inferred completion is acceptable; the bridge has
+no `DD_FLOW_RUNTIME_OWNER` branch. Allocation notifications go only to the
+requesting resolve client. Late allocation updates identity, never starts a
+listener/model switch/prompt. The response-observation window is bounded to
+60 seconds after timeout; unresolved durable intents have no automatic expiry.
+Restart or an expired observer cannot prove create had no effect. Do not delete
+an unresolved intent to retry: reconcile native identity first. A confirmed
+native rejection releases the intent; corrupt records fail closed.
+
+Not retained: obsolete mandatory provider-registry RPC, duplicated upstream
+alias/model persistence, bridge-side dd-flow usage aggregation, raw stderr
+dumping, unused late-response cache and unlimited late callbacks. Provider and
+model compatibility remain upstream-owned. Tests isolate allocation homes.
+
+Original experiment: archive tag `archive/zcode-0.13.1-native-recovery`, commit
+`c1d26da`. It is unqualified historical evidence, not an active development
+branch. Original dirty checkout files remain untouched. Integration checks do
+not substitute for native tuple qualification.
 
 ## Historical v0.43.2 overlay
 
 Scope: the committed v0.43.2 overlay, upstream commit
 `54acb495c30966f3d22d48ec09bbd749fd2d9475`, overlay head
-`8c0a893f3c26a0b96cb138acf762db84c800298b` on `dd-eval/v0.43.2-overlay`.
+`8c0a893f3c26a0b96cb138acf762db84c800298b` at archive tag
+`archive/dd-eval-v0.43.2-overlay` (formerly branch `dd-eval/v0.43.2-overlay`).
 This is a historical source baseline, not a declaration that any checkout or
 installed binary is qualified. Uncommitted changes in the older main checkout
 are outside this inventory and must be reviewed separately before inclusion.

@@ -19,6 +19,7 @@ import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeEvent } from "../src/backend/types.js";
 import "../src/handlers/slash.js";
 import { prompt } from "../src/handlers/session.js";
+import { closeSession } from "../src/handlers/harness.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
 vi.mock("../src/tasks-index.js", () => ({
@@ -122,6 +123,24 @@ async function waitForSend(sendRequests: ReturnType<typeof vi.fn>) {
 }
 
 describe("stall termination policy (watermark-based)", () => {
+  it("settles a closed in-flight prompt without stop, resend or resident revival", async () => {
+    const control = staleRunningBackend();
+    const original = control.backend.request.bind(control.backend);
+    vi.spyOn(control.backend, "request").mockImplementation((id, method, ...args) =>
+      method === "session/close"
+        ? Promise.resolve({ id, result: { closed: true } })
+        : original(id, method, ...args),
+    );
+    const server = setup(control.backend);
+    const turn = prompt(server, params, cx, "close-fixture");
+    await waitForSend(control.sendRequests);
+    await closeSession(server, { sessionId: "sess_stale" });
+    await vi.advanceTimersByTimeAsync(1000);
+    await expect(turn).resolves.toEqual({ stopReason: "cancelled" });
+    expect(control.sendRequests).toHaveBeenCalledTimes(1);
+    expect(control.backend.send).not.toHaveBeenCalled();
+    expect(server.isBackendSessionLive("sess_stale")).toBe(false);
+  });
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -344,7 +363,10 @@ describe("stall termination policy (watermark-based)", () => {
     expect(settled).toBe(false);
 
     await vi.advanceTimersByTimeAsync(700_000);
-    await expect(turn).resolves.toEqual({ stopReason: "end_turn" });
+    await expect(turn).resolves.toEqual({
+      stopReason: "end_turn",
+      _meta: { zcodeCompletionEvidence: "inferred" },
+    });
     expect(control.backend.send).not.toHaveBeenCalled();
   });
 });

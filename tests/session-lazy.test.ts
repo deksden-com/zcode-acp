@@ -9,6 +9,9 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
@@ -70,7 +73,10 @@ vi.mock("../src/lazy-sessions.js", () => ({
   },
 }));
 
+let allocationHome: string;
 beforeEach(() => {
+  allocationHome = mkdtempSync(path.join(tmpdir(), "zacp-allocation-test-"));
+  vi.stubEnv("ZCODE_HOME", allocationHome);
   mockStore.clear();
   // Keep the create-mode assertions deterministic on a machine that exports
   // ZCODE_ACP_MODE; the per-test stub below still overrides this.
@@ -78,6 +84,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  rmSync(allocationHome, { recursive: true, force: true });
   vi.unstubAllEnvs();
 });
 

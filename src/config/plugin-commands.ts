@@ -1,34 +1,19 @@
 /**
- * Plugin command discovery — reads enabled plugins from `~/.zcode/cli/config.json`
- * and scans their `commands/*.md` frontmatter to build slash-command entries.
+ * Plugin command discovery — reads enabled plugins from the ZCode CLI config
+ * (`<zcode-home>/cli/config.json`) and scans their `commands/*.md` frontmatter
+ * to build slash-command entries.
  *
- * Plugin commands (e.g. `/code-review`) are resolved by the ZCode backend's
- * `customCommandPromptResolver` before the model sees them, so they work in
- * app-server mode without bridge interception.
+ * `<zcode-home>` is the ZCode data root (`~/.zcode`, or `$ZCODE_HOME` when
+ * set — see `zcodeHomeDir()`). Plugin commands (e.g. `/code-review`) are
+ * resolved by the ZCode backend's `customCommandPromptResolver` before the
+ * model sees them, so they work in app-server mode without bridge
+ * interception.
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import path from "node:path";
 
-import { compareVersions, log } from "../utils.js";
-
-/** Path to the ZCode CLI config (plugins, skills, mcp). */
-const CLI_CONFIG_PATH = path.join(
-  homedir(),
-  ".zcode",
-  "cli",
-  "config.json",
-);
-
-/** Root of the plugin cache directory. */
-const PLUGIN_CACHE_DIR = path.join(
-  homedir(),
-  ".zcode",
-  "cli",
-  "plugins",
-  "cache",
-);
+import { compareVersions, log, zcodeCliConfigPath, zcodePluginCacheDir } from "../utils.js";
 
 /** A slash-command entry compatible with `sendAvailableCommands`. */
 export interface PluginCommandEntry {
@@ -55,10 +40,7 @@ function parseFrontmatter(content: string): Record<string, string> {
     const key = line.slice(0, idx).trim();
     // Strip surrounding quotes from the value (YAML scalar style).
     let val = line.slice(idx + 1).trim();
-    if (
-      (val.startsWith('"') && val.endsWith('"')) ||
-      (val.startsWith("'") && val.endsWith("'"))
-    ) {
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
       val = val.slice(1, -1);
     }
     if (key) fm[key] = val;
@@ -67,15 +49,17 @@ function parseFrontmatter(content: string): Record<string, string> {
 }
 
 /**
- * Read enabled plugin commands from `~/.zcode/cli/config.json` + the plugin
- * cache directory. Returns entries suitable for `available_commands_update`.
+ * Read enabled plugin commands from the CLI config + the plugin cache
+ * directory. Returns entries suitable for `available_commands_update`.
  *
  * Best-effort: failures are logged and swallowed (returns []).
  */
 export function loadPluginCommands(): PluginCommandEntry[] {
-  if (!existsSync(CLI_CONFIG_PATH) || !existsSync(PLUGIN_CACHE_DIR)) return [];
+  const cliConfigPath = zcodeCliConfigPath();
+  const pluginCacheDir = zcodePluginCacheDir();
+  if (!existsSync(cliConfigPath) || !existsSync(pluginCacheDir)) return [];
   try {
-    const cfg = JSON.parse(readFileSync(CLI_CONFIG_PATH, "utf8")) as CliConfig;
+    const cfg = JSON.parse(readFileSync(cliConfigPath, "utf8")) as CliConfig;
     const enabled = cfg.plugins?.enabledPlugins ?? {};
     const entries: PluginCommandEntry[] = [];
 
@@ -88,7 +72,7 @@ export function loadPluginCommands(): PluginCommandEntry[] {
       const marketplace = pluginKey.slice(atIdx + 1);
 
       // Scan all versions of this plugin in the cache (use latest found).
-      const marketDir = path.join(PLUGIN_CACHE_DIR, marketplace);
+      const marketDir = path.join(pluginCacheDir, marketplace);
       if (!existsSync(marketDir)) continue;
       const pluginDir = path.join(marketDir, pluginName);
       if (!existsSync(pluginDir)) continue;
@@ -124,9 +108,7 @@ export function loadPluginCommands(): PluginCommandEntry[] {
     log(`plugin-commands: loaded ${entries.length} plugin command(s)`);
     return entries;
   } catch (e) {
-    log(
-      `plugin-commands: load failed (${e instanceof Error ? e.message : String(e)})`,
-    );
+    log(`plugin-commands: load failed (${e instanceof Error ? e.message : String(e)})`);
     return [];
   }
 }

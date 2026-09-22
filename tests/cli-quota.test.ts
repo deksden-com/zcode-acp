@@ -104,9 +104,10 @@ describe("parseArgs", () => {
     expect(parseArgs(["-w"]).provider).toBe("all");
   });
 
-  it("'glm' / 'go' positional → the matching provider", () => {
+  it("'glm' / 'go' / 'oc' positional → the matching provider", () => {
     expect(parseArgs(["glm"]).provider).toBe("glm");
     expect(parseArgs(["go"]).provider).toBe("go");
+    expect(parseArgs(["oc"]).provider).toBe("oc");
   });
 
   it("provider combines with flags in any order", () => {

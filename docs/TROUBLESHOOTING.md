@@ -28,11 +28,84 @@
    - If not found, set: `export ZCODE_BIN=/path/to/zcode`
 
 3. Check the ZCode configuration:
+
    ```bash
    cat ~/.zcode/v2/config.json
    ```
    - Confirm a `provider` is enabled
    - Confirm `models` are defined
+
+4. Desktop-app CLI (3.12.3+) exits instantly with
+   `无法定位 CLI ZCode Built-in Provider Config`: the bundled CLI expects the
+   host to pass its provider table via `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`
+   (the desktop app does exactly that); launched bare, its own file lookup
+   cannot find the copy the bundle ships at `Resources/config/provider/`.
+   The bridge injects BOTH provider-table env vars automatically (see
+   `builtinProviderEnv` in `src/backend/resolve.ts`), deriving the builtin
+   path from the CLI it launches — the CLI uses an injected path verbatim
+   only when `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` is set alongside it (it
+   defaults to `~/.zcode/v2/provider_config.json`); with the builtin var
+   alone the CLI re-syncs the table into a version-keyed runtime copy, which
+   voids the bridge's account-config push (next section). The derived value
+   also overrides an inherited ambient copy, which is version-keyed and goes
+   stale across app updates. To force a custom table, point `ZCODE_BIN` at a
+   CLI whose directory carries no adjacent `zcode-builtin.json` and export
+   the env var yourself.
+
+### Switching to a GLM coding-plan model fails / snaps back to a third-party model
+
+**Symptom:** picking GLM-5.3 (or GLM-5.3-Flash) in the model picker errors out or the UI
+immediately falls back to a third-party model (e.g. DeepSeek); third-party models switch
+fine. The bridge log (`ZCODE_ACP_DEBUG=1`) shows
+`runtime-model: switch failed (modern: Provider Registry 中不存在 Model …)`.
+
+**Why:** on 3.12+ the backend registry is entitled by an account snapshot the bridge
+pushes (`provider/updateAccountConfig`). The push carries a `basedOnZCodeBuiltinRevision`
+hash of the provider-table PATH the backend resolved; if the backend resolved a different
+copy (its version-keyed runtime copy under
+`~/.zcode/v2/runtime/provider/<plat>/<version>/…` instead of the injected
+`Resources/config/provider/` path), it accepts the push but silently ignores it — every
+`account:*` model is then "not in the Provider Registry". The CLI only uses an injected
+builtin path verbatim when BOTH `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` and
+`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` are set; `builtinProviderEnv` injects both.
+
+**Troubleshooting steps:**
+
+1. Check which table the backend resolved:
+
+   ```bash
+   grep -a provider_registry.ready ~/.zcode/cli/log/zcode-$(date +%F).jsonl | tail -1
+   ```
+
+   The `configRevision` hash must match the injected path. Verify with:
+
+   ```bash
+   python3 -c "import hashlib,os;print(hashlib.sha256(b'/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json').hexdigest()[:16])"
+   ```
+
+2. If the hashes differ, the bridge is older than the dual-env fix (0.42.4+) or
+   `ZCODE_BIN` points at a CLI without an adjacent `zcode-builtin.json` — check
+   `echo $ZCODE_BIN` in the launching shell.
+
+3. Note `session.model_selection.persist_failed` ("FOREIGN KEY constraint failed")
+   appears on EVERY switch — including working ones — and is a backend persistence
+   wart, not the switching bug. The success signal is the following
+   `session.model.updated` event in the same log.
+
+### Switching to a GLM model works but every send fails / retries forever
+
+**Symptom:** the model picker shows the GLM model after switching, but sending a
+message errors immediately and retries; the backend log shows
+`model.request.failed` with `reason:"unknown"` on `account:bigmodel-…` providers.
+
+**Why:** the 3.12+ backend asks its host for provider runtime headers
+(`interaction/requestProviderRuntimeHeaders`) before EVERY model request on an
+account provider. A `headersApplied:false` answer makes the turn fail with
+-32031 and retry. The bridge (0.42.5+) answers with the coding plan's API key
+from `~/.zcode/v2/config.json` (`codingPlanRequestAuthFor`) — if sends still
+fail, check that the enabled `builtin:bigmodel-coding-plan` entry carries a
+non-empty `options.apiKey` in that file. Start-plan providers stay declined
+(Aliyun captcha — desktop app only, issue #123).
 
 ### Authentication / credential errors (401, provider auth failed)
 
@@ -52,7 +125,7 @@
 
 2. If the file is missing or the key is stale, **install and log into the ZCode desktop app** — it writes a fresh `config.json` with a valid enabled provider. There is no manual API-key configuration in the editor.
 
-3. If you need to override the key/base URL without touching `config.json`, set `ZCODE_BASE_URL` and provide the key via the provider config (see `src/backend/credentials.ts` for the merge order).
+3. There is no env override for the provider base URL: the app-server reads `ZCODE_BASE_URL` as its own service origin, so the bridge never passes one through (see `src/backend/credentials.ts`). Edit `config.json` (or the provider config in the App) instead.
 
 ### session/subscribe fails
 
@@ -67,13 +140,13 @@ a hardcoded version string — read the message text to identify the root cause.
 
 **Common causes:**
 
-| Message fragment                 | Cause                                                                                                                                                                                                                                                      |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `reader exited (backend dead)`   | The zcode subprocess crashed/exited. Restart the editor session.                                                                                                                                                                                           |
-| `timeout`                        | The per-attempt 5s subscribe deadline elapsed. The bridge retries transient timeouts once (2 attempts total, ~10.5s worst case); if both fail, the backend was unresponsive for that window.                                                               |
-| `pipe broken`                    | The stdin pipe to the zcode subprocess broke (process died mid-write).                                                                                                                                                                                     |
-| `method not found (code -32601)` | The CLI genuinely is too old (< 0.14.8). Upgrade.                                                                                                                                                                                                          |
-| `Session is not active` (-32004) | The backend evicted the session's resident runtime (idle ~10min, or its LRU cap). The bridge self-heals via `session/resume` (see below).                                                                                                                   |
+| Message fragment                 | Cause                                                                                                                                                                                        |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reader exited (backend dead)`   | The zcode subprocess crashed/exited. Restart the editor session.                                                                                                                             |
+| `timeout`                        | The per-attempt 5s subscribe deadline elapsed. The bridge retries transient timeouts once (2 attempts total, ~10.5s worst case); if both fail, the backend was unresponsive for that window. |
+| `pipe broken`                    | The stdin pipe to the zcode subprocess broke (process died mid-write).                                                                                                                       |
+| `method not found (code -32601)` | The CLI genuinely is too old (< 0.14.8). Upgrade.                                                                                                                                            |
+| `Session is not active` (-32004) | The backend evicted the session's resident runtime (idle ~10min, or its LRU cap). The bridge self-heals via `session/resume` (see below).                                                    |
 
 **`Session is not active` (code -32004) in detail:**
 
@@ -182,6 +255,10 @@ log (`~/.zcode/cli/log/zcode-YYYY-MM-DD.jsonl`) for the underlying cause
    - `⟳ AskUserQuestion forwarding elicitation/create (form, N fields)` → elicitation path
    - `⟳ AskUserQuestion forwarding session/request_permission` → fallback path
    - The path is decided by `clientCapabilities.elicitation.form`
+   - ExitPlanMode has its own gate: `⟳ ExitPlanMode forwarding elicitation/create` only
+     fires when `hasMarttyClient` is true (a martty TUI attached to this bridge — the
+     flag is sticky for the process lifetime); other clients take
+     `session/request_permission` (their popups render the plan markdown)
 
 3. Check whether `askOnce` (fallback path) or `handleAskUserViaElicitation`
    (elicitation path) successfully sent the request:
@@ -340,13 +417,19 @@ http://127.0.0.1:<hub-port>/api/health` fails, or `/api/*` returns 401.
 
 1. 401 means a token mismatch — `ZCODE_ACP_REMOTE_TOKEN` must be identical in
    the bridge env, the hub env (if run manually), and the client request.
-2. A dead hub self-heals: the next bridge heartbeat (≤10s; worst ~1min under
+2. Bridges on ≥0.17.0 self-heal after 401s (e.g. the token was rotated while
+   some windows kept the old env): the bridge keeps heartbeating and spawns a
+   replacement hub carrying its own token (≤1/min). Convergence needs the
+   mismatched hub to exit — instantly when nothing else holds the port, or via
+   its 10-minute zero-instance idle-exit. On older bridges a 401 permanently
+   stopped registration: restart the affected editor windows.
+3. A dead hub self-heals: the next bridge heartbeat (≤10s; worst ~1min under
    the spawn throttle) re-spawns the hub daemon. Retry with backoff rather
    than restarting anything by hand.
-3. Confirm the ports match: the client must reach `ZCODE_ACP_HUB_PORT`
+4. Confirm the ports match: the client must reach `ZCODE_ACP_HUB_PORT`
    (default 8377) through the tunnel, and the tunnel maps exactly that one
    port.
-4. Remote silently disabled? `ZCODE_ACP_REMOTE=1` without a token logs a
+5. Remote silently disabled? `ZCODE_ACP_REMOTE=1` without a token logs a
    warning and leaves the bridge stdio-only by design.
 
 ### Remote access: stale instance in the list / connect fails
@@ -358,9 +441,11 @@ or a WS connect to it fails.
 
 1. Hard-killed bridges (Zed force-kill, crash) never unregister — the hub's
    heartbeat TTL drops them within ~30s.
-2. For an immediately-honest list, call `GET /api/instances?probe=1`: the hub
-   TCP-probes each registered port and prunes unreachable bridges first.
-   Clients should use this on refresh.
+2. For an honest list without waiting out the TTL, call
+   `GET /api/instances?probe=1`: the hub TCP-probes each registered port and
+   prunes bridges that stay unreachable ~8s (one failed probe only marks the
+   instance unhealthy — a busy bridge can stall past the probe timeout while
+   alive). Clients should use this on refresh.
 3. A few-seconds outage after upgrading the package is expected: a newer
    bridge triggers the hub's version-handshake restart, then re-spawns it.
 
@@ -375,6 +460,109 @@ in-memory id mapping as "live" and skipped the resume RPC — a mapping
 re-registered from the durable store without a resume (or left behind by a
 failed one) therefore replayed nothing. Fixed by explicit backend-loaded
 tracking; the backend also logs a warning now when `session/messages` errors.
+
+### Remote access: a conversation replays only PARTLY on first entry
+
+**Symptom:** entering a resumed conversation the FIRST time shows history
+that ends in the middle; leaving and re-entering shows the full conversation.
+Happens often (but not always) with large sessions.
+
+**Cause:** the hub answers the resume request as soon as the incubated
+terminal bridge registers — before the terminal's boot-resume finishes — so
+the App's `session/load` raced the boot-resume for the SAME backend session.
+Both sent `session/resume` concurrently, and `session/messages` reflects only
+what the backend has hydrated so far: a query landing mid-restore returns a
+PREFIX, which was replayed as if it were the whole conversation. Fixed by
+single-flighting `session/resume` TOGETHER WITH its hydration settle per
+backend session id (a concurrent load joins the in-flight flight and shares
+its settled history snapshot; the settle requires two consecutive
+non-growing reads, capped). The bridge log line
+`session/load: replayed N messages (total M)` now prints the total
+unconditionally — a first-entry total below the session's real size was the
+signature of this bug.
+
+### Start Plan (zcode-plan) providers fail headless — 1113 / signing errors
+
+**Symptom:** every turn fails with HTTP 429 error `1113` ("Insufficient
+balance or no resource package") or `ClientRequestSigningV4Error: Client
+signing credential must contain one separator`, while the same account works
+in the ZCode desktop app.
+
+**Cause:** Start Plan providers (`builtin:zai-start-plan`,
+`builtin:bigmodel-start-plan`, baseURL `zcode.z.ai/api/v1/zcode-plan/...`)
+authenticate with the provider's OAuth JWT **plus an Aliyun captcha session**:
+before each model request the backend asks its host via
+`interaction/requestProviderRuntimeHeaders` to solve an Aliyun captcha and
+inject `X-Aliyun-Captcha-Verify-Param`/`-Region` headers. The desktop app
+solves this in its renderer (browser environment, mostly invisible); a
+headless bridge has neither a browser nor the captcha credential. GLM Coding
+Plan providers are unaffected — they use an `id.secret` API key and sign
+requests themselves.
+
+**Workaround:** switch the session's provider to a GLM Coding Plan one
+(model dropdown, or re-enable it in the desktop app so
+`~/.zcode/v2/config.json` marks it `enabled`). The bridge answers the captcha
+request with `headersApplied:false` and the backend surfaces a clear error;
+full Start Plan support headless would require solving the Aliyun captcha
+outside a browser, which this bridge does not do. That boundary is
+deliberate: unofficial clients or proxies that impersonate the desktop app or
+bypass the captcha check won't be shipped or supported here — if the provider
+ever offers an official headless credential path, this bridge will adopt it
+(see #123).
+
+### Interactive TUI / `script` / `expect` fails with `Operation not permitted` under the sandbox
+
+**Symptom:** inside an armed Seatbelt sandbox, pseudo-terminal allocation
+fails (`script: openpty: Operation not permitted`, or a TUI binary dying at
+terminal init with `os error 1`); the same binaries run fine headless.
+
+**Cause:** `openpty` opens `/dev/ptmx` and the granted `/dev/ttysNNN` pair
+`O_RDWR`, and the write half used to collide with the profile's blanket
+`file-write*` deny. Since the fix, the profile allows exactly those two write
+targets — the slave allow is gated on the sandbox pty extension, mirroring
+Apple's own `application.sb`/`com.apple.neagent.sb` profiles, so only slaves
+cloned through the sandbox's own `ptmx` opens are writable. Upgrade the bridge
+if you still see this.
+
+**Diagnosis tip:** a syscall-level sandbox denial has **no ask popup** (the
+dynamic-allow flow only triggers on write-path denials) and surfaces in the
+child as a bare `EPERM`, which tools may misreport as their own bug. When the
+backend runs sandboxed, the bridge logs a one-shot warning the first time a
+tool output contains `Operation not permitted` — that warning is your signal
+to suspect the sandbox. Path grants for legitimate writes go in
+`.zcode/acp/sandbox.json`.
+
+### UNRESOLVED: CLI (martty) freezes at an old state while the mobile app keeps updating
+
+**Symptom (observed once, 2026-09, no live instance preserved):** a CLI window
+attached to a conversation stops receiving everything — messages, model
+dropdown, thought-level updates — while the mobile app on the same
+conversation keeps receiving and interacting normally. The CLI stays frozen at
+a state noticeably older than the conversation.
+
+**Working hypotheses (in rough likelihood order), none confirmed:**
+
+1. **Session-alias divergence** — the interaction moved to an ACP session id
+   the martty connection never adopted (e.g. a phone-side `session/new` racing
+   the window's binding). martty drops every update addressed to a session id
+   it does not know (same failure shape as the 2026-09-06 boot-create
+   diagnosis in AGENTS.md). Everything stalling at once — config updates
+   included — fits a sessionId mismatch, since all of them are session-scoped.
+2. **Two different bridge processes** — the phone attached to the hub's serve
+   bridge while the CLI runs its own bridge: live events do not cross
+   processes by design (only session listings do). The CLI then only ever
+   updates for its own turns.
+3. **martty stdio wedge** — the TUI's own input thread stalls; the bridge's
+   notifies buffer into the pipe and the mobile (WS path) is unaffected.
+   Bridge-side nothing is wrong; typing in the frozen CLI would also be dead.
+
+**If it recurs, capture before closing anything:** whether typing still works
+in the frozen CLI (separates hypothesis 3 from 1/2); the bridge's stderr with
+`ZCODE_ACP_DEBUG=1` (do `session/update` notifies still leave?); the hub's
+instance listing (`GET /api/instances`) — which bridge id the phone's
+conversation is on vs the CLI's; and both ends' session ids (CLI transcript vs
+phone). See also the resume-race diagnosis in the same period: a partial
+first-entry replay is a different bug (history prefix), do not conflate.
 
 ## Log Debugging
 

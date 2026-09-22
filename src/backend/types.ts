@@ -46,6 +46,22 @@ export interface ZcodeSessionInfo {
 
 export interface ZcodeCreateResult {
   session: ZcodeSessionInfo;
+  /**
+   * Session settings snapshot. `model.available` is the FULL registry listing
+   * (with per-model reasoning metadata) — only create/resume return it;
+   * `session/read` answers with the current model alone. See
+   * `server.modelAvailability`.
+   */
+  settings?: {
+    model?: {
+      current?: { providerId?: string; modelId?: string };
+      available?: Array<{
+        ref?: { providerId?: string; modelId?: string };
+        reasoning?: { defaultLevel?: string; levels?: Array<{ value?: string }> };
+      }>;
+    };
+    thoughtLevel?: { current?: string; defaultLevel?: string };
+  };
 }
 
 export interface ZcodeSessionListItem {
@@ -77,17 +93,35 @@ export type ZcodeEventType =
   // stay accurate.
   | "turn.steerQueued"
   | "turn.steerDrained"
-  | "turn.terminal";
+  | "turn.terminal"
+  // app-server 0.16.5 (verified live + schema-checked against the desktop
+  // 3.12.3 bundle, 2026-09-18): authoritative conversation-title pushes.
+  // Consumed by SessionTitleListener; see docs/PROTOCOL.md.
+  | "session.titleUpdated";
 
 export interface ZcodeEvent {
   sessionId: string;
   seq: number;
   type: ZcodeEventType;
   payload: Record<string, unknown>;
+  /**
+   * Turn attribution — on the event ENVELOPE, not the payload (source:
+   * `zcodeEventEnvelopeSchema`, zcode-protocol index.ts:1029-1041; the
+   * `turn.*` payloads are `.strict()` and carry no turnId). A `session/event`
+   * frame's params ARE the envelope, so the field is present at runtime on
+   * every push even though the client only types the fields it consumed.
+   */
+  turnId?: string;
 }
 
 export interface ZcodeSubscribeResult {
   eventSeq: number;
+  /**
+   * Missed-window replay carried in the subscribe response itself (source:
+   * subscribeSession returns every event with seq > afterSeq). Consumed by
+   * resubscribe; absent when the request omits afterSeq (fresh subscribe).
+   */
+  events?: ZcodeEvent[];
   snapshot?: ZcodeSnapshot;
 }
 
@@ -102,6 +136,10 @@ export interface ZcodeProjection {
   contextUsed?: number;
   contextWindow?: number;
   totalTokenCount?: number;
+  /** Turns completed in this session (observed in app-server projections). */
+  turnCount?: number;
+  /** Id of the turn the projection considers current, if any. */
+  currentTurnId?: string;
 }
 
 // ---------- messages / history ----------
@@ -185,5 +223,13 @@ export interface ZcodeInteractionUserInputParams {
 
 /** The response we send back to a ZCode server→client request. */
 export type ZcodeInteractionResponse =
-  | { decision: "allow" | "deny" | "escalate" | "modify"; reason?: string; modifiedInput?: unknown }
+  | {
+      decision: "allow" | "deny" | "escalate" | "modify";
+      reason?: string;
+      modifiedInput?: unknown;
+      /** Persistent rule updates the selected option carries (e.g. the
+       * "Always allow in this project" option's addRules) — echoed back
+       * verbatim so the runtime persists them. */
+      permissionUpdates?: unknown[];
+    }
   | { action: "accept" | "decline" | "cancel"; content?: unknown; reason?: string };

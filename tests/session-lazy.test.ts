@@ -9,7 +9,7 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeMessage } from "../src/backend/types.js";
@@ -17,7 +17,9 @@ import {
   ensureRealSession,
   loadSession,
   newSession,
+  reloadBackendSession,
   resumeSession,
+  setConfigOptionHandler,
 } from "../src/handlers/session.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
@@ -46,13 +48,37 @@ vi.mock("../src/lazy-sessions.js", () => ({
       cwd: existing?.cwd ?? cwd,
       zcodeSid,
       createdAt: existing?.createdAt ?? Date.now(),
+      ...(existing?.modelChoice ? { modelChoice: existing.modelChoice } : {}),
+    });
+  },
+  recordModelChoice: (acpSid: string, patch: { model?: string; thought?: string; at?: number }) => {
+    const existing = mockStore.get(acpSid);
+    if (!existing) return;
+    mockStore.set(acpSid, {
+      ...existing,
+      modelChoice: { ...(existing.modelChoice ?? {}), ...patch },
     });
   },
   lookupLazySession: (acpSid: string) => mockStore.get(acpSid),
+  lookupModelChoiceByZcodeSid: (zcodeSid: string) => {
+    let best: { model?: string; thought?: string; at?: number } | undefined;
+    for (const rec of mockStore.values()) {
+      if (rec.zcodeSid !== zcodeSid || !rec.modelChoice) continue;
+      if (!best || (rec.modelChoice.at ?? 0) > (best.at ?? 0)) best = rec.modelChoice;
+    }
+    return best;
+  },
 }));
 
 beforeEach(() => {
   mockStore.clear();
+  // Keep the create-mode assertions deterministic on a machine that exports
+  // ZCODE_ACP_MODE; the per-test stub below still overrides this.
+  vi.stubEnv("ZCODE_ACP_MODE", "");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 /**
@@ -64,6 +90,7 @@ beforeEach(() => {
 function fakeBackend(
   listed: Array<{ sessionId: string; title?: string }> = [],
   messages: ZcodeMessage[] = [],
+  resumeWorkspace?: string,
 ): ZcodeBackend & {
   calls: Array<{ method: string; params: unknown }>;
 } {
@@ -83,8 +110,21 @@ function fakeBackend(
             },
           };
         case "session/resume":
+          return {
+            id,
+            // A resume result may carry the session's recorded workspace —
+            // the value normal mode adopts as the session root.
+            result: resumeWorkspace
+              ? { session: { workspace: { workspacePath: resumeWorkspace } } }
+              : {},
+          };
         case "workspace/updateProviderRegistry":
           return { id, result: {} };
+        case "provider/updateAccountConfig":
+          return {
+            id,
+            result: { receivedRevision: "account:test", providerCount: 0, status: "received" },
+          };
         case "session/list":
           return { id, result: { sessions: listed } };
         case "session/read":
@@ -156,6 +196,20 @@ describe("ensureRealSession", () => {
     expect(calls.filter((c) => c.method === "session/create")).toHaveLength(1);
   });
 
+  it("starts the session in ZCODE_ACP_MODE when it is set", async () => {
+    vi.stubEnv("ZCODE_ACP_MODE", "build");
+    const server = new ZcodeAcpServer();
+    const resp = await newSession(server, newSessionParams("/tmp/ws"));
+    const { backend, calls } = fakeBackend();
+    server.backend = backend;
+
+    await ensureRealSession(server, resp.sessionId);
+
+    const creates = calls.filter((c) => c.method === "session/create");
+    expect(creates).toHaveLength(1);
+    expect(creates[0].params).toMatchObject({ mode: "build" });
+  });
+
   it("serializes concurrent first-uses into a single session/create", async () => {
     const server = new ZcodeAcpServer();
     const resp = await newSession(server, newSessionParams("/tmp/ws"));
@@ -206,8 +260,11 @@ describe("ensureRealSession", () => {
 
     await expect(ensureRealSession(server, "acp_old_unused")).resolves.toBe("sess_lazy_1");
     expect(server.resolveSid("acp_old_unused")).toBe("sess_lazy_1");
-    expect(calls.filter((c) => c.method === "session/create")).toHaveLength(1);
-    expect(calls[0].params).toMatchObject({
+    const creates = calls.filter((c) => c.method === "session/create");
+    expect(creates).toHaveLength(1);
+    // Look the create up by method, not by index — the account-provider push
+    // (provider/updateAccountConfig) precedes it, so calls[0] is not the create.
+    expect(creates[0]!.params).toMatchObject({
       workspace: { workspacePath: "/tmp/ws", workspaceKey: "/tmp/ws" },
     });
   });
@@ -283,6 +340,47 @@ describe("resumeSession with lazy placeholders", () => {
     // only); with no recorded root and no workspace in the resume result the
     // bridge falls back to its process cwd.
     expect(server.sessionCwds.get("sess_real_1")).toBe(process.cwd());
+  });
+
+  it("re-sends stored mcpServers on an eviction reload (#193)", async () => {
+    // The backend treats mcpServers as per-load runtime config, not persisted
+    // state — an idle-eviction reload must carry them again or the session
+    // silently loses its client MCP tools for the rest of its life.
+    const server = new ZcodeAcpServer();
+    const mcpServers = [{ name: "echo", command: "node", args: [], env: [] }];
+    const resp = await newSession(server, { cwd: "/tmp/ws", mcpServers } as acp.NewSessionRequest);
+    const { backend, calls } = fakeBackend();
+    server.backend = backend;
+    await ensureRealSession(server, resp.sessionId);
+    calls.length = 0;
+
+    await reloadBackendSession(server, resp.sessionId, "sess_lazy_1");
+
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0].params).toMatchObject({ sessionId: "sess_lazy_1", mcpServers });
+  });
+
+  it("session/load re-sends a stored mcpServers set even when params carry []", async () => {
+    // The SDK makes `mcpServers: []` mandatory on session/load; that empty
+    // array must NOT wipe a set remembered at session/new.
+    const server = new ZcodeAcpServer();
+    const { backend, calls } = fakeBackend();
+    server.backend = backend;
+    const mcpServers = [{ name: "echo", command: "node", args: [], env: [] }];
+    server.registerSession("s-load", "sess_load");
+    server.sessionCwds.set("s-load", "/tmp/ws");
+    server.sessionMcpServers.set("s-load", mcpServers);
+
+    await loadSession(
+      server,
+      { sessionId: "s-load", cwd: "/tmp/ws", mcpServers: [] } as acp.LoadSessionRequest,
+      {} as acp.AgentContext,
+    );
+
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0].params).toMatchObject({ sessionId: "sess_load", mcpServers });
   });
 
   it("resumes an already-materialized placeholder without backend resume", async () => {
@@ -534,5 +632,262 @@ describe("backend-loaded session tracking", () => {
     await ensureRealSession(server, resp.sessionId);
 
     expect(server.isBackendSessionLive(resp.sessionId)).toBe(true);
+  });
+});
+
+describe("serve mode cwd pinning (ADR-0014 hardening)", () => {
+  // A remote client can mint {sid → arbitrary cwd} durable aliases on any
+  // editor bridge (session/new trusts the local editor's cwd) and then resume
+  // them on a serve bridge. Serve mode must treat foreign-cwd records as
+  // unknown ids and never move its pinned session root — neither via the
+  // workspace it sends to the backend nor via the root recorded for /fs.
+
+  it("session/new ignores a client cwd and records the pinned project", async () => {
+    const server = new ZcodeAcpServer({ serveMode: true });
+    const resp = await newSession(server, newSessionParams("/etc"));
+
+    expect(server.pendingSessions.get(resp.sessionId)).toEqual({ cwd: process.cwd() });
+    expect(mockStore.get(resp.sessionId)?.cwd).toBe(process.cwd());
+  });
+
+  it("rejects a foreign durable record with a zcodeSid (no alias smuggling)", async () => {
+    const server = new ZcodeAcpServer({ serveMode: true });
+    mockStore.set("acp_foreign", {
+      cwd: "/Users/victim/secret",
+      zcodeSid: "sess_foreign",
+      createdAt: 1,
+    });
+    const { backend, calls } = fakeBackend();
+    server.backend = backend;
+
+    await expect(ensureRealSession(server, "acp_foreign")).rejects.toThrow(
+      "session acp_foreign not found",
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects a foreign never-used record (no foreign materialization)", async () => {
+    const server = new ZcodeAcpServer({ serveMode: true });
+    mockStore.set("acp_pending_foreign", { cwd: "/Users/victim/secret", createdAt: 1 });
+    const { backend, calls } = fakeBackend();
+    server.backend = backend;
+
+    await expect(ensureRealSession(server, "acp_pending_foreign")).rejects.toThrow(
+      "session acp_pending_foreign not found",
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it("materializes its OWN record in the process cwd", async () => {
+    const server = new ZcodeAcpServer({ serveMode: true });
+    mockStore.set("acp_own", { cwd: process.cwd(), createdAt: 1 });
+    const { backend, calls } = fakeBackend();
+    server.backend = backend;
+
+    await expect(ensureRealSession(server, "acp_own")).resolves.toBe("sess_lazy_1");
+    expect(calls.filter((c) => c.method === "session/create")[0]!.params).toMatchObject({
+      workspace: { workspacePath: process.cwd(), workspaceKey: process.cwd() },
+    });
+  });
+
+  it("resume pins the root to the process cwd; a foreign-workspace session is refused", async () => {
+    const server = new ZcodeAcpServer({ serveMode: true });
+    const { backend, calls } = fakeBackend([], [], "/tmp/foreign-ws");
+    server.backend = backend;
+
+    await expect(
+      resumeSession(
+        server,
+        { sessionId: "sess_real_1", cwd: "/tmp/attacker" } as acp.ResumeSessionRequest,
+        {} as acp.AgentContext,
+      ),
+    ).rejects.toThrow("session belongs to another workspace");
+
+    // The workspace sent to the backend was pinned; the refused session
+    // records no mapping and no root.
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0]!.params).toMatchObject({
+      workspace: { workspacePath: process.cwd() },
+    });
+    expect(server.resolveSid("sess_real_1")).toBeUndefined();
+    expect(server.sessionCwds.get("sess_real_1")).toBeUndefined();
+  });
+
+  it("resume of the serve bridge's OWN workspace stays pinned", async () => {
+    const server = new ZcodeAcpServer({ serveMode: true });
+    // The backend reports the same project (sameProjectDir resolves both
+    // spellings): accepted, and the recorded root stays the process cwd.
+    const { backend, calls } = fakeBackend([], [], process.cwd());
+    server.backend = backend;
+
+    await resumeSession(
+      server,
+      { sessionId: "sess_real_1" } as acp.ResumeSessionRequest,
+      {} as acp.AgentContext,
+    );
+
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0]!.params).toMatchObject({
+      workspace: { workspacePath: process.cwd() },
+    });
+    expect(server.sessionCwds.get("sess_real_1")).toBe(process.cwd());
+  });
+
+  it("load pins the root the same way and refuses foreign-workspace sessions", async () => {
+    const server = new ZcodeAcpServer({ serveMode: true });
+    const { backend, calls } = fakeBackend([], [], "/tmp/foreign-ws");
+    server.backend = backend;
+
+    await expect(
+      loadSession(
+        server,
+        { sessionId: "sess_real_2" } as acp.LoadSessionRequest,
+        {} as acp.AgentContext,
+      ),
+    ).rejects.toThrow("session belongs to another workspace");
+
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0]!.params).toMatchObject({
+      workspace: { workspacePath: process.cwd() },
+    });
+    expect(server.sessionCwds.get("sess_real_2")).toBeUndefined();
+  });
+});
+
+describe("store-recovered sessions (bridge restart)", () => {
+  const stubCx = { notify: async () => {} } as unknown as acp.AgentContext;
+
+  /**
+   * Backend with real resident semantics: session state RPCs (setModel /
+   * setThoughtLevel) fail with -32004 "Session is not active" until a
+   * session/resume has loaded the session into THIS backend process.
+   */
+  function residentBackend(): ZcodeBackend & {
+    calls: Array<{ method: string; params: unknown }>;
+  } {
+    const calls: Array<{ method: string; params: unknown }> = [];
+    const resumed = new Set<string>();
+    const backend = {
+      isDead: false,
+      request: async (id: number, method: string, params: Record<string, unknown>) => {
+        calls.push({ method, params });
+        const sid = String(params.sessionId ?? "");
+        switch (method) {
+          case "session/resume":
+            resumed.add(sid);
+            return { id, result: {} };
+          case "session/setModel":
+          case "session/setThoughtLevel":
+            if (sid && !resumed.has(sid)) {
+              return { id, error: { code: -32004, message: `Session is not active: ${sid}` } };
+            }
+            return { id, result: {} };
+          case "session/read":
+            return { id, result: { projection: { contextUsed: 0 }, settings: {} } };
+          case "session/messages":
+            return { id, result: { messages: [] } };
+          default:
+            return { id, result: {} };
+        }
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    return { backend, calls };
+  }
+
+  it("ensureRealSession reloads a store-recovered mapping before first use", async () => {
+    mockStore.set("acp_restart", { cwd: "/tmp/ws", zcodeSid: "sess_restart", createdAt: 1 });
+    const server = new ZcodeAcpServer();
+    const { backend, calls } = residentBackend();
+    server.backend = backend;
+
+    await expect(ensureRealSession(server, "acp_restart")).resolves.toBe("sess_restart");
+
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(1);
+    // The resume workspace comes from the record's cwd, seeded for a process
+    // that never saw the session/new which recorded it.
+    expect(resumes[0]!.params).toMatchObject({
+      sessionId: "sess_restart",
+      workspace: { workspacePath: "/tmp/ws", workspaceKey: "/tmp/ws" },
+    });
+    expect(server.isBackendSessionLive("acp_restart")).toBe(true);
+  });
+
+  it("the FIRST model switch after a bridge restart succeeds (2026-09-18 regression)", async () => {
+    mockStore.set("acp_switch", { cwd: "/tmp/ws", zcodeSid: "sess_switch", createdAt: 1 });
+    const server = new ZcodeAcpServer();
+    const { backend, calls } = residentBackend();
+    server.backend = backend;
+
+    const resp = await setConfigOptionHandler(
+      server,
+      {
+        sessionId: "acp_switch",
+        configId: "model",
+        value: "builtin:bigmodel-coding-plan\\GLM-5.3",
+      } as acp.SetSessionConfigOptionRequest,
+      stubCx,
+    );
+
+    // The reload ran BEFORE the switch — setModel saw a resident session.
+    const resumeIdx = calls.findIndex((c) => c.method === "session/resume");
+    const setModelIdx = calls.findIndex((c) => c.method === "session/setModel");
+    expect(resumeIdx).toBeGreaterThanOrEqual(0);
+    expect(setModelIdx).toBeGreaterThan(resumeIdx);
+    const model = resp.configOptions.find((o) => o.id === "model");
+    expect(model?.currentValue).toBe("builtin:bigmodel-coding-plan\\GLM-5.3");
+  });
+
+  it("session/load on a store-recovered record resumes exactly once and carries fresh mcpServers", async () => {
+    mockStore.set("acp_load", { cwd: "/tmp/ws", zcodeSid: "sess_load", createdAt: 1 });
+    const server = new ZcodeAcpServer();
+    const { backend, calls } = residentBackend();
+    server.backend = backend;
+
+    await loadSession(
+      server,
+      {
+        sessionId: "acp_load",
+        mcpServers: [{ name: "srv", command: "echo" }],
+      } as acp.LoadSessionRequest,
+      stubCx,
+    );
+
+    // The eviction guard is skipped on the load/resume path (their resume is
+    // the one that must carry the client's freshly declared mcpServers, #193)
+    // — so exactly ONE resume, with those servers on it.
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0]!.params).toMatchObject({
+      mcpServers: [{ name: "srv", command: "echo" }],
+    });
+  });
+
+  it("a store-recovered mapping whose backend session was deleted fails with the evicted error", async () => {
+    mockStore.set("acp_dead", { cwd: "/tmp/ws", zcodeSid: "sess_dead", createdAt: 1 });
+    const server = new ZcodeAcpServer();
+    const calls: Array<{ method: string; params: unknown }> = [];
+    const backend = {
+      isDead: false,
+      request: async (id: number, method: string, params: Record<string, unknown>) => {
+        calls.push({ method, params });
+        if (method === "session/resume") {
+          return { id, error: { code: -32004, message: `Session not found: ${params.sessionId}` } };
+        }
+        return { id, result: {} };
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    server.backend = backend;
+
+    await expect(ensureRealSession(server, "acp_dead")).rejects.toThrow("acp_dead");
+    // No overlay retry for a deleted session.
+    expect(calls.filter((c) => c.method === "session/resume")).toHaveLength(1);
   });
 });

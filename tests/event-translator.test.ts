@@ -12,11 +12,18 @@ import type { InternalEvent } from "../src/translators/types.js";
 function ev(
   type: string,
   payload: Record<string, unknown> = {},
+  /**
+   * turnId rides the event ENVELOPE in production (zcodeEventEnvelopeSchema,
+   * zcode-protocol index.ts:1029-1041) — the turn.* payloads are strict and
+   * carry no turnId. Pass it here, not inside the payload.
+   */
+  turnId?: string,
 ): {
   type: string;
+  turnId?: string;
   payload: Record<string, unknown>;
 } {
-  return { type, payload };
+  return turnId === undefined ? { type, payload } : { type, turnId, payload };
 }
 
 describe("EventTranslator", () => {
@@ -24,6 +31,33 @@ describe("EventTranslator", () => {
     const t = new EventTranslator();
     const out = t.translate(ev("model.streaming", { kind: "text_delta", delta: "hello" }));
     expect(out).toEqual([{ kind: "TextDelta", text: "hello" }]);
+  });
+
+  it("carries assistantMessageId onto the emitted TextDelta", () => {
+    const t = new EventTranslator();
+    const out = t.translate(
+      ev("model.streaming", { kind: "text_delta", delta: "hello", assistantMessageId: "m1" }),
+    );
+    expect(out).toEqual([{ kind: "TextDelta", text: "hello", messageId: "m1" }]);
+  });
+
+  it("omits messageId when the streaming payload carries no assistantMessageId", () => {
+    const t = new EventTranslator();
+    const out = t.translate(ev("model.streaming", { kind: "text_delta", delta: "hello" }));
+    expect(out).toHaveLength(1);
+    expect(out[0]).not.toHaveProperty("messageId");
+  });
+
+  it("carries assistantMessageId onto the emitted ReasoningDelta", () => {
+    const t = new EventTranslator();
+    const out = t.translate(
+      ev("model.streaming", {
+        kind: "reasoning_delta",
+        delta: "thinking",
+        assistantMessageId: "m2",
+      }),
+    );
+    expect(out).toEqual([{ kind: "ReasoningDelta", text: "thinking", messageId: "m2" }]);
   });
 
   it("emits a ReasoningDelta on reasoning_delta", () => {
@@ -65,6 +99,43 @@ describe("EventTranslator", () => {
     expect(out2).toHaveLength(0);
   });
 
+  it("creates an in-progress tool call when started arrives without scheduled", () => {
+    const t = new EventTranslator();
+    t.translate(
+      ev("model.streaming", {
+        kind: "tool_call",
+        toolCallId: "c2_missing_scheduled",
+        toolName: "Bash",
+        input: { command: "sleep 140" },
+      }),
+    );
+
+    const out = t.translate(
+      ev("tool.updated", { kind: "started", toolCallId: "c2_missing_scheduled" }),
+    );
+
+    expect(out).toEqual([
+      expect.objectContaining({
+        kind: "ToolCallNew",
+        callId: "c2_missing_scheduled",
+        tool: "Bash",
+        status: "in_progress",
+        title: "Bash: sleep 140",
+        input: { command: "sleep 140" },
+      }),
+    ]);
+    expect(t.seenToolIds.has("c2_missing_scheduled")).toBe(true);
+    expect(
+      t.translate(
+        ev("tool.updated", {
+          kind: "scheduled",
+          toolCallId: "c2_missing_scheduled",
+          toolName: "Bash",
+        }),
+      ),
+    ).toEqual([]);
+  });
+
   it("translates tool.updated result → completed ToolCallUpdate with content for Read", () => {
     const t = new EventTranslator();
     t.translate(ev("tool.updated", { kind: "scheduled", toolCallId: "c3", toolName: "Read" }));
@@ -81,6 +152,36 @@ describe("EventTranslator", () => {
     expect(u.content?.[0]).toMatchObject({
       type: "content",
       content: { type: "text", text: "file body" },
+    });
+  });
+
+  it("creates a tool call before completing a result received without prior lifecycle events", () => {
+    const t = new EventTranslator();
+    t.translate(
+      ev("model.streaming", {
+        kind: "tool_call",
+        toolCallId: "c3_missing_lifecycle",
+        toolName: "Read",
+        input: { file_path: "README.md" },
+      }),
+    );
+
+    const out = t.translate(
+      ev("tool.updated", {
+        kind: "result",
+        toolCallId: "c3_missing_lifecycle",
+        result: { success: true, content: "file body" },
+      }),
+    );
+
+    expect(out.map((event) => [event.kind, event.status])).toEqual([
+      ["ToolCallNew", "in_progress"],
+      ["ToolCallUpdate", "completed"],
+    ]);
+    expect(out[0]).toMatchObject({
+      callId: "c3_missing_lifecycle",
+      tool: "Read",
+      input: { file_path: "README.md" },
     });
   });
 
@@ -180,13 +281,132 @@ describe("EventTranslator", () => {
     expect(t.turnFailed).toBe(false);
     expect(t.turnResultType).toBe("cancelled");
   });
+
+  it("captures turn.completed usage payload verbatim (and still emits UsageDelta)", () => {
+    const t = new EventTranslator();
+    const usage = {
+      source: "provider",
+      modelRequestCount: 2,
+      inputTokens: 100,
+      outputTokens: 40,
+      totalTokens: 140,
+      cacheReadTokens: 60,
+      cacheWriteTokens: 5,
+      reasoningTokens: 12,
+      webFetchRequests: 0,
+      webSearchRequests: 1,
+    };
+    const out = t.translate(
+      ev("turn.completed", { resultType: "success", tokenCount: 140, usage }),
+    );
+    expect(t.turnUsage).toEqual(usage);
+    expect(out).toEqual([
+      { kind: "UsageDelta", used: 140, size: 0 },
+      { kind: "TurnInfo", resultType: "success" },
+    ]);
+  });
+
+  it("leaves turnUsage null when turn.completed carries no usage", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.completed", { resultType: "cancelled", tokenCount: 7 }));
+    expect(t.turnUsage).toBeNull();
+  });
+
+  it("does not set turnUsage on turn.failed", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.failed", { error: { code: "1308" }, usage: { totalTokens: 9 } }));
+    expect(t.turnUsage).toBeNull();
+  });
+});
+
+describe("EventTranslator turn.completed resultType + cacheStats", () => {
+  const cacheStats = {
+    totalMessages: 45,
+    cachedMessages: 42,
+    lastCacheHit: true,
+    cacheReadTokens: 12300,
+  };
+
+  it("captures cacheStats verbatim and carries it on the TurnInfo event", () => {
+    const t = new EventTranslator();
+    const out = t.translate(
+      ev("turn.completed", { resultType: "success", tokenCount: 140, cacheStats }),
+    );
+    expect(t.turnCacheStats).toEqual(cacheStats);
+    const info = out.find((e) => e.kind === "TurnInfo") as Extract<
+      InternalEvent,
+      { kind: "TurnInfo" }
+    >;
+    expect(info.resultType).toBe("success");
+    expect(info.cacheStats).toEqual(cacheStats);
+  });
+
+  it("leaves cacheStats absent (null field) when turn.completed carries none", () => {
+    const t = new EventTranslator();
+    const out = t.translate(ev("turn.completed", { resultType: "success", tokenCount: 140 }));
+    expect(t.turnCacheStats).toBeNull();
+    const info = out.find((e) => e.kind === "TurnInfo") as Extract<
+      InternalEvent,
+      { kind: "TurnInfo" }
+    >;
+    expect(info.cacheStats).toBeUndefined();
+  });
+
+  it("accepts cacheStats without the optional cacheReadTokens", () => {
+    const t = new EventTranslator();
+    const out = t.translate(
+      ev("turn.completed", {
+        resultType: "success",
+        cacheStats: { totalMessages: 10, cachedMessages: 4, lastCacheHit: false },
+      }),
+    );
+    expect(t.turnCacheStats).toEqual({
+      totalMessages: 10,
+      cachedMessages: 4,
+      lastCacheHit: false,
+    });
+    expect(t.turnCacheStats).not.toHaveProperty("cacheReadTokens");
+    expect(out).toHaveLength(2);
+  });
+
+  it("carries a non-success resultType verbatim on the TurnInfo event", () => {
+    const t = new EventTranslator();
+    const out = t.translate(
+      ev("turn.completed", { resultType: "error_max_budget", tokenCount: 140, cacheStats }),
+    );
+    const info = out.find((e) => e.kind === "TurnInfo") as Extract<
+      InternalEvent,
+      { kind: "TurnInfo" }
+    >;
+    expect(info.resultType).toBe("error_max_budget");
+    // Non-success still carries the cache stats — the line renderer decides.
+    expect(info.cacheStats).toEqual(cacheStats);
+  });
+
+  it("ignores a malformed cacheStats block (never breaks the turn end)", () => {
+    const t = new EventTranslator();
+    const out = t.translate(
+      ev("turn.completed", {
+        resultType: "success",
+        cacheStats: { totalMessages: "many", cachedMessages: 4 },
+      }),
+    );
+    expect(t.turnCacheStats).toBeNull();
+    const info = out.find((e) => e.kind === "TurnInfo") as Extract<
+      InternalEvent,
+      { kind: "TurnInfo" }
+    >;
+    expect(info.cacheStats).toBeUndefined();
+    // The UsageDelta still emitted.
+    expect(out[0]?.kind).toBe("UsageDelta");
+  });
 });
 
 describe("EventTranslator background-task turn deferral", () => {
   it("skips every event of a background_task turn (defers to BackgroundTaskListener)", () => {
     const t = new EventTranslator();
     // A background notification turn starts.
-    t.translate(ev("turn.started", { inputSource: "background_task", turnId: "turn_bg" }));
+    t.translate(ev("turn.started", { inputSource: "background_task" }, "turn_bg"));
     // Its text deltas MUST NOT be emitted (else double-forwarded alongside the
     // bg listener) and MUST NOT set turnStarted.
     const out1 = t.translate(ev("model.streaming", { kind: "text_delta", delta: "bg result" }));
@@ -201,10 +421,10 @@ describe("EventTranslator background-task turn deferral", () => {
 
   it("resumes normal handling after the next user-initiated turn.started", () => {
     const t = new EventTranslator();
-    t.translate(ev("turn.started", { inputSource: "background_task", turnId: "turn_bg" }));
+    t.translate(ev("turn.started", { inputSource: "background_task" }, "turn_bg"));
     t.translate(ev("model.streaming", { kind: "text_delta", delta: "bg" })); // dropped
     // A normal user turn starts → deferral cleared.
-    t.translate(ev("turn.started", { turnId: "turn_user" }));
+    t.translate(ev("turn.started", {}, "turn_user"));
     expect(t.turnStarted).toBe(true);
     const out = t.translate(ev("model.streaming", { kind: "text_delta", delta: "user reply" }));
     expect(out).toEqual([{ kind: "TextDelta", text: "user reply" }]);
@@ -212,7 +432,7 @@ describe("EventTranslator background-task turn deferral", () => {
 
   it("ignores background_task tool.updated events inside the deferred turn", () => {
     const t = new EventTranslator();
-    t.translate(ev("turn.started", { inputSource: "background_task", turnId: "turn_bg" }));
+    t.translate(ev("turn.started", { inputSource: "background_task" }, "turn_bg"));
     const out = t.translate(
       ev("tool.updated", { kind: "scheduled", toolCallId: "c1", toolName: "Read" }),
     );
@@ -301,5 +521,152 @@ describe("EventTranslator run_in_background flag threading", () => {
     );
     const u = out[0] as Extract<InternalEvent, { kind: "ToolCallUpdate" }>;
     expect(u.background).toBeUndefined();
+  });
+});
+
+describe("EventTranslator foreign internal-turn attribution", () => {
+  it("ignores a goal/compact internal turn started mid-turn (ghost-completed bug)", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", {}, "turn_user"));
+    // session/goal(set) starts a backend-internal turn on the same session.
+    expect(t.translate(ev("turn.started", {}, "turn_goal"))).toEqual([]);
+    // Its output and terminal event MUST NOT touch this translator's state.
+    expect(t.translate(ev("model.streaming", { kind: "text_delta", delta: "goal ack" }))).toEqual(
+      [],
+    );
+    expect(t.translate(ev("turn.completed", { resultType: "success" }, "turn_goal"))).toEqual([]);
+    expect(t.turnDone).toBe(false);
+    // The user's own turn completes normally afterwards.
+    t.translate(ev("turn.completed", { resultType: "success" }, "turn_user"));
+    expect(t.turnDone).toBe(true);
+  });
+
+  it("drops a mismatched turn.completed even without a foreign turn.started", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", {}, "turn_user"));
+    t.translate(ev("turn.completed", { resultType: "success" }, "turn_other"));
+    expect(t.turnDone).toBe(false);
+    t.translate(ev("turn.completed", { resultType: "success" }, "turn_user"));
+    expect(t.turnDone).toBe(true);
+  });
+
+  it("drops a mismatched turn.failed too", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", {}, "turn_user"));
+    t.translate(ev("turn.failed", { error: { code: "x" } }, "turn_goal"));
+    expect(t.turnFailed).toBe(false);
+    expect(t.turnDone).toBe(false);
+  });
+
+  it("keeps legacy behavior when turnId is absent (old backends)", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", {}));
+    t.translate(ev("turn.completed", { resultType: "success" }));
+    expect(t.turnDone).toBe(true);
+  });
+
+  it("falls back to a payload-carried turnId (legacy builds)", () => {
+    // 0.16.9 carries turnId on the envelope only; the payload spelling was
+    // the original (bundle-era) read and must keep working on builds that
+    // put it there.
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", { turnId: "turn_user" }));
+    t.translate(ev("turn.completed", { turnId: "turn_other", resultType: "success" }));
+    expect(t.turnDone).toBe(false);
+    t.translate(ev("turn.completed", { turnId: "turn_user", resultType: "success" }));
+    expect(t.turnDone).toBe(true);
+  });
+
+  it("reads turnId from the ENVELOPE, where 0.16.9 puts it", () => {
+    // The attribution guard was dead code while it read the payload: the
+    // turn.* payloads are strict and carry no turnId (source: zcode-protocol
+    // index.ts:1166+, 1229+), so a payload-only read never armed it.
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", {}, "turn_user"));
+    // A control-only turn (session/goal set) lands mid-user-turn.
+    expect(t.translate(ev("turn.started", {}, "turn_ctl"))).toEqual([]);
+    expect(t.translate(ev("model.streaming", { kind: "text_delta", delta: "ctl" }))).toEqual([]);
+    // Its terminal event names ITS turn on the envelope — dropped, and our
+    // turn keeps running.
+    expect(t.translate(ev("turn.completed", { resultType: "success" }, "turn_ctl"))).toEqual([]);
+    expect(t.turnDone).toBe(false);
+    t.translate(ev("turn.completed", { resultType: "success" }, "turn_user"));
+    expect(t.turnDone).toBe(true);
+  });
+
+  it("accepts a turn.completed matching the active turnId", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", {}, "turn_user"));
+    const out = t.translate(ev("turn.completed", { resultType: "success" }, "turn_user"));
+    expect(t.turnDone).toBe(true);
+    expect(out).toEqual([
+      { kind: "UsageDelta", used: 0, size: 0 },
+      { kind: "TurnInfo", resultType: "success" },
+    ]);
+  });
+
+  it("processes OUR turn.completed even while a foreign turn is still in flight", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", {}, "turn_user"));
+    t.translate(ev("turn.started", {}, "turn_goal")); // foreign, skipping
+    // The user turn completes FIRST (goal turn still running) — its terminal
+    // event must NOT be swallowed as foreign, else the turn loop hangs until
+    // the STALE_FREEZE_MS backstop.
+    t.translate(ev("turn.completed", { resultType: "success" }, "turn_user"));
+    expect(t.turnDone).toBe(true);
+  });
+});
+
+describe("EventTranslator protocol-layer terminal broadcast (state.updated)", () => {
+  // 0.16.9's protocol layer emits state.updated {reason:"prompt_completed"} in
+  // runPromptTurnInBackground's finally (server-operations.ts:2469) and
+  // "prompt_failed" when the turn threw (:2445). Unlike turn.completed it is
+  // emitted by the protocol layer, so it survives a deaf event stream; the
+  // turn loop's stall branch consults these flags to end a lost-terminal turn
+  // in seconds instead of waiting out STALE_FREEZE_MS.
+  it("records prompt_completed after our turn.started", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", {}, "turn_user"));
+    t.translate(ev("state.updated", { reason: "prompt_completed", revision: 7 }));
+    expect(t.sawPromptCompleted).toBe(true);
+    expect(t.sawPromptFailed).toBe(false);
+    // The flag alone must NOT end the turn — the loop decides at its stall gate
+    // (the notification carries no turnId, so it cannot attribute turns).
+    expect(t.turnDone).toBe(false);
+  });
+
+  it("records prompt_failed as the failed flavour", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", {}, "turn_user"));
+    t.translate(ev("state.updated", { reason: "prompt_failed" }));
+    expect(t.sawPromptFailed).toBe(true);
+    expect(t.sawPromptCompleted).toBe(false);
+    expect(t.turnFailed).toBe(false);
+  });
+
+  it("ignores a terminal broadcast that arrives before our turn.started (previous turn's)", () => {
+    const t = new EventTranslator();
+    t.translate(ev("state.updated", { reason: "prompt_completed" }));
+    expect(t.sawPromptCompleted).toBe(false);
+  });
+
+  it("ignores a terminal broadcast once the terminal event already landed", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", {}, "turn_user"));
+    t.translate(ev("turn.completed", { resultType: "success" }, "turn_user"));
+    t.translate(ev("state.updated", { reason: "prompt_completed" }));
+    expect(t.sawPromptCompleted).toBe(false);
+  });
+
+  it("still forwards the settings patch alongside the terminal reason", () => {
+    const t = new EventTranslator();
+    t.translate(ev("turn.started", {}, "turn_user"));
+    const out = t.translate(
+      ev("state.updated", {
+        reason: "prompt_completed",
+        patch: { model: { current: { providerId: "p", modelId: "m" } } },
+      }),
+    );
+    expect(out).toEqual([{ kind: "ConfigChanged", model: { providerId: "p", modelId: "m" } }]);
   });
 });

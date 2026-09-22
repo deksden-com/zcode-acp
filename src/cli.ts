@@ -2,9 +2,10 @@
 
 /**
  * Unified CLI entry (`zcode-acp`). Every operational surface is a subcommand;
- * bare invocation opens the interactive REPL. See docs/adr/0007 for why the
- * old `zcode-acp-hub` / `zcode-quota` bins were folded in here and why
- * `zcode-acp-server` remains as a bin alias pointing at this same file.
+ * bare invocation opens the interactive Martty TUI (ADR-0020). See docs/adr
+ * 0007 for why the old `zcode-acp-hub` / `zcode-quota` bins were folded in
+ * here and why `zcode-acp-server` remains as a bin alias pointing at this
+ * same file.
  *
  * The legacy alias is detected via argv[0]: npm/pnpm install bin names as
  * symlinks, so both `zcode-acp` and `zcode-acp-server` resolve to dist/cli.js
@@ -12,26 +13,23 @@
  * user (or editor config) actually typed.
  */
 
-import { execFileSync } from "node:child_process";
-import { basename, dirname } from "node:path";
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
 
 import { main as runHub } from "./bin/hub.js";
 import { main as runQuota } from "./bin/quota.js";
-import { main as runServer } from "./index.js";
-import { runRepl } from "./repl/run.js";
+import { main as runServer, runHeadless } from "./index.js";
+import { reexecToBunIfEligible } from "./runtime.js";
+import { checkTuiRuntime, runTui } from "./tui.js";
 import { AGENT_INFO } from "./utils.js";
 
-export const DD_HARNESS_CONTRACT = "dd-zcode-harness@1";
+export const DD_HARNESS_CONTRACT = "dd-zcode-harness@2";
 
 function harnessCommit(): string {
   try {
-    return execFileSync("git", ["rev-parse", "HEAD"], {
-      cwd: dirname(fileURLToPath(import.meta.url)),
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
+    const build = JSON.parse(readFileSync(new URL("./dd-harness-build.json", import.meta.url), "utf8"));
+    return build.dirty ? "unknown" : build.source_commit ?? "unknown";
   } catch {
     return "unknown";
   }
@@ -40,8 +38,9 @@ function harnessCommit(): string {
 /** What the dispatcher decided to run. `args` are the tokens after the subcommand. */
 export type Invocation =
   | { kind: "help" }
-  | { kind: "repl"; explicit: boolean }
+  | { kind: "tui"; explicit: boolean; check: boolean }
   | { kind: "server" }
+  | { kind: "serve" }
   | { kind: "hub" }
   | { kind: "quota"; args: string[] }
   | { kind: "unknown"; sub: string };
@@ -51,19 +50,24 @@ export type Invocation =
  *
  * `invokedAs` is basename(argv[1]); `zcode-acp-server` means we were spawned
  * by an editor config that expects the bridge to speak ACP on stdio with no
- * subcommand prefix. Bare `zcode-acp` opens the interactive REPL.
+ * subcommand prefix. Bare `zcode-acp` opens the interactive Martty TUI;
+ * `repl` stays accepted as the old spelling of `tui`.
  */
 export function resolveInvocation(invokedAs: string, argv: readonly string[]): Invocation {
   if (invokedAs === "zcode-acp-server") return { kind: "server" };
   const sub = argv[0];
-  if (sub === undefined) return { kind: "repl", explicit: false };
-  if (sub === "repl" || sub === "tui") return { kind: "repl", explicit: true };
+  if (sub === undefined) return { kind: "tui", explicit: false, check: false };
+  if (sub === "repl" || sub === "tui") {
+    return { kind: "tui", explicit: true, check: argv.slice(1).includes("--check") };
+  }
   if (sub === "-h" || sub === "--help" || sub === "help") {
     return { kind: "help" };
   }
   switch (sub) {
     case "server":
       return { kind: "server" };
+    case "serve":
+      return { kind: "serve" };
     case "hub":
       return { kind: "hub" };
     case "quota":
@@ -76,15 +80,20 @@ export function resolveInvocation(invokedAs: string, argv: readonly string[]): I
 const HELP_TEXT = `Usage: zcode-acp [command] [options]
 
 The single entry point for every zcode-acp-server surface. Bare invocation
-opens the interactive REPL (agent chat in this terminal).
+opens the interactive Martty TUI (agent chat in this terminal).
 
 Commands:
-  (none) | repl       Interactive agent chat (Ink UI): stream output, tool
-                      rows, arrow-key permission prompts. /exit quits.
+  (none) | tui       Interactive agent chat (Martty TUI): stream output,
+                      tool rows, model picker, session resume. /exit quits.
+                      'tui --check' runs a headless wiring check and exits.
   quota [args...]   Plan usage cards (was the zcode-quota bin): -w watch,
                     -i <sec>, -d detail, -p plain, provider glm|go.
   hub               Run the remote-access hub daemon (was zcode-acp-hub;
                     usually auto-spawned by bridges, rarely run by hand).
+  serve             Headless bridge for remote session-create (ADR-0014):
+                    no stdio editor, lives for remote WS clients until idle.
+                    Normally spawned by the hub, not run by hand (needs
+                    ZCODE_ACP_REMOTE=1 + ZCODE_ACP_REMOTE_TOKEN).
   server            The editor-facing ACP bridge over stdio (was
                     zcode-acp-server; editors normally launch it via the bin
                     alias without this subcommand).
@@ -112,17 +121,27 @@ async function main(): Promise<void> {
     return;
   }
   const invocation = resolveInvocation(basename(process.argv[1] ?? ""), process.argv.slice(2));
+  // Long-running surfaces hand over to `bun --smol` when available (idle RSS
+  // ~47 MB vs ~81 MB on Node); the instant paths (help/version/unknown) skip
+  // the re-exec hop entirely.
+  if (invocation.kind !== "help" && invocation.kind !== "unknown") {
+    if (await reexecToBunIfEligible(process.argv[1] ?? "", process.argv.slice(2))) return;
+  }
   switch (invocation.kind) {
     case "help":
       process.stdout.write(HELP_TEXT + "\n");
       return;
-    case "repl":
+    case "tui":
+      if (invocation.check) {
+        process.exitCode = (await checkTuiRuntime()) ? 0 : 1;
+        return;
+      }
       if (process.stdin.isTTY && process.stdout.isTTY) {
-        await runRepl();
+        await runTui();
         return;
       }
       if (invocation.explicit) {
-        process.stderr.write("zcode-acp: interactive REPL needs a TTY — run it from a terminal.\n");
+        process.stderr.write("zcode-acp: interactive TUI needs a TTY — run it from a terminal.\n");
         process.exit(2);
       }
       // Bare invocation without a TTY falls back to the stdio server: on
@@ -133,6 +152,9 @@ async function main(): Promise<void> {
       return;
     case "server":
       await runServer();
+      return;
+    case "serve":
+      await runHeadless();
       return;
     case "hub":
       await runHub();

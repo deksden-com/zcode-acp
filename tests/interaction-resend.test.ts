@@ -29,13 +29,15 @@ import {
   handleAskUserQuestion,
   resendPendingInteractions,
 } from "../src/handlers/server-requests.js";
-import type { ClientLike } from "../src/remote/broadcast.js";
+import { ClientRegistry, type ClientLike } from "../src/remote/broadcast.js";
 
 /** Minimal server stub: elicitation form supported (preferred AskUser path). */
 function makeServer(): ZcodeAcpServer {
   return {
     supportsElicitationForm: () => true,
     nextId: () => 1,
+    clients: new ClientRegistry(),
+    sessionAliases: (sid: string) => [sid],
   } as unknown as ZcodeAcpServer;
 }
 
@@ -264,4 +266,42 @@ describe("reconnect resend of undecided interactions", () => {
       content: { answers: { "Language?": "JS" } },
     });
   });
+
+  it("tells attached clients ($/zcode/ask_settled) once the race settles", async () => {
+    // The stale-popup fix: the SDK never sends $/cancel_request to the losing
+    // client, so the bridge must say "this ask was decided" explicitly — a
+    // client still showing the dialog dismisses it on this notification.
+    const server = makeServer();
+    const watcherA = makeRecordingClient();
+    const watcherB = makeRecordingClient();
+    server.clients.add(watcherA.client);
+    server.clients.add(watcherB.client);
+
+    const zed = makeAnsweringClient(elicitAccept("TS"));
+    const resultP = startPendingAsk(server, zed.client as unknown as acp.AgentContext);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await resultP).toMatchObject({ action: "accept" });
+
+    for (const watcher of [watcherA, watcherB]) {
+      const settled = watcher.notifications.filter((n) => n.method === "$/zcode/ask_settled");
+      expect(settled).toEqual([
+        { method: "$/zcode/ask_settled", params: { sessionId: "s1", kind: "elicitation" } },
+      ]);
+    }
+  });
 });
+
+/** A client that records notifications — models an attached dialog holder. */
+function makeRecordingClient(): {
+  client: ClientLike;
+  notifications: Array<{ method: string; params: unknown }>;
+} {
+  const notifications: Array<{ method: string; params: unknown }> = [];
+  const client: ClientLike = {
+    notify: async (method, params) => {
+      notifications.push({ method, params });
+    },
+    request: (() => new Promise<never>(() => {})) as unknown as ClientLike["request"],
+  };
+  return { client, notifications };
+}

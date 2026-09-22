@@ -3,8 +3,11 @@
  * ZCode uses, so `/mcp` can show users exactly which servers are available.
  *
  * Sources:
- *   1. ~/.zcode/cli/config.json → mcp.servers (user-configured)
+ *   1. <zcode-home>/cli/config.json → mcp.servers (user-configured)
  *   2. Enabled plugin .mcp.json files (two formats: flat and nested)
+ *
+ * `<zcode-home>` is the ZCode data root (`~/.zcode`, or `$ZCODE_HOME` when
+ * set — see `zcodeHomeDir()`).
  *
  * The ZCode backend loads these automatically and exposes their tools to the
  * model. This module is purely informational — it lists what's configured so
@@ -12,10 +15,10 @@
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import path from "node:path";
 
-import { compareVersions, log } from "../utils.js";
+import { messages } from "../i18n.js";
+import { compareVersions, log, zcodeCliConfigPath, zcodePluginCacheDir } from "../utils.js";
 
 /** Information about a discovered MCP server. */
 export interface McpServerInfo {
@@ -43,10 +46,6 @@ interface McpServerConfig {
   url?: string;
 }
 
-const HOME = homedir();
-const CLI_CONFIG_PATH = path.join(HOME, ".zcode", "cli", "config.json");
-const PLUGIN_CACHE_DIR = path.join(HOME, ".zcode", "cli", "plugins", "cache");
-
 /**
  * Discover all MCP servers from config.json and enabled plugins.
  *
@@ -57,8 +56,9 @@ export function loadMcpServers(): McpServerInfo[] {
 
   let config: CliConfig | null = null;
   try {
-    if (existsSync(CLI_CONFIG_PATH)) {
-      config = JSON.parse(readFileSync(CLI_CONFIG_PATH, "utf8")) as CliConfig;
+    const cliConfigPath = zcodeCliConfigPath();
+    if (existsSync(cliConfigPath)) {
+      config = JSON.parse(readFileSync(cliConfigPath, "utf8")) as CliConfig;
     }
   } catch (e) {
     log(`mcp-discovery: config read failed (${e instanceof Error ? e.message : String(e)})`);
@@ -87,7 +87,7 @@ export function loadMcpServers(): McpServerInfo[] {
     const pluginName = pluginKey.slice(0, atIdx);
     const marketplace = pluginKey.slice(atIdx + 1);
 
-    const pluginDir = path.join(PLUGIN_CACHE_DIR, marketplace, pluginName);
+    const pluginDir = path.join(zcodePluginCacheDir(), marketplace, pluginName);
     if (!existsSync(pluginDir)) continue;
 
     // Find the latest version directory.
@@ -143,31 +143,32 @@ export function loadMcpServers(): McpServerInfo[] {
  * Groups by source (config vs plugins) and aligns columns for readability.
  */
 export function formatMcpServers(servers: McpServerInfo[]): string {
+  const m = messages();
   if (servers.length === 0) {
-    return "📡 No MCP servers configured.\nUse the ZCode desktop app to add MCP servers.";
+    return m.mcpNone;
   }
 
   const configServers = servers.filter((s) => s.source === "config");
   const pluginServers = servers.filter((s) => s.source !== "config");
 
-  const lines: string[] = [`📡 MCP Servers (${servers.length})`];
+  const lines: string[] = [m.mcpHeader(servers.length)];
 
   if (configServers.length > 0) {
-    lines.push("", "From config.json:");
+    lines.push("", m.mcpFromConfig);
     for (const s of configServers) {
       lines.push(`  ${pad(s.name, 16)} ${pad(s.type, 6)} ${formatEndpoint(s)}`);
     }
   }
 
   if (pluginServers.length > 0) {
-    lines.push("", "From plugins:");
+    lines.push("", m.mcpFromPlugins);
     for (const s of pluginServers) {
       const pluginLabel = `[${s.source.replace("plugin: ", "")}]`;
       lines.push(`  ${pad(s.name, 16)} ${pad(s.type, 6)} ${formatEndpoint(s)}  ${pluginLabel}`);
     }
   }
 
-  lines.push("", "MCP tools are auto-invoked by the model when needed.");
+  lines.push("", m.mcpFooter);
   return lines.join("\n");
 }
 
@@ -191,4 +192,41 @@ function formatEndpoint(s: McpServerInfo): string {
 /** Pad a string to the given width for column alignment. */
 function pad(s: string, width: number): string {
   return s.length >= width ? s : s + " ".repeat(width - s.length);
+}
+
+/**
+ * Per-server health from the backend `mcp/list` RPC with `mode:"status"`
+ * (zcodeMcpServerStatusSnapshot): per-server health WITHOUT connecting.
+ * `failureKind` and `authorizationUrl` are present only when set.
+ */
+export interface McpServerHealth {
+  status: string;
+  toolCount: number;
+  failureKind?: string;
+  authorizationUrl?: string;
+}
+
+/**
+ * Format the backend's live MCP health map into a card for `/mcp`.
+ *
+ * One line per server — `name · status · N tools · failureKind` (failureKind
+ * only when present, raw enum value) — with a pending OAuth authorizationUrl
+ * indented on its own line beneath its server.
+ */
+export function formatMcpServerHealth(statuses: Record<string, McpServerHealth>): string {
+  const m = messages();
+  const names = Object.keys(statuses).sort();
+  if (names.length === 0) {
+    return m.mcpNone;
+  }
+  const lines: string[] = [m.mcpHealthHeader(names.length), ""];
+  for (const name of names) {
+    const h = statuses[name]!;
+    const parts = [name, h.status, m.mcpHealthTools(h.toolCount)];
+    if (h.failureKind) parts.push(h.failureKind);
+    lines.push(`  ${parts.join(" · ")}`);
+    if (h.authorizationUrl) lines.push(`    ${h.authorizationUrl}`);
+  }
+  lines.push("", m.mcpFooter);
+  return lines.join("\n");
 }

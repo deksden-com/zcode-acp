@@ -5,6 +5,7 @@
  * so either can feed `dispatchEvent`. State held per-translator:
  *   - seenToolIds / toolNames / toolInputs / finalToolIds for tool lifecycle
  *   - turnStarted / turnDone / turnFailed / turnResultType / turnError for turn state
+ *     (plus turnUsage / turnCacheStats captured from the same terminal event)
  *
  * A critical quirk: zcode streams tool input via `model.streaming tool_call`
  * BEFORE the `tool.updated scheduled` event, whose `input` is then omitted
@@ -20,11 +21,17 @@ import {
   summarizeToolInput,
   TOOL_KIND_MAP,
 } from "./tool-helpers.js";
-import type { InternalEvent } from "./types.js";
+import type { InternalEvent, TurnCacheStats } from "./types.js";
 
 interface ZcodeEventPayload {
   type?: string;
   payload?: Record<string, unknown>;
+  /**
+   * Turn attribution from the event ENVELOPE (0.16.9 puts turnId there, not
+   * in the payload — see ZcodeEvent). The payload spelling remains as a
+   * fallback for builds that carried it inside.
+   */
+  turnId?: string;
 }
 
 /**
@@ -46,6 +53,41 @@ export class EventTranslator {
   turnResultType: string | null = null;
   turnError: Record<string, unknown> | null = null;
   /**
+   * Usage object from this turn's `turn.completed` payload, verbatim from the
+   * backend. The backend merges every model call's usage into one billing-
+   * grade object ({source, modelRequestCount, inputTokens, outputTokens,
+   * totalTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens,
+   * webFetchRequests, webSearchRequests}); it is omitted when no model call
+   * reported usage. Per-turn scope, not session-cumulative. Consumed by the
+   * prompt loop to fill the ACP `PromptResponse.usage` field.
+   */
+  turnUsage: Record<string, unknown> | null = null;
+  /**
+   * cacheStats from this turn's `turn.completed` payload (prompt-cache hit
+   * counts; `cacheReadTokens` optional). Null when the backend sent none —
+   * pre-cacheStats builds omit the field. Consumed by the dispatcher to render
+   * the turn-end status line alongside the TurnInfo event.
+   */
+  turnCacheStats: TurnCacheStats | null = null;
+  /**
+   * The protocol layer's authoritative terminal broadcast for a session/send
+   * turn: `state.updated {reason:"prompt_completed"}` from
+   * runPromptTurnInBackground's finally (server-operations.ts:2469), and
+   * `"prompt_failed"` when the turn threw (:2445). Unlike `turn.completed` it
+   * is emitted by the protocol layer, so it survives a deaf event stream — the
+   * turn loop consults these flags in its stall branch to end a
+   * lost-terminal turn in seconds instead of waiting out STALE_FREEZE_MS
+   * (10 min).
+   *
+   * Deliberately NOT a primary terminal: the notification carries no turnId,
+   * and a prompt accepted during the previous turn's post-clear snapshot build
+   * (`afterStateMutation` awaits real I/O before emitting) could deliver a
+   * stale one to the next turn's translator. Only set after OUR
+   * `turn.started`, and only acted on after 15s of stream silence.
+   */
+  sawPromptCompleted = false;
+  sawPromptFailed = false;
+  /**
    * True while inside a background-task notification turn
    * (`turn.started {inputSource:"background_task"}`). Set on its turn.started,
    * cleared on the next user-initiated turn.started. While true, `translate`
@@ -53,14 +95,41 @@ export class EventTranslator {
    */
   private skippingBackgroundTurn = false;
   /**
-   * Backend message ids (`assistantMessageId`) whose content reached this
+   * turnId of the user turn this translator owns (from its `turn.started`).
+   * Backend-internal turns (`session/goal` set, `session/compact`) emit their
+   * own turn.started/turn.completed on the SAME session mid-turn: without
+   * attribution, their turn.completed flipped turnDone and the bridge ended
+   * the user's turn while the backend kept generating (the "ghost completed"
+   * remote-status bug). turnId-less backends keep the old behavior (both ids
+   * must be present for a mismatch to drop an event).
+   *
+   * Read from the event ENVELOPE (`event.turnId`) — 0.16.9's turn.* payloads
+   * are strict and carry no turnId; a payload-only read silently nulled this
+   * and the whole attribution below was dead code (fixed 2026-09-21).
+   */
+  private activeTurnId: string | null = null;
+  private skippingForeignTurn = false;
+  /**
+   * Backend message ids (`assistantMessageId`) whose TEXT reached this
    * translator via the live event stream. Used by the turn loop to dedup the
    * turn-completion fallback replay: a message already streamed live must not
    * be re-emitted by `ProjectionDiffer.diff()`, while messages produced while
    * no listener was attached (e.g. a backend turn resumed after compaction)
    * have no live deltas and must be replayed.
+   *
+   * TEXT-only by contract. Text and reasoning share one assistant message id
+   * (the differ tags both replays with `m.info.id`), and GLM-style backends
+   * stream the text live while the CoT reaches us only via the completion
+   * snapshot — a shared set would let the streamed text suppress the reasoning
+   * replay entirely.
    */
   readonly deliveredMessageIds = new Set<string>();
+  /**
+   * Same contract as `deliveredMessageIds`, for REASONING content. Kept
+   * separate so live-streamed reasoning never suppresses the differ's
+   * reasoning replay (and vice versa: streamed text must not).
+   */
+  readonly deliveredReasoningMessageIds = new Set<string>();
 
   /** Tool call ids we've already emitted a ToolCallNew for. */
   readonly seenToolIds = new Set<string>();
@@ -100,6 +169,20 @@ export class EventTranslator {
         return results;
       }
       this.skippingBackgroundTurn = false;
+      // Envelope-first (0.16.9 shape); a payload-carried turnId stays valid
+      // for builds that spelled it that way.
+      const turnId = event.turnId ?? (payload["turnId"] as string) ?? null;
+      if (!this.turnStarted) {
+        this.activeTurnId = turnId;
+        this.skippingForeignTurn = false;
+      } else if (turnId && this.activeTurnId && turnId !== this.activeTurnId) {
+        // A second, different turn started mid-turn: a backend-internal turn
+        // (goal set / compact). Its events belong to that turn — drop them
+        // until it completes and our own turn's events resume.
+        this.skippingForeignTurn = true;
+        log(`  [event] turn.started (foreign turn ${turnId.slice(-8)}) → skipping its events`);
+        return results;
+      }
       this.turnStarted = true;
       log("  [event] turn.started");
     } else if (this.skippingBackgroundTurn) {
@@ -107,15 +190,45 @@ export class EventTranslator {
       // listener handles it). turn.completed/turn.failed for the bg turn also
       // land here and are intentionally NOT used to set turnDone.
       return results;
+    } else if (etype === "turn.completed" || etype === "turn.failed") {
+      const evTurnId = event.turnId ?? (payload["turnId"] as string) ?? null;
+      if (this.skippingForeignTurn) {
+        // A turn ended while a foreign (internal) turn was in flight. When it
+        // provably belongs to the foreign turn, drop it and resume normal
+        // processing. When it names OUR turn (the user turn can complete
+        // before the internal one), fall through — swallowing it here would
+        // leave turnDone unset and the turn loop waiting out STALE_FREEZE_MS.
+        this.skippingForeignTurn = false;
+        if (!(evTurnId && this.activeTurnId && evTurnId === this.activeTurnId)) {
+          log(`  [event] ${etype} (foreign turn) → ignored`);
+          return results;
+        }
+      }
+      if (evTurnId && this.activeTurnId && evTurnId !== this.activeTurnId) {
+        log(`  [event] ${etype} (turnId mismatch) → ignored`);
+        return results;
+      }
+      if (etype === "turn.completed") {
+        this.turnDone = true;
+        this.turnResultType = (payload["resultType"] as string) ?? "success";
+        this.turnUsage = (payload["usage"] as Record<string, unknown>) ?? null;
+        this.turnCacheStats = parseCacheStats(payload["cacheStats"]);
+        results.push(...this.translateTurnDone(payload));
+        log(`  [event] turn.completed (resultType=${this.turnResultType})`);
+      } else {
+        this.turnDone = true;
+        this.turnFailed = true;
+        this.turnError = (payload["error"] as Record<string, unknown>) ?? {};
+        this.turnResultType = (payload["resultType"] as string) ?? "error";
+        const err = this.turnError;
+        warn(`  [event] turn.failed (code=${err["code"] ?? err["type"] ?? "?"})`);
+      }
+    } else if (this.skippingForeignTurn) {
+      return results;
     } else if (etype === "model.streaming") {
       results.push(...this.translateStreaming(payload));
     } else if (etype === "tool.updated") {
       results.push(...this.translateTool(payload));
-    } else if (etype === "turn.completed") {
-      this.turnDone = true;
-      this.turnResultType = (payload["resultType"] as string) ?? "success";
-      results.push(...this.translateTurnDone(payload));
-      log(`  [event] turn.completed (resultType=${this.turnResultType})`);
     } else if (etype === "session.updated") {
       const usage = (payload["usage"] as Record<string, unknown>) ?? {};
       const used = usage["inputTokens"];
@@ -128,14 +241,19 @@ export class EventTranslator {
       // mid-turn). The backend notification carries the authoritative full
       // settings patch — forward the new values so the editor UI follows the
       // switch immediately instead of at the next turn's completion.
+      const reason = payload["reason"];
+      if (
+        (reason === "prompt_completed" || reason === "prompt_failed") &&
+        this.turnStarted &&
+        !this.turnDone
+      ) {
+        // Authoritative terminal broadcast for OUR turn (see the field
+        // docstrings for why this is not a primary terminal).
+        if (reason === "prompt_failed") this.sawPromptFailed = true;
+        else this.sawPromptCompleted = true;
+        log(`  [event] state.updated (${reason}) → terminal broadcast recorded`);
+      }
       results.push(...this.translateStateUpdated(payload));
-    } else if (etype === "turn.failed") {
-      this.turnDone = true;
-      this.turnFailed = true;
-      this.turnError = (payload["error"] as Record<string, unknown>) ?? {};
-      this.turnResultType = (payload["resultType"] as string) ?? "error";
-      const err = this.turnError;
-      warn(`  [event] turn.failed (code=${err["code"] ?? err["type"] ?? "?"})`);
     }
     return results;
   }
@@ -169,14 +287,34 @@ export class EventTranslator {
     const delta = (payload["delta"] as string) ?? "";
     // Record the owning assistant message so the turn loop can distinguish
     // "already streamed live" from "produced while no listener was attached"
-    // when replaying missing content at turn completion.
+    // when replaying missing content at turn completion. Per-content-kind:
+    // text and reasoning share one assistantMessageId, and the completion
+    // replay must stay able to deliver the kind that did NOT stream live
+    // (GLM: text streams, reasoning arrives only via the snapshot).
     const msgId = payload["assistantMessageId"];
-    if (typeof msgId === "string" && msgId) this.deliveredMessageIds.add(msgId);
+    if (typeof msgId === "string" && msgId) {
+      if (kind === "reasoning_delta") this.deliveredReasoningMessageIds.add(msgId);
+      else if (kind === "text_delta") this.deliveredMessageIds.add(msgId);
+    }
+
+    // Carry the owning backend message id onto the emitted delta so the ACP
+    // chunk keeps one messageId per assistant message instead of one per turn.
+    const ownerId = typeof msgId === "string" && msgId ? msgId : undefined;
 
     if (kind === "text_delta") {
-      if (delta) results.push({ kind: "TextDelta", text: delta });
+      if (delta)
+        results.push({
+          kind: "TextDelta",
+          text: delta,
+          ...(ownerId ? { messageId: ownerId } : {}),
+        });
     } else if (kind === "reasoning_delta") {
-      if (delta) results.push({ kind: "ReasoningDelta", text: delta });
+      if (delta)
+        results.push({
+          kind: "ReasoningDelta",
+          text: delta,
+          ...(ownerId ? { messageId: ownerId } : {}),
+        });
     } else if (kind === "tool_call") {
       // Cache input + toolName for the later scheduled event.
       const callId = (payload["toolCallId"] as string) ?? "";
@@ -192,54 +330,29 @@ export class EventTranslator {
     const results: InternalEvent[] = [];
     const tkind = (payload["kind"] as string) ?? "";
     const callId = (payload["toolCallId"] as string) ?? "";
-    let toolName = (payload["toolName"] as string) ?? "";
+    const toolName = (payload["toolName"] as string) ?? "";
     const runtimeMeta = zcodeRuntimeMeta(payload);
 
     if (tkind === "scheduled") {
-      if (callId && !this.seenToolIds.has(callId)) {
-        this.seenToolIds.add(callId);
-        if (toolName) {
-          this.toolNames.set(callId, toolName);
-        } else {
-          toolName = this.toolNames.get(callId) ?? "unknown";
-        }
-        const acpKind = TOOL_KIND_MAP[toolName] ?? "execute";
-        // Input: scheduled payload first, fall back to cached tool_call input.
-        let inp = payload["input"];
-        if (inp === undefined) inp = this.toolInputs.get(callId);
-        const summary = summarizeToolInput(toolName, inp);
-        const title = summary ? `${toolName}: ${summary}` : toolName;
-        // Track background launches so the later `result` event (input omitted)
-        // can still tag its ToolCallUpdate. The BackgroundTaskListener also
-        // keys off this to know which callId owns the card.
-        const isBackground = isBackgroundInput(inp);
-        if (isBackground) this.backgroundCallIds.add(callId);
-        const newEv: InternalEvent = {
-          kind: "ToolCallNew",
-          callId,
-          tool: toolName,
-          acpKind,
-          status: "pending",
-          title,
-          ...(isBackground ? { background: true } : {}),
-          ...(runtimeMeta ? { runtimeMeta } : {}),
-        };
-        if (inp !== undefined) (newEv as { input?: unknown }).input = inp;
-        const locs = extractLocations(toolName, inp);
-        if (locs.length > 0) (newEv as { locations?: typeof locs }).locations = locs;
+      const newEv = this.createToolCall(callId, toolName, payload["input"], "pending");
+      if (newEv) {
+        if (runtimeMeta) newEv.runtimeMeta = runtimeMeta;
         results.push(newEv);
       }
     } else if (tkind === "started") {
       if (callId) {
-        results.push({
-          kind: "ToolCallUpdate",
-          callId,
-          status: "in_progress",
-          ...(runtimeMeta ? { runtimeMeta } : {}),
-        });
+        const newEv = this.createToolCall(callId, toolName, payload["input"], "in_progress");
+        if (newEv) {
+          if (runtimeMeta) newEv.runtimeMeta = runtimeMeta;
+          results.push(newEv);
+        } else {
+          results.push({ kind: "ToolCallUpdate", callId, status: "in_progress", ...(runtimeMeta ? { runtimeMeta } : {}) });
+        }
       }
     } else if (tkind === "progress") {
       if (callId) {
+        const newEv = this.createToolCall(callId, toolName, payload["input"], "in_progress");
+        if (newEv) results.push(newEv);
         const output = payload["stdoutTail"] ?? payload["stderrTail"] ?? "";
         const tn = (toolName || this.toolNames.get(callId)) ?? "";
         results.push({
@@ -254,6 +367,8 @@ export class EventTranslator {
       }
     } else if (tkind === "result") {
       if (callId) {
+        const newEv = this.createToolCall(callId, toolName, payload["input"], "in_progress");
+        if (newEv) results.push(newEv);
         const resultPayload = payload["result"];
         const tn = (toolName || this.toolNames.get(callId)) ?? "";
         const ev: InternalEvent = {
@@ -276,6 +391,8 @@ export class EventTranslator {
       }
     } else if (tkind === "error") {
       if (callId) {
+        const newEv = this.createToolCall(callId, toolName, payload["input"], "in_progress");
+        if (newEv) results.push(newEv);
         const tn = (toolName || this.toolNames.get(callId)) ?? "";
         const errPayload = payload["error"];
         const ev: InternalEvent = {
@@ -308,6 +425,37 @@ export class EventTranslator {
     return results;
   }
 
+  /** Create the first ACP tool event, even if the backend omitted `scheduled`. */
+  private createToolCall(
+    callId: string,
+    eventToolName: string,
+    eventInput: unknown,
+    status: "pending" | "in_progress",
+  ): Extract<InternalEvent, { kind: "ToolCallNew" }> | null {
+    if (!callId || this.seenToolIds.has(callId)) return null;
+    this.seenToolIds.add(callId);
+
+    const toolName = eventToolName || this.toolNames.get(callId) || "unknown";
+    this.toolNames.set(callId, toolName);
+    const input = eventInput === undefined ? this.toolInputs.get(callId) : eventInput;
+    const summary = summarizeToolInput(toolName, input);
+    const isBackground = isBackgroundInput(input);
+    if (isBackground) this.backgroundCallIds.add(callId);
+    const newEv: Extract<InternalEvent, { kind: "ToolCallNew" }> = {
+      kind: "ToolCallNew",
+      callId,
+      tool: toolName,
+      acpKind: TOOL_KIND_MAP[toolName] ?? "execute",
+      status,
+      title: summary ? `${toolName}: ${summary}` : toolName,
+      ...(isBackground ? { background: true } : {}),
+    };
+    if (input !== undefined) newEv.input = input;
+    const locations = extractLocations(toolName, input);
+    if (locations.length > 0) newEv.locations = locations;
+    return newEv;
+  }
+
   private translateTurnDone(payload: Record<string, unknown>): InternalEvent[] {
     const usage = (payload["usage"] as Record<string, unknown>) ?? {};
     // Use || (not ??) to match Python's `or` semantics: a falsy totalTokens
@@ -315,14 +463,38 @@ export class EventTranslator {
     // be kept as-is and never fall back, diverging from the Python reference.
     const used = (usage["totalTokens"] as number) || (payload["tokenCount"] as number) || 0;
     const size = (usage["contextWindow"] as number) || 0;
-    return [{ kind: "UsageDelta", used, size }];
+    // Terminal info line: resultType verbatim (success / cancelled /
+    // error_*) plus the prompt-cache stats when the backend sent them.
+    const info: InternalEvent = { kind: "TurnInfo", resultType: this.turnResultType ?? "success" };
+    if (this.turnCacheStats) info.cacheStats = this.turnCacheStats;
+    return [{ kind: "UsageDelta", used, size }, info];
   }
+}
+
+/**
+ * Parse `turn.completed` cacheStats. Returns undefined on absent/malformed
+ * input — an unreadable stats block must never break the turn-end flow.
+ */
+function parseCacheStats(raw: unknown): TurnCacheStats | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const o = raw as Record<string, unknown>;
+  const totalMessages = o["totalMessages"];
+  const cachedMessages = o["cachedMessages"];
+  if (typeof totalMessages !== "number" || typeof cachedMessages !== "number") return null;
+  const stats: TurnCacheStats = {
+    totalMessages,
+    cachedMessages,
+    lastCacheHit: o["lastCacheHit"] === true,
+  };
+  const read = o["cacheReadTokens"];
+  if (typeof read === "number") stats.cacheReadTokens = read;
+  return stats;
 }
 
 function zcodeRuntimeMeta(payload: Record<string, unknown>): Record<string, unknown> | null {
   const keys = ["source", "childSessionId", "agentId", "parentToolCallId", "taskId"];
   const meta = Object.fromEntries(
-    keys.flatMap((key) => (payload[key] === undefined ? [] : [[key, payload[key]]])),
+    keys.flatMap((key) => (payload[key] === undefined ? [] : [[key, payload[key]]] as const)),
   );
   return Object.keys(meta).length > 0 ? meta : null;
 }

@@ -370,6 +370,24 @@ Tool status update.
 
 The turn completed.
 
+`usage` carries the turn's billing-grade usage: the backend merges every model
+call's usage into one object (per-turn scope, not session-cumulative). It is
+omitted when no model call reported usage. The bridge forwards this object as
+the ACP `session/prompt` result's `usage` field (UNSTABLE in
+agent-client-protocol), with `source`/`modelRequestCount`/web request counts
+riding in the result's `_meta.zcode.usage`.
+
+One field is normalized: the backend's `inputTokens` is cache-INCLUSIVE
+(OpenAI-style; verified `totalTokens == inputTokens + outputTokens` on live
+frames), while ACP's de-facto convention (claude-agent-acp, DeepSeek's
+dsh-token-meter four-bucket model) reports `inputTokens` EXCLUDING cache —
+clients compute hit rate as `cachedRead / (input + cachedRead + cachedWrite)`.
+The bridge therefore reports `inputTokens = backend inputTokens − cacheRead −
+cacheWrite` (clamped at 0) and keeps `totalTokens` verbatim (the backend's
+input+output sum equals the convention's four-bucket total). The untouched
+backend value rides in `_meta.zcode.usage.rawInputTokens` — present only when
+normalization actually changed the number.
+
 ```json
 {
   "method": "session/event",
@@ -380,7 +398,16 @@ The turn completed.
     "payload": {
       "resultType": "success",
       "usage": {
-        "totalTokens": 1234
+        "source": "provider",
+        "modelRequestCount": 2,
+        "inputTokens": 1100,
+        "outputTokens": 134,
+        "totalTokens": 1234,
+        "cacheReadTokens": 800,
+        "cacheWriteTokens": 90,
+        "reasoningTokens": 45,
+        "webFetchRequests": 0,
+        "webSearchRequests": 0
       }
     }
   }
@@ -550,17 +577,24 @@ User input request (ExitPlanMode / AskUserQuestion).
 ### Bridge routing (protocol negotiation)
 
 ZCode `interaction/*` requests are routed to different ACP interaction
-mechanisms based on client capabilities:
+mechanisms. Each request type has its OWN gate:
 
-| Request type                                                  |      Client supports elicitation.form      |              Client does not              |
-| ------------------------------------------------------------- | :----------------------------------------: | :---------------------------------------: |
-| Tool auth (`interaction/requestPermission`)                   |        `session/request_permission`        |       `session/request_permission`        |
-| ExitPlanMode (`interaction/requestUserInput` + plan_approval) | `elicitation/create` (approve/reject form) |       `session/request_permission`        |
-| AskUserQuestion (`interaction/requestUserInput`)              |     `elicitation/create` (single form)     | per-question `session/request_permission` |
+| Request type                                                  |       Routing when the gate is OPEN        |      Routing when the gate is CLOSED      | Gate                               |
+| ------------------------------------------------------------- | :----------------------------------------: | :---------------------------------------: | :--------------------------------- |
+| Tool auth (`interaction/requestPermission`)                   |        `session/request_permission`        |       `session/request_permission`        | none (always the same path)        |
+| ExitPlanMode (`interaction/requestUserInput` + plan_approval) | `elicitation/create` (approve/reject form) |       `session/request_permission`        | `server.hasMarttyClient()`         |
+| AskUserQuestion (`interaction/requestUserInput`)              |     `elicitation/create` (single form)     | per-question `session/request_permission` | `server.supportsElicitationForm()` |
 
-**Capability detection**: at `initialize` time the client declares support via
-`clientCapabilities.elicitation.form`. The server detects it with
-`server.supportsElicitationForm()`.
+**Capability detection**: AskUserQuestion keys on
+`clientCapabilities.elicitation.form` (detected at `initialize` via
+`server.supportsElicitationForm()`) — structured input is the correct
+elicitation use for any form-capable client. ExitPlanMode keys on
+`server.hasMarttyClient()` instead: martty's request_permission overlay draws
+only the title, so the plan needs the form's scrollable detail pane — while
+editors render `toolCall.content` as full markdown (Zed: `MarkdownElement`,
+code blocks and links) and draw form descriptions as plain text, so the form
+would downgrade them. Zed ≥1.12 declares `elicitation.form`, which is why the
+gate keys on the client kind, not the capability.
 
 **Reconnect resend**: interaction requests are one-shot and raced across the
 clients connected when they fire (first response wins). A client that was
@@ -622,12 +656,14 @@ that question without cancelling the form.
 }
 ```
 
-**ExitPlanMode elicitation form** — single `feedback` text field; no
-approve/reject dropdown. The client's own submit button is the approve action;
-typing into the field is the reject action. Submitting with the field empty
-approves the plan; submitting with text rejects it and returns the text to
-zcode as the decline `reason` (so the agent sees the redirection when it
-re-plans). The cancel/decline button is a plain reject with no reason.
+**ExitPlanMode elicitation form** — sent only when a martty TUI is attached
+(`server.hasMarttyClient()`); everyone else gets `session/request_permission`
+with the plan in `toolCall.content`. The form carries the COMPLETE plan
+markdown as the `approval` field's `description` (martty renders it in a
+scrollable detail pane); the decision itself is a required approve/reject enum.
+An `accept` whose `content.approval` is `"approve"` maps to the zcode accept
+(`answer_0: "approve"`); a `reject`/`cancel` action, or `"reject"` in the
+field, maps to a plain decline.
 
 ```json
 {
@@ -635,25 +671,42 @@ re-plans). The cancel/decline button is a plain reject with no reason.
   "params": {
     "mode": "form",
     "sessionId": "sess_abc123",
-    "message": "Ready to code?\n\n1. Implement login\n2. Implement signup\n\nLeave the box empty and submit to approve; type feedback to reject and redirect.",
+    "message": "Exit plan mode",
     "requestedSchema": {
       "type": "object",
       "properties": {
-        "feedback": {
+        "approval": {
           "type": "string",
-          "title": "Feedback",
-          "description": "Empty = approve the plan. Anything typed = reject and use this text as the redirection."
+          "title": "Review the plan, then choose an action",
+          "description": "1. Implement login\n2. Implement signup",
+          "oneOf": [
+            { "const": "approve", "title": "Approve — exit plan mode" },
+            { "const": "reject", "title": "Reject — keep planning" }
+          ]
         }
       },
-      "required": []
+      "required": ["approval"]
     }
   }
 }
 ```
 
+If the form request fails outright (no form-capable client attached any more —
+capability flags are merged across clients at initialize — or a timeout), the
+bridge falls back once to `session/request_permission` so the plan can still
+be approved by a plain permission popup; only when that also fails does the
+plan decline.
+
 ## Extension Methods (0.14.8+)
 
 ### Harness inspection
+
+The downstream implementation lives in `src/handlers/harness.ts`.
+`dd-zcode-harness@2` returns `zcode/session/usage` unchanged from the native
+backend; consumers calculate request-level totals from `zcode/session/read`.
+The @1 bridge's aggregated request fields are not part of @2. A bounded/partial
+history read must not be treated as complete cumulative usage. Native extension
+failures preserve method/session and native code/data in ACP RequestError data.
 
 Controlled headless clients can resolve the lazy ACP locator and read native
 session evidence without reaching around the bridge:
@@ -939,6 +992,58 @@ The mechanism:
 `session/cancelBackgroundTask` for a background Bash task additionally emits
 `terminal_exit` with `_meta.backgroundTask.cancelled = true` so the terminal
 UI closes on cancellation.
+
+### Notification-turn busy window
+
+When a background task finishes, the backend's notification turn (the model
+summarising the result) holds the session's prompt lock for its whole
+duration — a fresh `session/send` during that window answers busy:
+
+```json
+{ "code": -32010, "message": "A prompt is already running for this session" }
+```
+
+(observed live against desktop 3.12.3 / app-server 0.16.5, 2026-09-18). The
+prompt path's busy-retry normally gives up after 30s, but a notification turn
+is a real model turn and easily outlives that budget. While the session's
+`BackgroundTaskListener` has a notification turn active
+(`server.notifyTurnActiveSince`), the bridge extends the busy budget to 180s
+instead of failing the user's prompt — the send is guaranteed accepted once
+the notification turn drains.
+
+### `session.titleUpdated`
+
+New in app-server 0.16.5 (verified live + schema-checked against the desktop
+3.12.3 bundle): the backend pushes authoritative conversation-title changes.
+
+```json
+{
+  "type": "session.titleUpdated",
+  "payload": {
+    "previousTitle": "",
+    "source": "generated",
+    "title": "Fix the login bug",
+    "messageID": "msg_…"
+  }
+}
+```
+
+`source` is one of `default` (nothing meaningful), `first_input` (the literal
+first prompt), `generated` (the backend's LLM-generated title, landing after
+the first turn), or `custom` (a user rename from another surface, e.g. the
+desktop app over the same session store).
+
+The bridge's session-scoped `SessionTitleListener` (registered alongside the
+background-task listener) adopts `generated` and `custom` pushes — updating
+`sessionTitles` for every ACP alias of the conversation, the session summary,
+the tasks-index, the martty terminal tab title, and broadcasting an ACP
+`session_info_update` to attached clients per alias. A manual rename wins:
+sessions renamed through the bridge's remote rename endpoint (or adopted via
+a `custom` push) are pinned in `server.titleUserSetBy`, and the durable
+`title_overridden` flag in `tasks-index.sqlite` is consulted for renames that
+predate the bridge process — later `generated` pushes never override them.
+`default`/`first_input` pushes are ignored — the bridge already seeds the
+first-prompt form itself (see "one-shot session title" in the handlers).
 
 ### `session/cancelBackgroundTask`
 

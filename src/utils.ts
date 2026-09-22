@@ -8,6 +8,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import { debugEnabled } from "./config/settings.js";
+
 /** ACP protocol version this server speaks. */
 export const PROTOCOL_VERSION = 1;
 
@@ -35,13 +37,46 @@ export const AGENT_INFO = {
   version: PACKAGE_VERSION,
 } as const;
 
-/** Path to the ZCode v2 config (credentials + provider/model metadata). */
-export const ZCODE_CREDS_PATH = path.join(
-  process.env.HOME || process.env.USERPROFILE || "~",
-  ".zcode",
-  "v2",
-  "config.json",
-);
+/**
+ * Root of the ZCode data directory. `ZCODE_HOME` replaces `~/.zcode` outright,
+ * so a bridge can run against an isolated ZCode install (a second account, a
+ * container mount, a test fixture) without touching the user's real one.
+ * Resolved at call time so a caller can change the env before reading.
+ */
+export function zcodeHomeDir(): string {
+  const explicit = process.env.ZCODE_HOME;
+  if (explicit) return explicit;
+  return path.join(process.env.HOME || process.env.USERPROFILE || "~", ".zcode");
+}
+
+/**
+ * Path to the ZCode v2 config (credentials + provider/model metadata).
+ * Module-level snapshot: `ZCODE_HOME` must be set before the process starts.
+ */
+export const ZCODE_CREDS_PATH = path.join(zcodeHomeDir(), "v2", "config.json");
+
+/**
+ * Path to the desktop's personal provider config (3.12+): the desktop writes
+ * user-added providers and models HERE, and the backend registry reads it
+ * directly — legacy config.json's provider map stopped syncing. Per call, so
+ * discovery follows a `ZCODE_HOME` change made after import (tests).
+ */
+export function zcodePersonalProviderPath(): string {
+  return path.join(zcodeHomeDir(), "v2", "provider_config.json");
+}
+
+/**
+ * Path to the ZCode CLI config (skills/plugins/MCP enablement). Per call, so
+ * discovery follows a `ZCODE_HOME` change made after import (tests).
+ */
+export function zcodeCliConfigPath(): string {
+  return path.join(zcodeHomeDir(), "cli", "config.json");
+}
+
+/** Root of the ZCode plugin cache directory (per call — see above). */
+export function zcodePluginCacheDir(): string {
+  return path.join(zcodeHomeDir(), "cli", "plugins", "cache");
+}
 
 /**
  * Slash commands surfaced to the editor. Each maps to a ZCode session method
@@ -57,6 +92,11 @@ export const ZCODE_CREDS_PATH = path.join(
  * and the model resolves them via its `Skill` tool.
  */
 export const SLASH_COMMANDS = [
+  {
+    name: "auto",
+    description: "Autonomous loop: start, status, pause, resume, stop",
+    input: { hint: "<objective> | status | pause | resume | stop" },
+  },
   { name: "compact", description: "Compress conversation context (free up tokens)" },
   {
     name: "goal",
@@ -80,6 +120,7 @@ export const SLASH_COMMANDS = [
     input: { hint: "low|high|max" },
   },
   { name: "quota", description: "Show remaining usage quota (5h / weekly / MCP)" },
+  { name: "resume", description: "Resume a past session into this thread (picker popup)" },
   { name: "mcp", description: "List available MCP servers" },
   { name: "init", description: "Create or update workspace AGENTS.md instructions" },
 ] as const;
@@ -135,10 +176,11 @@ export const CONFIG_DISPATCH: Record<string, { method: string; paramKey: string 
  * Never use `console.log` — it would corrupt the stdout protocol stream.
  */
 
-/** True when the user opted into verbose diagnostics.
- *  Read at call time so tests can flip it without re-importing the module. */
+/** True when the user opted into verbose diagnostics (config file `debug` or
+ *  `ZCODE_ACP_DEBUG=1`). Read at call time so tests can flip it without
+ *  re-importing the module. */
 function isDebug(): boolean {
-  return process.env.ZCODE_ACP_DEBUG === "1";
+  return debugEnabled();
 }
 
 /** Verbose diagnostic log. Only emitted when `ZCODE_ACP_DEBUG=1`. */
@@ -150,6 +192,17 @@ export function log(msg: string): void {
 /** Warning — always emitted. For perceivable failures. */
 export function warn(msg: string): void {
   process.stderr.write(`[zcode-acp] ${msg}\n`);
+}
+
+/**
+ * Stable identity of an ACP client connection. Each request wraps the
+ * connection in a fresh AgentContext, so the wrappers never compare equal —
+ * `connectionContext` is the SDK's per-connection root (public at runtime,
+ * @internal in the typings, hence the cast). `ctx.client` from a handler is
+ * one such wrapper; two requests from the same editor/TUI/app share the root.
+ */
+export function clientConnectionRoot(client?: unknown): unknown {
+  return (client as { connectionContext?: unknown } | undefined)?.connectionContext;
 }
 
 /**

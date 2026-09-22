@@ -6,7 +6,7 @@
 
 import type * as acp from "@agentclientprotocol/sdk";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { echoUserPromptToOthers } from "../src/handlers/io.js";
 import { ClientRegistry, type ClientLike } from "../src/remote/broadcast.js";
@@ -159,6 +159,66 @@ describe("ClientRegistry broadcast", () => {
     expect(phone.notifies).toHaveLength(1);
     expect(phone.notifies[0]![1]).toEqual({ x: 1 });
   });
+
+  it("a stalled client cannot hold the notify fan-out (send timeout isolation)", async () => {
+    vi.useFakeTimers();
+    try {
+      const registry = new ClientRegistry();
+      const cli = fakeClient();
+      // Half-open connection: the SDK's sendWireMessage awaits the transport
+      // write, which pends until TCP gives up. Before the timeout guard this
+      // froze the per-session send chain for EVERY client.
+      const stalled = fakeClient();
+      stalled.cx.notify = () => new Promise<void>(() => undefined);
+      registry.add(cli.cx);
+      registry.add(stalled.cx);
+
+      const sent = registry.broadcast().notify("session/update", { x: 1 });
+      // Not resolved before the timeout elapses…
+      let resolved = false;
+      void sent.then(() => {
+        resolved = true;
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(resolved).toBe(false);
+      // …resolves once the stall timeout fires, without waiting for the stuck write.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(resolved).toBe(true);
+      // The healthy client got the message regardless.
+      expect(cli.notifies).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sends keep flowing to healthy clients after a stall (guard not poisoned)", async () => {
+    vi.useFakeTimers();
+    try {
+      const registry = new ClientRegistry();
+      const cli = fakeClient();
+      const stalled = fakeClient();
+      stalled.cx.notify = () => new Promise<void>(() => undefined);
+      registry.add(cli.cx);
+      registry.add(stalled.cx);
+
+      const first = registry.broadcast().notify("session/update", { x: 1 });
+      await vi.advanceTimersByTimeAsync(6_000);
+      await first;
+      // A second send must ALSO settle — and immediately: a client already
+      // marked stalled is fire-and-forget, so it must not cost another
+      // full timeout (that would throttle every client to 1 update/5s).
+      const second = registry.broadcast().notify("session/update", { x: 2 });
+      let resolved = false;
+      void second.then(() => {
+        resolved = true;
+      });
+      await vi.advanceTimersByTimeAsync(50);
+      expect(resolved).toBe(true);
+      expect(cli.notifies).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("echoUserPromptToOthers", () => {
@@ -184,7 +244,10 @@ describe("echoUserPromptToOthers", () => {
 
   it("echoes the prompt text to other clients, never the prompter", async () => {
     const { registry, zed, phone, prompter } = registryWithZedAndPhone();
-    const server = { clients: registry } as unknown as ZcodeAcpServer;
+    const server = {
+      clients: registry,
+      sessionAliases: (sid: string) => [sid],
+    } as unknown as ZcodeAcpServer;
 
     echoUserPromptToOthers(server, prompter, { sessionId: "s1", prompt: "hello from zed" });
     await sleep(0);
@@ -203,7 +266,10 @@ describe("echoUserPromptToOthers", () => {
 
   it("joins text blocks of a structured prompt and skips non-text ones", async () => {
     const { registry, phone, prompter } = registryWithZedAndPhone();
-    const server = { clients: registry } as unknown as ZcodeAcpServer;
+    const server = {
+      clients: registry,
+      sessionAliases: (sid: string) => [sid],
+    } as unknown as ZcodeAcpServer;
     const prompt = [
       { type: "text", text: "look at this" },
       { type: "image", data: "…" },
@@ -221,12 +287,66 @@ describe("echoUserPromptToOthers", () => {
 
   it("sends nothing for an empty prompt", async () => {
     const { registry, phone, prompter } = registryWithZedAndPhone();
-    const server = { clients: registry } as unknown as ZcodeAcpServer;
+    const server = {
+      clients: registry,
+      sessionAliases: (sid: string) => [sid],
+    } as unknown as ZcodeAcpServer;
 
     echoUserPromptToOthers(server, prompter, { sessionId: "s1", prompt: "  " });
     await sleep(0);
     await sleep(0);
 
     expect(phone.notifies).toHaveLength(0);
+  });
+});
+
+describe("per-client naming and notifyEach", () => {
+  it("builds a distinct payload per recorded client name (null payload skips)", async () => {
+    const registry = new ClientRegistry();
+    const zed = fakeClient();
+    const app = fakeClient();
+    const martty = fakeClient();
+    registry.add(zed.cx);
+    registry.add(app.cx);
+    registry.add(martty.cx);
+    registry.nameConnection(zed.cx, "Zed");
+    registry.nameConnection(app.cx, ""); // remote App: initialize with no clientInfo
+    registry.nameConnection(martty.cx, "martty");
+
+    await registry.notifyEach("session/update", (name) => ({
+      sessionId: "s1",
+      update: { grouped: name !== null && !name.toLowerCase().includes("martty") },
+    }));
+
+    expect((zed.notifies[0]![1] as { update: { grouped: boolean } }).update.grouped).toBe(true);
+    expect((app.notifies[0]![1] as { update: { grouped: boolean } }).update.grouped).toBe(false);
+    expect((martty.notifies[0]![1] as { update: { grouped: boolean } }).update.grouped).toBe(false);
+  });
+
+  it("nameOf reads null for unnamed or unseen connections", () => {
+    const registry = new ClientRegistry();
+    const named = fakeClient();
+    const unnamed = fakeClient();
+    const unseen = fakeClient();
+    registry.add(named.cx);
+    registry.add(unnamed.cx);
+    registry.add(unseen.cx);
+    registry.nameConnection(named.cx, "Zed");
+    registry.nameConnection(unnamed.cx, "");
+
+    expect(registry.nameOf(named.cx)).toBe("Zed");
+    expect(registry.nameOf(unnamed.cx)).toBeNull();
+    expect(registry.nameOf(unseen.cx)).toBeNull();
+  });
+});
+
+describe("skillPrefixForClient", () => {
+  it("keeps $ grouping for editors, strips it for martty and unnamed clients", async () => {
+    const { skillPrefixForClient } = await import("../src/handlers/io.js");
+    expect(skillPrefixForClient("Zed")).toBe("$");
+    expect(skillPrefixForClient("JetBrains")).toBe("$");
+    expect(skillPrefixForClient("martty")).toBe("");
+    expect(skillPrefixForClient("Martty TUI")).toBe("");
+    expect(skillPrefixForClient(null)).toBe("");
   });
 });

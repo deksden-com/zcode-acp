@@ -19,11 +19,24 @@
  * passes ?probe=1 to /api/instances: the hub TCP-probes each registered
  * loopback port and prunes unreachable bridges before answering — no periodic
  * probing, the cost is paid only when someone refreshes. When no instance is
- * registered and no proxy is active for `idleExitMs`, the hub exits — the
+ * registered and no proxy is active for `idleExitMs`, the hub re-reads the
+ * user config LIVE: remote still enabled → stays resident (phone-driven
+ * create/resume must work with zero local bridges); disabled → exits, and the
  * next bridge re-spawns it on demand.
  */
 
-import { createHash, timingSafeEqual } from "node:crypto";
+import { spawn, type ChildProcess } from "node:child_process";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import type { Dirent } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import {
@@ -34,14 +47,35 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import { EventEmitter } from "node:events";
 import net from "node:net";
 import path from "node:path";
+import process from "node:process";
+import { tmpdir } from "node:os";
+import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 
+import { resolveRuntime, runtimeSpawnParts } from "../runtime.js";
+import { sessionTabTitle } from "../terminal-title.js";
 import { AGENT_INFO, compareVersions, log, warn } from "../utils.js";
+import type { TerminalPrefs } from "../config/user-config.js";
+import { tuiStatsSegments } from "../config/settings.js";
+import { readCodeFingerprint } from "./code-fingerprint.js";
+import { remoteEnabledLive, remoteTerminalPrefs } from "./config.js";
 import { accountUsageStats, type UsageStatsResult } from "../handlers/account.js";
+import { BOOT_RESUME_TRIGGER } from "../handlers/session.js";
+import {
+  composeQuotaDock,
+  formatGoDockSegment,
+  formatOcDockSegment,
+  formatQuotaDock,
+} from "../quota/format.js";
+import { queryQuota } from "../quota/index.js";
+import { queryOcUsage } from "../quota/ollama-cloud/index.js";
+import { queryGoUsage } from "../quota/opencode-go/index.js";
+import { listKnownWorkspaces } from "../tasks-index.js";
 
 export interface HubOptions {
   port: number;
@@ -49,10 +83,22 @@ export interface HubOptions {
   token: string;
   /** Registration TTL before an instance is pruned (default 30s). */
   heartbeatTimeoutMs?: number;
+  /**
+   * How long an instance must stay probe-unreachable before ?probe=1 prunes it
+   * (default 8s). A single failed probe only marks it unhealthy — a busy
+   * bridge's event loop can stall past the connect timeout while fully alive.
+   */
+  probeGraceMs?: number;
   /** Idle time with zero instances and zero proxies before exit (default 10min). */
   idleExitMs?: number;
   /** WebSocket keepalive ping interval (default 30s; tunnels drop idle links). */
   pingIntervalMs?: number;
+  /**
+   * How long a visible-terminal incubation (session-create/-resume) waits for
+   * the spawned bridge's registration (default TUI_REGISTER_TIMEOUT_MS; tests
+   * shrink it).
+   */
+  tuiRegisterTimeoutMs?: number;
   /**
    * Fires when the hub decided it should restart onto newer on-disk code
    * (a newer bridge registered, or POST /api/upgrade found the dist newer).
@@ -66,6 +112,56 @@ export interface HubOptions {
    * directory this module runs from.
    */
   codePaths?: { packageJson: string; distDir: string };
+  /**
+   * Override the frozen content fingerprint this hub compares bridges and
+   * /api/upgrade against (tests inject fixtures). Default: read from the
+   * code-fingerprint.json next to this module's dist root; null in dev/src.
+   */
+  hubFingerprint?: string | null;
+  /**
+   * Override where the remote session-create endpoints read the known-project
+   * whitelist from (tests point this at a fixture sqlite). Default: the App's
+   * tasks-index.sqlite (see listKnownWorkspaces).
+   */
+  projectsDbPath?: string;
+  /**
+   * Override the idle-exit stay-alive check (tests pin it). Default: live
+   * re-read of the user config (remoteEnabledLive) — remote still enabled
+   * means the hub stays resident so a phone can create/resume at any time;
+   * only an explicit disable retires the daemon.
+   */
+  stayAliveCheck?: () => boolean;
+  /**
+   * Override how the remote session-create / session-resume endpoints spawn
+   * a bridge (tests inject a fake). Default: this node + this package's
+   * dist/cli.js — an interactive TUI in a visible terminal for
+   * session-create and session-resume ("tui"; resume carries the requested
+   * session in ZCODE_ACP_RESUME_SESSION), a detached headless serve bridge
+   * for background queries ("serve"). A "tui" attempt returns null when the
+   * launch fails; the caller then walks down the terminal preference list
+   * (terminalLaunches) and only spawns "serve" once every entry failed.
+   */
+  spawnServe?: (opts: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    /** "tui" = visible terminal (session-create/-resume); "serve" = detached headless. */
+    kind: "tui" | "serve";
+    /** The resolved launch for a "tui" attempt (one list entry). */
+    launch?: TerminalLaunch;
+  }) => ChildProcess | null | Promise<ChildProcess | null>;
+  /**
+   * Override the ordered terminal preference list the create/resume
+   * incubation walks (tests inject fixed entries). Default: resolved LIVE
+   * per incubation from remoteTerminalPrefs (config file > env), so editing
+   * the file takes effect without a hub restart.
+   */
+  terminalLaunches?: TerminalLaunch[];
+  /**
+   * How long after startup the hub ignores newer-bridge stale votes (tests
+   * shrink to 0). Default STALE_VOTE_COOLDOWN_MS — the loop breaker so a
+   * same-age respawn can never be voted into a restart churn.
+   */
+  staleVoteCooldownMs?: number;
 }
 
 export interface HubHandle {
@@ -89,13 +185,45 @@ interface InstanceEntry {
   workspace: string;
   sessions: SessionSummary[];
   lastSeen: number;
+  /** "editor" (stdio bridge) or "serve" (headless, hub-spawned, ADR-0014). */
+  origin: "editor" | "serve";
+  /**
+   * Hub-incubation correlation (ADR-0016/0017): the nonce this bridge's
+   * incubation spawned it with, echoed from ZCODE_ACP_SPAWN_NONCE. Absent on
+   * bridges started by hand or by older hubs — the incubation poll falls back
+   * to any nonce-less registration for them.
+   */
+  nonce?: string;
+  /**
+   * The incubated TUI tree this serve bridge lives in (ZCODE_ACP_TUI_CLI_PID —
+   * the .command script's $$, exec'd into the CLI; ADR-0016). Absent on
+   * headless serve bridges and editor bridges. Instance shutdown uses it to
+   * tear the whole window tree down — the bridge alone is only the leaf.
+   */
+  tuiPid?: number;
+  /** First failed ?probe=1 timestamp; a bridge alive enough to re-register clears it. */
+  unhealthySince?: number;
 }
 
 const HEARTBEAT_TIMEOUT_MS = 30_000;
 const IDLE_EXIT_MS = 10 * 60_000;
 const PING_INTERVAL_MS = 30_000;
-/** Per-instance TCP probe timeout for /api/instances?probe=1. */
-const PROBE_TIMEOUT_MS = 500;
+/**
+ * Per-instance TCP probe timeout for /api/instances?probe=1. Generous on
+ * purpose: the bridge is single-threaded and a busy event loop (large payload
+ * parse, sync fs) can delay accept() well past a tight timeout while the
+ * process is perfectly healthy.
+ */
+const PROBE_TIMEOUT_MS = 2_000;
+/**
+ * An instance must be probe-unreachable for at least this long before the
+ * probe prunes it. One failed probe only marks unhealthySince — the next
+ * ?probe=1 (clients poll every 3–5s) prunes only if the mark is older than
+ * this. A hard-killed bridge still disappears in ~2 polls instead of waiting
+ * out the 30s heartbeat TTL; a momentary event-loop stall no longer evicts a
+ * live instance and kicks attached clients ("Instance went away").
+ */
+const PROBE_GRACE_MS = 8_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 
 /** Constant-time token compare (hash both to equal length first). */
@@ -142,6 +270,15 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown> |
   }
 }
 
+/** realpath spelling of p; a vanished path falls back to raw equality. */
+function canonicalPath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
 function validSessions(raw: unknown): SessionSummary[] | null {
   if (!Array.isArray(raw)) return null;
   const out: SessionSummary[] = [];
@@ -162,6 +299,413 @@ function validSessions(raw: unknown): SessionSummary[] | null {
     });
   }
   return out;
+}
+
+/** How long POST /api/instances waits for the spawned bridge to register. */
+const SERVE_REGISTER_TIMEOUT_MS = 10_000;
+const SERVE_REGISTER_POLL_MS = 300;
+/**
+ * A freshly started hub ignores newer-bridge stale votes for this long —
+ * the loop breaker for a restart that re-spawned a hub of the same age
+ * (the vote would otherwise fire again immediately; at most one restart
+ * per cooldown window).
+ */
+const STALE_VOTE_COOLDOWN_MS = 60_000;
+
+/** Register-origin parser: only "serve" is special; anything else is "editor". */
+function parseOrigin(raw: unknown): "editor" | "serve" {
+  return raw === "serve" ? "serve" : "editor";
+}
+
+/**
+ * The TUI-in-a-terminal incubation budget (ADR-0016): a visible terminal
+ * adds a GUI round-trip (Terminal app launch, TUI boot, its bridge child)
+ * ahead of the hub registration. Terminals normally register in a couple of
+ * seconds; a cold GUI start still fits inside 10s.
+ */
+const TUI_REGISTER_TIMEOUT_MS = 10_000;
+/**
+ * Budget for fallback attempts AFTER the first terminal preference (next
+ * preference, headless rescue): half the first budget. A terminal that has
+ * already failed once is a fallback — making the user wait the full budget
+ * again per preference turned a broken first choice into a 3×20s stall.
+ */
+const TUI_RETRY_BUDGET_MS = TUI_REGISTER_TIMEOUT_MS / 2;
+/** `open -a <terminal>` must answer fast or the incubation falls back. */
+const TERMINAL_OPEN_TIMEOUT_MS = 3_000;
+/**
+ * The osascript path (Ghostty AppleScript) needs more room: on a locked
+ * screen with display sleep, the AppleEvent round-trip to the app can take
+ * well over 3s while still succeeding — killing it there produced a spurious
+ * timeout (and a duplicate tab once the app processed the event anyway).
+ */
+const TERMINAL_SCRIPT_TIMEOUT_MS = 10_000;
+
+/** Single-quote for sh: ' → '\'' . */
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/** How the hub hands the .command script to a terminal (ADR-0016). */
+export type TerminalLaunch =
+  /** ZCODE_ACP_HUB_TERMINAL_COMMAND: a shell command; `{script}` (if present)
+   * is replaced by the quoted script path, else the path is appended. */
+  | { kind: "shell"; command: string }
+  /** `.command`-executing apps (Terminal, iTerm): `open -a <app> <script>`. */
+  | { kind: "openApp"; app: string }
+  /** Terminals driven by their own CLI: `open -na <app> --args <args> <sh>
+   * <script>` — args come first, the script program is appended. */
+  | { kind: "openAppArgs"; app: string; args: string[] }
+  /** Ghostty: `-e` trips its "Allow Ghostty to Execute" security prompt on
+   * EVERY launch (GHSA-q9fg-cpmh-c78x — upstream refuses a disable switch),
+   * so the hub drives its AppleScript dictionary instead (Ghostty ≥1.3.0):
+   * a `new tab` in the front window reuses an existing window, and `command`
+   * on a surface configuration runs the script without the prompt. Only a
+   * one-time macOS Automation (TCC) grant for the hub is required. */
+  | { kind: "ghosttyScript"; app: string }
+  /** Warp: refuses `.command` files and its CLI is agent-only, but its URI
+   * scheme EXECUTES a script handed to action/new_tab's path param
+   * (app/src/uri/mod.rs → open_file; verified on 0.2026.09.02): the hub opens
+   * `<scheme>://action/new_tab?path=<script>` and Warp runs it as a new tab
+   * in its default mode. Preview uses the warppreview:// scheme. */
+  | { kind: "warpUri"; app: string; scheme: string };
+
+/**
+ * Built-in launch recipes for well-known macOS terminals (ADR-0016 §5). Each
+ * mechanism is the app's documented, verified way to run a command in a fresh
+ * window: Terminal and iTerm execute `.command` files handed over via open;
+ * WezTerm's `start --` runs an alternative program (wezterm.org/cli/start.html);
+ * kitty takes the program as normal positional arguments
+ * (sw.kovidgoyal.net/kitty/invocation); Alacritty supports the common `-e`
+ * flag; Ghostty rides its AppleScript dictionary (see ghosttyScript above —
+ * its `-e` is unusable for programmatic launches); Warp rides its new_tab
+ * URI action (see warpUri above).
+ * The script does its own `cd`, so no per-app cwd flags. Hyper is absent — no
+ * programmatic command execution at all (vercel/hyper#3677).
+ */
+const TERMINAL_APP_LAUNCHERS: Record<string, TerminalLaunch> = {
+  terminal: { kind: "openApp", app: "Terminal" },
+  apple_terminal: { kind: "openApp", app: "Terminal" },
+  iterm: { kind: "openApp", app: "iTerm" },
+  iterm2: { kind: "openApp", app: "iTerm" },
+  wezterm: { kind: "openAppArgs", app: "WezTerm", args: ["start", "--"] },
+  kitty: { kind: "openAppArgs", app: "kitty", args: [] },
+  alacritty: { kind: "openAppArgs", app: "Alacritty", args: ["-e"] },
+  ghostty: { kind: "ghosttyScript", app: "Ghostty" },
+  warp: { kind: "warpUri", app: "Warp", scheme: "warp" },
+  "warp-preview": { kind: "warpUri", app: "Warp Preview", scheme: "warppreview" },
+  warp_preview: { kind: "warpUri", app: "Warp Preview", scheme: "warppreview" },
+};
+
+/**
+ * Pick how to open the TUI script. Preferences arrive pre-merged from
+ * `remoteTerminalPrefs` (config file first, env fallback — see config.ts);
+ * only the app-name normalization lives here. Priority: the explicit command
+ * template (the universal escape hatch) → a built-in launcher by app name
+ * (aliases are case- and `.app`-suffix-insensitive) → plain Terminal.app
+ * (macOS has no default-terminal setting to detect). Any other unmatched
+ * name passes through to `open -a` unchanged.
+ */
+export function resolveTerminalLaunch(
+  env: NodeJS.ProcessEnv,
+  prefs: TerminalPrefs = remoteTerminalPrefs(env),
+): {
+  launch: TerminalLaunch;
+  warning?: string;
+} {
+  const launches = resolveTerminalLaunches(prefs);
+  return { launch: launches[0] ?? { kind: "openApp", app: "Terminal" } };
+}
+
+/**
+ * The ORDERED terminal preference list (ADR-0016 amendment): the hub walks
+ * it when a window fails — a launch that errors moves down the list at
+ * once, a window that never registers moves down at its registration
+ * timeout — and only the exhaustion of every entry falls back to headless.
+ * Resolution per entry mirrors resolveTerminalLaunch: the explicit command
+ * template (the universal escape hatch) replaces the whole list; otherwise
+ * a built-in launcher by normalized app name, else `open -a` passthrough.
+ * Disabled prefs resolve to [] (no visible-terminal attempts at all).
+ */
+export function resolveTerminalLaunches(prefs: TerminalPrefs): TerminalLaunch[] {
+  if (prefs.enabled === false) return [];
+  if (prefs.command) return [{ kind: "shell", command: prefs.command }];
+  const names = prefs.terminals?.length ? prefs.terminals : prefs.app ? [prefs.app] : ["Terminal"];
+  return names.map((raw) => {
+    const name = raw
+      .toLowerCase()
+      .replace(/\.app$/, "")
+      .replace(/\s+/g, "-");
+    return TERMINAL_APP_LAUNCHERS[name] ?? { kind: "openApp", app: raw };
+  });
+}
+
+/**
+ * Non-ZCODE_ACP_* env vars the incubation script re-exports into the
+ * terminal's fresh shell. `DSH_TUI_AUTOPROMPT` is bridge-injected (the
+ * boot-resume banner handshake); `DSH_TUI_STATS` is USER-set — martty's
+ * stats-view plugin reads it at process start to filter the composer dock
+ * (e.g. `DSH_TUI_STATS=tokens,context`). The terminal shell inherits
+ * launchd's environment, NOT the hub's or the user's interactive shell, so
+ * without this export a hub-incubated TUI window never sees the user's
+ * dock config and the dock renders every segment (statsSegments() reads
+ * undefined as "no filtering").
+ */
+const MARTTY_PASSTHROUGH_ENV = ["DSH_TUI_AUTOPROMPT", "DSH_TUI_STATS"] as const;
+
+/**
+ * The .command script body. The incubation env MUST be embedded as exports:
+ * the script runs in a fresh shell spawned by the terminal app, which
+ * inherits launchd's environment — NOT the hub's — so without them the TUI
+ * would boot as a plain local session and never register back (the
+ * incubation would stall into its timeout). Everything ZCODE_ACP_* travels,
+ * plus the MARTTY_PASSTHROUGH_ENV allowlist; values are single-quoted.
+ */
+export function terminalTuiScript(cwd: string, cliJs: string, env: NodeJS.ProcessEnv): string {
+  const exports = Object.keys(env)
+    .filter(
+      (k) =>
+        k.startsWith("ZCODE_ACP_") || (MARTTY_PASSTHROUGH_ENV as readonly string[]).includes(k),
+    )
+    .map((k) => `export ${k}=${shQuote(String(env[k]))}`);
+  // Prefer bun --smol for the long-lived bridge (src/runtime.ts); the tokens
+  // are quoted individually because the interpreter may carry flags.
+  const rt = resolveRuntime();
+  const execLine = [rt.command, ...rt.preArgs, cliJs].map(shQuote).join(" ");
+  return [
+    "#!/bin/sh",
+    `# Hub-incubated TUI session (ADR-0016): closing this window ends the bridge.`,
+    `cd ${shQuote(cwd)} || exit 1`,
+    ...exports,
+    // OSC 0 names the tab after the conversation — without it terminals show
+    // the running process ("node"). printf reads the \033/\007 escapes from
+    // the format string; %s keeps the value itself shell-safe. martty never
+    // sets a terminal title, so this survives until the window closes.
+    ...(env.ZCODE_ACP_TAB_TITLE !== undefined
+      ? [`printf '\\033]0;%s\\007' "$ZCODE_ACP_TAB_TITLE"`]
+      : []),
+    // $$ survives exec as the cli's pid — and as the terminal's foreground
+    // process-group leader it names the whole TUI tree (cli → martty → bridge).
+    // Remote session-close SIGTERMs this GROUP to tear the window's CLI down
+    // (see session-close-endpoint.ts); a bare pid would orphan the Rust host.
+    `export ZCODE_ACP_TUI_CLI_PID=$$`,
+    `exec ${execLine}`,
+    "",
+  ].join("\n");
+}
+
+/** Stale TUI scripts older than this are swept on the next incubation. */
+const TUI_SCRIPT_MAX_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * Write the throwaway .command script for a terminal TUI incubation.
+ *
+ * Preferred location: `<workspace>/.zcode/tmp/tui-XXXX.command`. Terminal apps
+ * bind the new tab's project root to the script's PARENT directory (Warp's
+ * open_file opens a session in the file's dir before executing it), so a
+ * tmpdir script leaves the tab bound to a throwaway directory — the in-script
+ * `cd` only moves the shell cwd and never re-binds the terminal project, which
+ * blinds diff/git panels. Any failure writing there (read-only workspace,
+ * permissions, …) falls back to the historical mkdtemp(tmpdir()) path.
+ */
+/** Escape a string for an AppleScript double-quoted literal (\\ and "). */
+function appleScriptString(s: string): string {
+  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * The AppleScript source that opens the TUI script as a NEW TAB in Ghostty's
+ * front window (a new window only when none exists). See the ghosttyScript
+ * launcher: `command` on a surface configuration is Ghostty's trusted,
+ * prompt-free path to run a program — unlike `-e`, which trips its
+ * "Allow Ghostty to Execute" security gate on every launch.
+ */
+export function ghosttyTabAppleScript(app: string, scriptPath: string): string {
+  return [
+    `tell application ${appleScriptString(app)}`,
+    // activate requires live GUI-session focus — while the screen is LOCKED it
+    // fails ("permission violation" -10004) and aborts the whole tell block,
+    // so the tab never opens (remote create/resume died on every locked
+    // screen). Best-effort: new tab itself needs no activation.
+    "try",
+    "activate",
+    "end try",
+    "if (count of windows) = 0 then",
+    "set tgt to new window",
+    "else",
+    "set tgt to front window",
+    "end if",
+    "set cfg to new surface configuration",
+    `set command of cfg to "/bin/sh " & ${appleScriptString(scriptPath)}`,
+    "new tab in tgt with configuration cfg",
+    "end tell",
+  ].join("\n");
+}
+
+export function writeTuiScript(workspace: string, cliJs: string, env: NodeJS.ProcessEnv): string {
+  const contents = terminalTuiScript(workspace, cliJs, env);
+  const dir = path.join(workspace, ".zcode", "tmp");
+  try {
+    mkdirSync(dir, { recursive: true });
+    // Best-effort sweep of stale scripts (>1h old): an unlinked-but-running
+    // script keeps executing on unix, and a fresh one may back a live
+    // incubation, so only clearly-stale files go.
+    const cutoff = Date.now() - TUI_SCRIPT_MAX_AGE_MS;
+    for (const entry of readdirSync(dir)) {
+      if (!entry.startsWith("tui-") || !entry.endsWith(".command")) continue;
+      const stale = path.join(dir, entry);
+      try {
+        if (statSync(stale).mtimeMs < cutoff) unlinkSync(stale);
+      } catch {
+        // best-effort — a racing removal must not abort the incubation
+      }
+    }
+    const script = path.join(dir, `tui-${randomUUID().slice(0, 8)}.command`);
+    writeFileSync(script, contents, { mode: 0o700 });
+    chmodSync(script, 0o700);
+    return script;
+  } catch (e) {
+    warn(
+      `hub: cannot place the TUI script in ${dir} (${e instanceof Error ? e.message : String(e)}) — using the system tmpdir`,
+    );
+  }
+  const fallback = path.join(mkdtempSync(path.join(tmpdir(), "zcode-acp-term-")), "tui.command");
+  writeFileSync(fallback, contents, { mode: 0o700 });
+  chmodSync(fallback, 0o700);
+  return fallback;
+}
+
+/**
+ * Spawn session-create as a VISIBLE interactive TUI (ADR-0016): write a
+ * throwaway .command script (`cd <project> && exec node cli.js`) and hand it
+ * to ONE resolved terminal launch — the user gets a real terminal window
+ * running the local CLI instead of an invisible daemon. The TUI's bridge
+ * child inherits the remote ENV, so the incubation registers exactly like a
+ * serve bridge; closing the window ends the bridge (its lifetime follows
+ * the terminal, the ADR-0001 anchor). Returns null when the launch fails —
+ * platform without GUI support or the open erroring (pre-1.3 Ghostty,
+ * denied Automation permission) — and the CALLER walks down the terminal
+ * preference list, falling back to the detached serve spawn only after the
+ * list is exhausted.
+ */
+async function spawnTerminalTui(opts: {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  launch: TerminalLaunch;
+}): Promise<ChildProcess | null> {
+  if (process.platform !== "darwin") return null;
+  const cliJs = fileURLToPath(new URL("../cli.js", import.meta.url));
+  const script = writeTuiScript(opts.cwd, cliJs, opts.env);
+  const { launch } = opts;
+  let argv: string[];
+  if (launch.kind === "shell") {
+    const rendered = launch.command.includes("{script}")
+      ? launch.command.replace("{script}", shQuote(script))
+      : `${launch.command} ${shQuote(script)}`;
+    argv = ["/bin/sh", "-c", rendered];
+  } else if (launch.kind === "openApp") {
+    argv = ["open", "-a", launch.app, script];
+  } else if (launch.kind === "ghosttyScript") {
+    // osascript talks to the running app — a non-zero exit (pre-1.3 Ghostty,
+    // denied Automation permission) falls through to the headless bridge.
+    argv = ["osascript", "-e", ghosttyTabAppleScript(launch.app, script)];
+  } else if (launch.kind === "warpUri") {
+    // new_tab = Warp's default open mode (like Cmd+T: a tab in the focused
+    // window; Warp opens a window first if none exists).
+    argv = [
+      "open",
+      "-a",
+      launch.app,
+      `${launch.scheme}://action/new_tab?path=${encodeURIComponent(script)}`,
+    ];
+  } else {
+    argv = ["open", "-na", launch.app, "--args", ...launch.args, "/bin/sh", script];
+  }
+  // Async spawn — spawnSync would freeze the hub's event loop (WS proxying,
+  // heartbeats for every live bridge) for up to the full timeout while a GUI
+  // app cold-starts.
+  const openTimeoutMs =
+    launch.kind === "ghosttyScript" ? TERMINAL_SCRIPT_TIMEOUT_MS : TERMINAL_OPEN_TIMEOUT_MS;
+  const errChunks: Buffer[] = [];
+  const opened = await new Promise<{ error?: Error; timedOut?: boolean; code?: number | null }>(
+    (resolve) => {
+      const child = spawn(argv[0]!, argv.slice(1), { stdio: ["ignore", "ignore", "pipe"] });
+      child.stderr?.on("data", (c: Buffer) => errChunks.push(c));
+      const timer = setTimeout(() => {
+        child.kill();
+        resolve({ timedOut: true });
+      }, openTimeoutMs);
+      child.once("error", (e: Error) => {
+        clearTimeout(timer);
+        resolve({ error: e });
+      });
+      child.once("exit", (code: number | null) => {
+        clearTimeout(timer);
+        resolve({ code });
+      });
+    },
+  );
+  if (opened.error || opened.timedOut || opened.code !== 0) {
+    const detail = opened.timedOut
+      ? `timed out after ${openTimeoutMs}ms`
+      : (opened.error?.message ?? Buffer.concat(errChunks).toString("utf8").trim()) ||
+        `exit ${opened.code ?? "?"}`;
+    warn(`hub: no terminal window for ${opts.cwd} (${detail}) — falling back to a headless bridge`);
+    return null;
+  }
+  log(`hub: opened a Terminal TUI for ${opts.cwd}`);
+  // `open` has already exited; incubation only needs a child that reads as
+  // alive until the bridge registers. A window that dies early surfaces as
+  // the register timeout — the terminal window itself shows the reason.
+  const fake = new EventEmitter() as ChildProcess & {
+    pid: number;
+    exitCode: number | null;
+    signalCode: string | null;
+  };
+  fake.pid = -1;
+  fake.exitCode = null;
+  fake.signalCode = null;
+  return fake as unknown as ChildProcess;
+}
+
+/**
+ * Default bridge spawner for the remote session-create endpoints: a visible
+ * terminal TUI for session-create (ADR-0016, macOS + not gated off), a
+ * detached headless serve bridge otherwise (the ADR-0014 original — also the
+ * fallback whenever the terminal window can't be opened).
+ */
+/**
+ * One spawn attempt. "tui" = one resolved terminal launch (returns null when
+ * the launch fails — the caller walks the preference list); "serve" = the
+ * detached headless bridge (the documented no-GUI fallback, ADR-0014).
+ */
+async function defaultSpawnServe(opts: {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  kind: "tui" | "serve";
+  launch?: TerminalLaunch;
+}): Promise<ChildProcess | null> {
+  if (opts.kind === "tui") {
+    if (!opts.launch) return null;
+    return spawnTerminalTui(opts as typeof opts & { launch: TerminalLaunch });
+  }
+  // dist/remote/hub-server.js → dist/cli.js (one level up).
+  const cliJs = fileURLToPath(new URL("../cli.js", import.meta.url));
+  const child = spawn(...runtimeSpawnParts(cliJs, "serve"), {
+    cwd: opts.cwd,
+    detached: true,
+    stdio: ["ignore", "ignore", "pipe"],
+    env: opts.env,
+  });
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (d: string) => {
+    for (const line of d.split("\n")) {
+      if (line.trim()) warn(`serve-bridge[${opts.cwd}]: ${line}`);
+    }
+  });
+  child.once("error", (e) => warn(`serve-bridge[${opts.cwd}] spawn failed: ${e.message}`));
+  child.unref();
+  return child;
 }
 
 /**
@@ -198,6 +742,39 @@ export function resetQuotaCacheForTest(): void {
 }
 
 /**
+ * Cached dock string for GET /api/quota/dock (ADR-0021) — the compact one-line
+ * quota format consumed by the Martty TUI refresher. Shorter TTL than
+ * /api/quota (15s): the dock is resident UI, freshness beats upstream load.
+ * `formatted: null` (no data) is cached too, so a credentials-less machine
+ * does not hammer the API on every 60s refresh.
+ */
+const DOCK_TTL_MS = 15_000;
+let dockCache: { formatted: string | null; at: number } | null = null;
+
+function getQuotaDock(): Promise<{ formatted: string | null; fetchedAt: number }> {
+  if (dockCache && Date.now() - dockCache.at < DOCK_TTL_MS) {
+    return Promise.resolve({ formatted: dockCache.formatted, fetchedAt: dockCache.at });
+  }
+  return Promise.all([
+    queryQuota().then(formatQuotaDock),
+    queryGoUsage()
+      .then(formatGoDockSegment)
+      .catch(() => null),
+    queryOcUsage()
+      .then(formatOcDockSegment)
+      .catch(() => null),
+  ]).then(([glm, go, oc]) => {
+    dockCache = { formatted: composeQuotaDock(glm, go, oc), at: Date.now() };
+    return { formatted: dockCache.formatted, fetchedAt: dockCache.at };
+  });
+}
+
+/** Reset the dock cache (test helper). */
+export function resetDockCacheForTest(): void {
+  dockCache = null;
+}
+
+/**
  * TCP-probe a bridge's loopback endpoint. Loopback refusals are instant, so
  * the timeout only guards pathological cases; a bare connect+destroy is
  * harmless to the bridge's HTTP server.
@@ -214,6 +791,96 @@ function portOpen(port: number, timeoutMs: number): Promise<boolean> {
     socket.once("timeout", () => done(false));
     socket.once("error", () => done(false));
     socket.connect(port, "127.0.0.1");
+  });
+}
+
+/** Body cap for a bridge's GET /sessions answer (session lists are small). */
+const MAX_SESSION_LIST_BYTES = 4 * 1024 * 1024;
+/**
+ * A cold bridge must spawn its backend before the store answers, so the
+ * budget covers an incubation plus one session/list round-trip (the bridge
+ * gives its own query 15s).
+ */
+const SESSION_LIST_TIMEOUT_MS = 12_000;
+/** Best-effort budget for the resume tab-title lookup — the window must
+ *  never wait on a slow bridge (the 12s list budget is for listings, not
+ *  for cosmetics). */
+const TITLE_LOOKUP_BUDGET_MS = 2_000;
+
+/**
+ * Tab-title sanitizer: the value is printf'd into the terminal as an OSC
+ * payload, so control characters (an ESC inside a model-generated summary
+ * would inject terminal sequences) become spaces, whitespace collapses, and
+ * the length caps at what a tab can usefully show. Empty/non-string →
+ * undefined (the caller falls back to the project name).
+ */
+export function sanitizeTabTitle(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const clean = v
+    .replace(/[\p{Cc}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return clean.length > 0 ? clean : undefined;
+}
+
+/** Resolve with undefined after `ms` — for best-effort lookups that must not
+ *  stall their caller; the losing promise settles into the void (its own
+ *  rejection is the caller's `.catch`, never unhandled). */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+  const timeout = new Promise<undefined>((resolve) => {
+    setTimeout(() => resolve(undefined), ms).unref?.();
+  });
+  return Promise.race([p, timeout]);
+}
+
+/**
+ * Fetch a bridge's GET /sessions payload (ADR-0015), forwarding the
+ * pagination query ("?limit=..&before=.."). Resolves with the parsed JSON;
+ * rejects on transport failure, a non-200 answer, truncation, or a non-JSON
+ * body — the caller turns every rejection into a 502.
+ */
+function fetchBridgeSessions(
+  port: number,
+  query = "",
+): Promise<{ sessions?: unknown[]; nextCursor?: unknown }> {
+  return new Promise((resolve, reject) => {
+    const req = httpGet({ host: "127.0.0.1", port, path: `/sessions${query}` }, (up) => {
+      if ((up.statusCode ?? 500) !== 200) {
+        up.resume();
+        reject(new Error(`bridge answered ${up.statusCode ?? "?"}`));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let size = 0;
+      up.on("data", (c: Buffer) => {
+        size += c.length;
+        if (size > MAX_SESSION_LIST_BYTES) {
+          up.destroy();
+          reject(new Error("bridge session list too large"));
+          return;
+        }
+        chunks.push(c);
+      });
+      up.on("end", () => {
+        try {
+          resolve(
+            JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+              sessions?: unknown[];
+              nextCursor?: unknown;
+            },
+          );
+        } catch {
+          reject(new Error("bridge returned an invalid session list"));
+        }
+      });
+      up.on("error", () => reject(new Error("bridge session list failed")));
+    });
+    req.on("error", () => reject(new Error("bridge unreachable")));
+    req.setTimeout(SESSION_LIST_TIMEOUT_MS, () => {
+      req.destroy();
+      reject(new Error("bridge session list timed out"));
+    });
   });
 }
 
@@ -261,20 +928,31 @@ async function newestJsMtime(dir: string): Promise<number | null> {
 
 /**
  * /api/upgrade staleness check: is the code on DISK newer than this running
- * process? Either signal suffices — the on-disk package.json version beats
- * the version frozen into this process at start (a release upgrade), or any
- * .js under dist was written after process start (a rebuild, even without a
- * version bump). A respawned process starts after the newest dist mtime, so
- * the condition self-negates: no restart loops.
+ * process? The content fingerprint is checked FIRST — a hub that knows its
+ * own fingerprint restarts onto any differently-fingerprinted disk build
+ * (deterministic; version numbers can lie across a release-merge/rebuild
+ * window and mtimes can be preserved or skewed). Legacy signals follow for
+ * fingerprint-less processes: the on-disk package.json version beats the
+ * version frozen into this process at start (a release upgrade), or any .js
+ * under dist was written after process start (a rebuild, even without a
+ * version bump). A respawned process re-reads the same disk, so every
+ * condition self-negates: no restart loops.
  */
 async function diskCodeIsNewer(
   paths: { packageJson: string; distDir: string },
   startedAt: number,
+  runningFingerprint: string | null,
 ): Promise<{
   newer: boolean;
-  reason: "version" | "mtime" | "up-to-date";
+  reason: "fingerprint" | "version" | "mtime" | "up-to-date";
   diskVersion: string | null;
 }> {
+  if (runningFingerprint) {
+    const diskFingerprint = readCodeFingerprint(paths.distDir);
+    if (diskFingerprint && diskFingerprint !== runningFingerprint) {
+      return { newer: true, reason: "fingerprint", diskVersion: null };
+    }
+  }
   let diskVersion: string | null = null;
   try {
     const pkg = JSON.parse(await readFile(paths.packageJson, "utf8")) as { version?: unknown };
@@ -302,19 +980,375 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     host,
     token,
     heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
+    probeGraceMs = PROBE_GRACE_MS,
     idleExitMs = IDLE_EXIT_MS,
     pingIntervalMs = PING_INTERVAL_MS,
+    tuiRegisterTimeoutMs = TUI_REGISTER_TIMEOUT_MS,
     onIdleExit,
     onRestart,
     codePaths = defaultCodePaths(),
+    projectsDbPath,
+    stayAliveCheck = () => remoteEnabledLive(),
+    spawnServe = defaultSpawnServe,
+    terminalLaunches,
+    staleVoteCooldownMs = STALE_VOTE_COOLDOWN_MS,
   } = options;
 
   /** Frozen at hub start — the anchor the /api/upgrade signals compare to. */
   const startedAt = Date.now();
+  /**
+   * Frozen at hub start — the CONTENT anchor both staleness checks compare
+   * against (/api/upgrade vs disk, /api/register vs each bridge). Null when
+   * this process runs from src or a pre-fingerprint build; callers then fall
+   * back to version/mtime signals.
+   */
+  const hubFingerprint =
+    options.hubFingerprint !== undefined ? options.hubFingerprint : readCodeFingerprint();
 
   const instances = new Map<string, InstanceEntry>();
   const proxyPairs = new Set<{ client: WebSocket; bridge: WebSocket }>();
   const timers: Array<ReturnType<typeof setInterval>> = [];
+
+  /**
+   * Single-flight incubation per workspace (remote session-create,
+   * ADR-0014): concurrent POSTs for the same project join the SAME
+   * incubation instead of racing a second detached process past the
+   * findServe check (check-then-act). Check-then-set is one synchronous
+   * block, so requests can only ever observe "no entry" one at a time.
+   * A resume incubation keys by session instead (ADR-0017) — concurrent
+   * resumes of different sessions each get their own window.
+   */
+  // Single-flight incubation (see joinIncubation below).
+  const serveIncubations = new Map<
+    string,
+    { kind: "tui" | "serve" | "resume"; promise: Promise<{ id: string; reused: boolean }> }
+  >();
+
+  /** Live serve instances for a workspace, oldest registration first. */
+  const findServeInstances = (workspacePath: string): InstanceEntry[] => {
+    // The dedupe key must be canonical: a whitelist row (or registration) can
+    // carry a symlinked or otherwise non-canonical spelling while the serve
+    // child registers with its RESOLVED process cwd — raw string equality
+    // would never match, 502-ing every create and spawning a duplicate per
+    // retry. realpath both sides; a vanished path falls back to raw equality.
+    const wanted = canonicalPath(workspacePath);
+    return Array.from(instances.values()).filter(
+      (e) => e.origin === "serve" && canonicalPath(e.workspace) === wanted,
+    );
+  };
+
+  /** The live serve instance for a workspace, if any (per-workspace dedupe). */
+  const findServeInstance = (workspacePath: string): InstanceEntry | undefined =>
+    findServeInstances(workspacePath)[0];
+
+  /**
+   * Spawn a bridge and poll until it registers (or fails fast on child exit /
+   * timeout). Shared by every incubating endpoint for this workspace — all
+   * joiners see the same outcome. Kind picks the spawn surface and the
+   * payload: "tui" opens a visible terminal (remote session-create,
+   * ADR-0016), "resume" a visible terminal that boots straight into the
+   * requested session (ADR-0017), "serve" the detached headless bridge
+   * (background listing, ADR-0015).
+   */
+  const incubateServe = async (
+    workspacePath: string,
+    kind: "tui" | "serve" | "resume",
+    sessionId?: string,
+    tabTitle?: string,
+  ): Promise<{ id: string; reused: boolean }> => {
+    // Async spawn failures (ENOENT — the dir vanished between the whitelist
+    // check and the spawn) arrive as an 'error' event with exitCode still
+    // null; without this flag the poll burns the full budget.
+    let spawnError: Error | null = null;
+    let child: ChildProcess;
+    // Incubation correlation (ADR-0016/0017): the spawned bridge echoes this
+    // back on every registration, so the poll pairs THIS spawn with ITS
+    // registration even when several incubations race for one workspace.
+    // terminalTuiScript exports the var into the terminal's fresh shell; the
+    // detached serve spawn inherits it directly.
+    const nonce = randomUUID();
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ZCODE_ACP_REMOTE: "1",
+      ZCODE_ACP_REMOTE_TOKEN: token,
+      ZCODE_ACP_HUB_PORT: String(port),
+      ZCODE_ACP_SPAWN_NONCE: nonce,
+      // Parity with the bridge-side spawnHub: the serve child may have to
+      // (re)spawn the hub itself, and must bind the same configured host.
+      ZCODE_ACP_HUB_HOST: host,
+      // ADR-0016: the incubated bridge registers as THIS project's serve
+      // bridge (the hub's per-workspace dedupe matches it) and pins its
+      // session roots to the project cwd, so ADR-0014's whitelist
+      // semantics survive the visible-terminal lifecycle. The detached
+      // serve path ignores both (it hardcodes origin/serveMode itself).
+      ZCODE_ACP_REMOTE_ORIGIN: "serve",
+      ZCODE_ACP_REMOTE_PIN_CWD: "1",
+    };
+    // The TUI CLI pid names ONE process tree and must never leak across
+    // trees: a hub born inside a TUI (or re-spawned by one of its bridges)
+    // carries it in process.env, and a bridge it later incubates headless
+    // would SIGTERM that UNRELATED tree's process group on its last close.
+    // The terminal script re-exports its own live $$ for real TUI spawns.
+    delete env.ZCODE_ACP_TUI_CLI_PID;
+    // Martty dock filter (tui.stats in the user config, DSH_TUI_STATS as the
+    // env fallback). Resolved HERE, per incubation, from a live file read:
+    // this hub is a detached daemon whose birth env predates most shell
+    // exports, so an inherited DSH_TUI_STATS would go stale the moment the
+    // user edits the preference (or would be missing entirely on a hub that
+    // never saw it). terminalTuiScript exports it into the terminal's fresh
+    // shell — launchd's environment would otherwise drop it, and martty
+    // reads the variable once at its own process start.
+    const statsFilter = tuiStatsSegments(process.env);
+    if (statsFilter !== undefined) env.DSH_TUI_STATS = statsFilter;
+    if (kind === "resume") {
+      // ADR-0017: the requested session rides the env — terminalTuiScript
+      // exports every ZCODE_ACP_* var into the terminal's fresh shell, so the
+      // TUI boots into it. The detached serve fallback ignores it; the
+      // client attaches to the serve bridge and session/loads there instead.
+      env.ZCODE_ACP_RESUME_SESSION = sessionId;
+      // Banner handshake (see BOOT_RESUME_TRIGGER): martty auto-submits this
+      // text at boot, which drops its welcome banner and reveals the
+      // boot-replayed history without waiting for the user's first message.
+      // Must ride the env verbatim — martty reads it once at process start.
+      env.DSH_TUI_AUTOPROMPT = BOOT_RESUME_TRIGGER;
+    }
+    if (kind === "tui") {
+      // Remote session-create binding: pre-generate the ACP session id BOTH
+      // the TUI window and the attaching phone adopt on their first
+      // session/new (ZCODE_ACP_BOOT_CREATE_SESSION tells the bridge to MINT it
+      // lazily rather than load an existing conversation). Without it each
+      // side mints its own placeholder — two sessions that never meet, the
+      // phone's conversation invisible in the window (verified by the
+      // 2026-09-06 diagnosis: martty drops every update addressed to the
+      // phone's session id, and its banner never yields).
+      env.ZCODE_ACP_RESUME_SESSION = randomUUID();
+      env.ZCODE_ACP_BOOT_CREATE_SESSION = "1";
+      // Same banner handshake as resume: the auto-submitted trigger drops
+      // martty's welcome banner so the window reveals the shared conversation.
+      env.DSH_TUI_AUTOPROMPT = BOOT_RESUME_TRIGGER;
+    }
+    if (kind !== "serve") {
+      // Tab title (both visible-terminal kinds): "project · conversation"
+      // when the hub resolved the resume's title; session-create and a failed
+      // lookup fall back to the project name. Built with the same helper the
+      // bridge uses for its live updates (terminal-title.ts) so the title
+      // never churns when the bridge takes over the script's initial printf.
+      env.ZCODE_ACP_TAB_TITLE = sessionTabTitle(tabTitle, workspacePath);
+    }
+    // Terminal preference list (ADR-0016 amendment): visible-terminal kinds
+    // walk it — a failed launch moves down at once, a window that never
+    // registers moves down at its timeout — and only the exhausted list
+    // falls back to the detached headless spawn. "serve" never pops a window.
+    const launches =
+      kind === "serve"
+        ? []
+        : (terminalLaunches ?? resolveTerminalLaunches(remoteTerminalPrefs(process.env)));
+    let li = 0;
+    /**
+     * Try launches[li..] until one OPENS; advance li past every failure and
+     * leave it parked on the first opened attempt's successor. null = the
+     * remaining list failed/exhausted (caller falls back to headless).
+     */
+    const openNextTerminal = async (): Promise<ChildProcess | null> => {
+      while (li < launches.length) {
+        const attempt = launches[li]!;
+        li++;
+        try {
+          const opened = await spawnServe({
+            cwd: workspacePath,
+            kind: "tui",
+            env,
+            launch: attempt,
+          });
+          if (opened) {
+            opened.once("error", (e: Error) => {
+              spawnError = e;
+            });
+            spawnError = null;
+            log(
+              `hub: spawned terminal TUI via ${
+                attempt.kind === "shell"
+                  ? "command template"
+                  : attempt.kind === "ghosttyScript"
+                    ? `Ghostty (${attempt.app})`
+                    : attempt.kind === "warpUri"
+                      ? `Warp (${attempt.app})`
+                      : `open -a ${attempt.app}`
+              } for ${workspacePath} (pid ${opened.pid})`,
+            );
+            return opened;
+          }
+          warn(
+            `hub: terminal launch ${li}/${launches.length} failed to open — trying the next preference`,
+          );
+        } catch (e) {
+          warn(`hub: terminal launch threw: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      return null;
+    };
+    try {
+      const opened = await openNextTerminal();
+      if (opened) {
+        child = opened;
+      } else {
+        // Resume shares session-create's visible-terminal surface (and its
+        // detached-serve fallback for headless machines); only a background
+        // listing spawns the headless form — it must never pop a window.
+        const spawned = await spawnServe({
+          cwd: workspacePath,
+          kind: "serve",
+          env,
+        });
+        if (!spawned) throw new Error("headless spawn returned null");
+        child = spawned;
+        child.once("error", (e: Error) => {
+          spawnError = e;
+        });
+      }
+    } catch (e) {
+      warn(`hub: serve spawn failed: ${e instanceof Error ? e.message : String(e)}`);
+      throw new Error("serve bridge spawn failed");
+    }
+    log(
+      `hub: incubating ${kind === "resume" ? "resume TUI" : kind === "tui" ? "terminal TUI" : "serve bridge"} for ${workspacePath} (pid ${child.pid})`,
+    );
+    const budget = kind === "serve" ? SERVE_REGISTER_TIMEOUT_MS : tuiRegisterTimeoutMs;
+    let deadline = Date.now() + budget;
+    // One headless rescue per incubation — a second timeout means the rescue
+    // bridge also failed to register, and retrying again just burns time.
+    let rescued = false;
+    // A visible-terminal incubation (create OR resume) runs NEXT TO the serve
+    // bridge the listing already incubated, and several incubations can race
+    // for one workspace: the poll matches only a registration that is neither
+    // a pre-existing instance nor another incubation's bridge — otherwise a
+    // create would answer with the listing's headless bridge and the window
+    // would never be the returned instance. Only "serve" (the ensure-a-bridge
+    // listing) accepts any live registration. A nonce-less registration means
+    // a bridge older than the nonce protocol — accept it, or a legacy spawn
+    // could never satisfy its own incubation.
+    const preexisting = new Set<string>(
+      kind === "serve" ? [] : findServeInstances(workspacePath).map((e) => e.id),
+    );
+    for (;;) {
+      await new Promise<void>((resolve) => setTimeout(resolve, SERVE_REGISTER_POLL_MS).unref?.());
+      const candidates = findServeInstances(workspacePath).filter((e) => !preexisting.has(e.id));
+      const entry = candidates.find((e) => e.nonce === nonce) ?? candidates.find((e) => !e.nonce);
+      if (entry) return { id: entry.id, reused: false };
+      // The child dying is the honest fast-fail (missing cwd perms, port
+      // exhaustion, crash) — without this check the loop burns the full budget.
+      // (A terminal TUI reports through the window itself, so only the
+      // timeout applies there.)
+      if (spawnError || child.exitCode !== null || child.signalCode !== null) {
+        warn(`hub: serve bridge for ${workspacePath} exited during startup`);
+        throw new Error("serve bridge exited during startup");
+      }
+      if (Date.now() > deadline) {
+        // Slow-window fallback (session-create only): the TUI missed its
+        // registration budget (GUI cold start, skill/plugin scans ahead of the
+        // hub registration). A 502 makes the App retry, and every retry
+        // incubates ANOTHER window — the observed placeholder storm. Answer
+        // with the workspace's live headless serve bridge instead: the App
+        // attaches and can talk at once, and the late window registers on its
+        // own and is merely closable (ADR-0014 semantics unchanged — the
+        // headless serve spawn is already the documented no-GUI fallback).
+        if (kind === "tui") {
+          const fallback = findServeInstance(workspacePath);
+          if (fallback) {
+            warn(
+              `hub: TUI for ${workspacePath} slow to register — ` +
+                `falling back to the live serve bridge`,
+            );
+            return { id: fallback.id, reused: true };
+          }
+        }
+        // Next terminal preference: the window opened but never registered —
+        // on a locked/display-asleep screen Ghostty's AppleScript tab opens
+        // fine but its surface init fails (error.OutOfMemory, ghostty
+        // #10712), leaving the tab dead on its error page (the fake child
+        // never exits, so the fast-fail above can't fire). Walk down the
+        // user's list with a fresh budget before giving up on windows.
+        if (kind !== "serve" && li < launches.length) {
+          warn(
+            `hub: terminal TUI for ${workspacePath} never registered — trying the next terminal preference`,
+          );
+          const next = await openNextTerminal();
+          if (next) {
+            deadline = Date.now() + Math.max(1_000, Math.min(budget, TUI_RETRY_BUDGET_MS));
+            continue;
+          }
+        }
+        // Headless rescue (once, after the terminal list is exhausted):
+        // spawn the SAME incubation headlessly — the session-bind env rides
+        // along (create's pre-generated id, resume's target) and the nonce is
+        // unchanged, so this very loop matches the rescue bridge's
+        // registration and answers with a working session either way.
+        if (kind !== "serve" && !rescued) {
+          rescued = true;
+          warn(
+            `hub: ${kind === "resume" ? "resume TUI" : "terminal TUI"} for ${workspacePath} ` +
+              `never registered — rescuing the request with a headless serve bridge`,
+          );
+          try {
+            const rescuedChild = await spawnServe({ cwd: workspacePath, kind: "serve", env });
+            if (!rescuedChild) throw new Error("rescue spawn returned null");
+            child = rescuedChild;
+            child.once("error", (e: Error) => {
+              spawnError = e;
+            });
+            spawnError = null;
+          } catch (e) {
+            warn(
+              `hub: headless rescue spawn failed: ${e instanceof Error ? e.message : String(e)}`,
+            );
+            throw new Error("serve bridge did not register in time");
+          }
+          deadline = Date.now() + Math.max(1_000, Math.min(budget, TUI_RETRY_BUDGET_MS));
+          continue;
+        }
+        warn(`hub: serve bridge for ${workspacePath} never registered`);
+        throw new Error("serve bridge did not register in time");
+      }
+    }
+  };
+
+  /**
+   * Single-flight incubation per workspace: concurrent endpoint calls join one
+   * spawn instead of racing duplicates. A "serve" caller (the listing) joins
+   * ANY in-flight incubation keyed to its workspace — the outcome it waits for
+   * is "a serve bridge is registered", whichever surface spawned it. A "tui"
+   * caller (session-create) joins only another tui: the visible window IS the
+   * feature (ADR-0016), so it never piggybacks on an invisible listing spawn.
+   * A "resume" caller joins only the exact same session (ADR-0017) — its map
+   * key carries the session id, so resumes of different sessions each get
+   * their own window.
+   */
+  const joinIncubation = (
+    workspacePath: string,
+    kind: "tui" | "serve" | "resume",
+    sessionId?: string,
+    tabTitle?: string,
+  ): Promise<{ id: string; reused: boolean }> => {
+    const mapKey =
+      kind === "resume" ? `${workspacePath}\u0000resume\u0000${sessionId ?? ""}` : workspacePath;
+    const inflight = serveIncubations.get(mapKey);
+    if (inflight && (inflight.kind === kind || kind === "serve")) {
+      log(`hub: joining the incubating serve bridge for ${workspacePath}`);
+      return inflight.promise;
+    }
+    const promise = incubateServe(workspacePath, kind, sessionId, tabTitle);
+    serveIncubations.set(mapKey, { kind, promise });
+    // Drop the entry once settled (identity-checked — a newer incubation may
+    // already have replaced it). The catch keeps the DERIVED promise handled;
+    // the original is awaited by its creating request.
+    promise
+      .catch(() => undefined)
+      .finally(() => {
+        const current = serveIncubations.get(mapKey);
+        if (current && current.promise === promise) serveIncubations.delete(mapKey);
+      });
+    return promise;
+  };
 
   /**
    * Reply first, then gracefully stop (close() releases the port) and hand
@@ -333,6 +1367,22 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
 
   const wss = new WebSocketServer({ noServer: true });
 
+  /**
+   * Reject a WS upgrade with a real HTTP status before destroying. A bare
+   * destroy leaves the client's upgrade request hanging on an opaque
+   * ECONNRESET — the `ws` client surfaces that as an error on its internal
+   * upgrade request with no clean signal, so machine clients (the TUI's hub
+   * client included) hang or crash on it instead of reading the reason.
+   */
+  const rejectUpgrade = (socket: Duplex, status: number, reason: string): void => {
+    try {
+      socket.write(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\n\r\n`);
+    } catch {
+      // best-effort — the destroy below is the actual rejection
+    }
+    socket.destroy();
+  };
+
   const server: Server = createServer((req, res) => {
     // Async handler failures (malformed URL, aborted body) must never escape
     // into the event loop — warn and drop the connection.
@@ -345,18 +1395,18 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     if (url.pathname !== "/acp") {
-      socket.destroy();
+      rejectUpgrade(socket, 404, "Not Found");
       return;
     }
     if (!authorized(req, url, token)) {
       warn("hub: unauthorized WS upgrade rejected");
-      socket.destroy();
+      rejectUpgrade(socket, 401, "Unauthorized");
       return;
     }
     const entry = instances.get(url.searchParams.get("instance") ?? "");
     if (!entry) {
       warn("hub: WS upgrade for unknown instance rejected");
-      socket.destroy();
+      rejectUpgrade(socket, 404, "Unknown Instance");
       return;
     }
     // Dial the bridge's loopback endpoint before accepting the client side,
@@ -379,7 +1429,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     });
     bridge.once("error", (e) => {
       warn(`hub: dial bridge :${entry.port} failed: ${e.message}`);
-      socket.destroy();
+      rejectUpgrade(socket, 502, "Bridge Unreachable");
     });
   });
 
@@ -403,10 +1453,16 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         return;
       }
       // On-demand liveness probe (?probe=1): verify every registered bridge's
-      // loopback port and prune the unreachable ones before answering, so a
-      // client refresh gets an honest list instead of waiting out the
-      // heartbeat TTL (hard-killed bridges never unregister).
+      // loopback port before answering so a client refresh gets an honest
+      // list without waiting out the heartbeat TTL (hard-killed bridges never
+      // unregister). A single failed probe does NOT prune — a busy bridge's
+      // event loop can stall past the connect timeout while fully alive, and
+      // evicting it kicks every attached client. The first failure marks
+      // unhealthySince; only a probe failing after probeGraceMs of continuous
+      // unreachability prunes. A successful probe or a re-register (heartbeat)
+      // clears the mark.
       if (["1", "true"].includes((url.searchParams.get("probe") ?? "").toLowerCase())) {
+        const now = Date.now();
         const probes = await Promise.all(
           Array.from(instances.entries(), async ([id, entry]) => ({
             id,
@@ -414,11 +1470,22 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           })),
         );
         for (const { id, ok } of probes) {
-          if (!ok) {
-            instances.delete(id);
-            idleSince = null; // re-arm the idle clock on membership change
-            log(`hub: pruned instance ${id} (probe: endpoint unreachable)`);
+          const entry = instances.get(id);
+          if (!entry) continue; // unregistered while probing
+          if (ok) {
+            delete entry.unhealthySince;
+            continue;
           }
+          const unhealthySince = entry.unhealthySince ?? now;
+          entry.unhealthySince = unhealthySince;
+          if (now - unhealthySince < probeGraceMs) {
+            log(`hub: instance ${id} probe failed — marked unhealthy (grace window)`);
+            continue;
+          }
+          instances.delete(id);
+          idleSince = null; // re-arm the idle clock on membership change
+          const unhealthyForS = Math.round((now - unhealthySince) / 100) / 10;
+          log(`hub: pruned instance ${id} (probe: unreachable for ${unhealthyForS}s)`);
         }
       }
       // Cross-instance session dedupe: every bridge of a workspace lists the
@@ -449,6 +1516,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           pid: e.pid,
           startedAt: e.startedAt,
           workspace: e.workspace,
+          origin: e.origin,
           sessions: e.sessions.filter((s) => winners.get(s.sessionId)?.instance === e),
         }));
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -475,6 +1543,237 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       }
       return;
     }
+    // GET /api/quota/dock — the compact quota-dock string for the TUI
+    // refresher (ADR-0021). Account-level like /api/quota; hub-side cache is
+    // the only caching layer, so clients must not store stale copies.
+    if (url.pathname === "/api/quota/dock" && req.method === "GET") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      try {
+        const { formatted, fetchedAt } = await getQuotaDock();
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify({ formatted, fetchedAt }));
+      } catch {
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end("quota query failed");
+      }
+      return;
+    }
+    // GET /api/projects — the machine's known-project list (remote
+    // session-create, ADR-0014). Sourced from the App's tasks index: every
+    // workspace that ever ran a session. The list gates POST /api/instances
+    // (paths outside it are refused) — a convenience bound, not a security
+    // boundary: bridge-side session materialization also writes rows here,
+    // and a token holder can already drive an editor-bridge session in any
+    // cwd. The trust boundary is the token itself.
+    if (url.pathname === "/api/projects" && req.method === "GET") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const projects = await listKnownWorkspaces(projectsDbPath);
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify(projects));
+      return;
+    }
+    // GET /api/projects/sessions?workspacePath=… — the project's backend
+    // session store (ADR-0015), including closed ones no bridge advertises.
+    // Discovery stays running-scoped by design; this is the deliberate
+    // "resume an old session" surface. PAGINATED (long-lived projects hold
+    // dozens of sessions): ?limit= (default 20, max 200) rows newest-first,
+    // ?before=<ms> resumes an older page; the answer's nextCursor (null on
+    // the last page) feeds the next call. Same whitelist gate as
+    // POST /api/instances (the check bounds which cwds may incubate a serve
+    // bridge), then the ADR-0014 incubation ensures a serve bridge and the
+    // query proxies to its loopback /sessions. The answer wraps the bridge
+    // payload with the instance a list-then-load client attaches to
+    // (session/load reuses the same one).
+    if (url.pathname === "/api/projects/sessions" && req.method === "GET") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const workspacePath = (url.searchParams.get("workspacePath") ?? "").trim();
+      if (!workspacePath) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("workspacePath required");
+        return;
+      }
+      // Pagination forwarding: validate here so a bad page request fails
+      // fast with 400 instead of surfacing as the bridge's 502.
+      const pagination = new URLSearchParams();
+      for (const name of ["limit", "before"]) {
+        const raw = url.searchParams.get(name);
+        if (raw === null) continue;
+        if (!/^\d+$/.test(raw) || (name === "limit" && parseInt(raw, 10) < 1)) {
+          res.writeHead(400, { "Content-Type": "text/plain" });
+          res.end(`invalid ${name} — positive integer expected`);
+          return;
+        }
+        pagination.set(name, raw);
+      }
+      const beforeId = url.searchParams.get("beforeId");
+      if (beforeId !== null) {
+        if (!/^[\w.:-]+$/.test(beforeId)) {
+          res.writeHead(400, { "Content-Type": "text/plain" });
+          res.end("invalid beforeId — session id expected");
+          return;
+        }
+        pagination.set("beforeId", beforeId);
+      }
+      const known = await listKnownWorkspaces(projectsDbPath);
+      if (!known.some((p) => p.workspacePath === workspacePath)) {
+        res.writeHead(403, { "Content-Type": "text/plain" });
+        res.end("unknown project");
+        return;
+      }
+      try {
+        let entry = findServeInstance(workspacePath);
+        if (!entry) {
+          // "serve": a background listing must not pop a terminal window
+          // (ADR-0015) — only session-create does (ADR-0016). joinIncubation
+          // makes concurrent listings (and a listing racing a create) share
+          // one spawn instead of doubling bridges.
+          await joinIncubation(workspacePath, "serve");
+          entry = findServeInstance(workspacePath);
+        }
+        if (!entry) {
+          throw new Error("serve bridge did not register");
+        }
+        const qs = pagination.toString();
+        const payload = await fetchBridgeSessions(entry.port, qs ? `?${qs}` : "");
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.end(
+          JSON.stringify({
+            workspacePath,
+            instance: { id: entry.id, origin: entry.origin },
+            ...(Array.isArray(payload.sessions)
+              ? { sessions: payload.sessions }
+              : { sessions: [] }),
+            nextCursor: payload.nextCursor ?? null,
+          }),
+        );
+      } catch (e) {
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end(e instanceof Error ? e.message : "session list failed");
+      }
+      return;
+    }
+    // POST /api/instances — create a bridge for one known project, or RESUME
+    // one of its closed sessions (optional sessionId, ADR-0017). BOTH paths
+    // incubate a VISIBLE interactive TUI in the user's terminal (ADR-0016 as
+    // amended, macOS; ZCODE_ACP_HUB_TERMINAL=0 / headless falls back to the
+    // detached `zcode-acp serve` of ADR-0014). Without a sessionId the TUI
+    // starts a fresh conversation; with one — the backend store id from the
+    // ADR-0015 listing — it boots straight into that session. Neither path
+    // reuses a live serve bridge: the App flow always runs the history
+    // listing first, which incubates a headless serve instance, and reuse
+    // would mean the window can never open (the pre-amendment behaviour).
+    // The hub waits for the bridge's heartbeat registration; the bridge lives
+    // its own life afterwards (a terminal TUI until the window closes, a
+    // serve bridge on its idle timer). Concurrent identical POSTs join one
+    // in-flight incubation; a create and a resume, or two different sessions,
+    // each get their own window. Accepted bound: a hub restart clears the
+    // instance table, so a POST inside the bridges' ≤10s re-registration
+    // window may incubate a duplicate — harmless (the extra window is
+    // closable; background serve bridges dedupe by workspace elsewhere).
+    if (url.pathname === "/api/instances" && req.method === "POST") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const body = await readJson(req);
+      const rawPath = (body as { workspacePath?: unknown } | undefined)?.workspacePath;
+      const workspacePath = typeof rawPath === "string" ? rawPath.trim() : "";
+      if (!workspacePath) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("workspacePath required");
+        return;
+      }
+      // Optional session resume (ADR-0017); the shape mirrors beforeId's.
+      const rawSid = (body as { sessionId?: unknown } | undefined)?.sessionId;
+      const resumeSid = typeof rawSid === "string" ? rawSid.trim() : "";
+      if (resumeSid && !/^[\w.:-]+$/.test(resumeSid)) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("invalid sessionId — session id expected");
+        return;
+      }
+      const known = await listKnownWorkspaces(projectsDbPath);
+      if (!known.some((p) => p.workspacePath === workspacePath)) {
+        res.writeHead(403, { "Content-Type": "text/plain" });
+        res.end("unknown project");
+        return;
+      }
+      if (resumeSid) {
+        // Tab title, best-effort: the App browsed this conversation through
+        // the serve bridge's /sessions history, which is normally still live
+        // and still holds the title. Every miss (no live instance, id beyond
+        // the page, slow fetch) falls back to the project name inside
+        // incubateServe — the window must never wait on this lookup.
+        let tabTitle: string | undefined;
+        const titleSource = findServeInstance(workspacePath);
+        if (titleSource) {
+          const row = await withTimeout(
+            fetchBridgeSessions(titleSource.port, "?limit=200")
+              .then((payload) =>
+                (payload.sessions ?? []).find(
+                  (s) => (s as { sessionId?: unknown }).sessionId === resumeSid,
+                ),
+              )
+              .catch(() => undefined),
+            TITLE_LOOKUP_BUDGET_MS,
+          );
+          tabTitle = sanitizeTabTitle((row as { title?: unknown } | undefined)?.title);
+        }
+        // Resume never reuses the live serve bridge: the window IS the
+        // feature, and the answer must be the NEW instance so the attaching
+        // client and the terminal share one bridge (and one backend process)
+        // for the session. A bogus id still opens the window — the TUI
+        // shows the load failure and falls back to a fresh session, the same
+        // honesty as a window that dies early (ADR-0016 §4).
+        const incubation = joinIncubation(workspacePath, "resume", resumeSid, tabTitle);
+        try {
+          const out = await incubation;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(out));
+        } catch (e) {
+          res.writeHead(502, { "Content-Type": "text/plain" });
+          res.end(e instanceof Error ? e.message : "serve bridge failed");
+        }
+        return;
+      }
+      // Session-create ALWAYS incubates a VISIBLE terminal TUI (ADR-0016 as
+      // amended): the App flow lists the project's history first, which
+      // incubates a headless serve bridge — reusing that instance (the
+      // original behaviour) meant a window could NEVER open once the project
+      // was browsed, and every create ran invisibly in the background. The
+      // answer is the NEW window's instance; concurrent identical POSTs join
+      // one incubation, and the detached headless serve spawn remains the
+      // fallback (no GUI / gated off / open failure). Clients that want a
+      // headless attach use the listing's instance id instead of this POST.
+      const incubation = joinIncubation(workspacePath, "tui");
+      try {
+        const out = await incubation;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(out));
+      } catch (e) {
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end(e instanceof Error ? e.message : "serve bridge failed");
+      }
+      return;
+    }
     // POST /api/upgrade — a remote client may TRIGGER a staleness check but
     // never decide the restart: the hub compares its frozen running version
     // and process start time against the on-disk package.json and dist
@@ -485,7 +1784,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         res.end("unauthorized");
         return;
       }
-      const check = await diskCodeIsNewer(codePaths, startedAt);
+      const check = await diskCodeIsNewer(codePaths, startedAt, hubFingerprint);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
@@ -539,6 +1838,93 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         }
       });
       req.on("close", () => upstream.destroy());
+      return;
+    }
+    // POST /api/instances/{id}/shutdown — the remote "close the session
+    // window" gesture (ADR-0016/0017). For a TUI-incubated instance it tears
+    // the whole window tree down (see the tuiPid note below); for a headless
+    // serve bridge it kills just the bridge. Only instances this hub (or a
+    // remote app via it) brought up may be killed — a serve-origin bridge or
+    // any incubation-nonce carrier. An editor-origin bridge without a nonce
+    // lives inside the user's editor; killing it would take the editor's
+    // agent connection down, so those are refused (403).
+    const shutdownMatch = url.pathname.match(/^\/api\/instances\/([^/]+)\/shutdown$/);
+    if (shutdownMatch && req.method === "POST") {
+      req.resume(); // no body — drain so the client connection closes cleanly
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const entry = instances.get(shutdownMatch[1]!);
+      if (!entry) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("unknown instance");
+        return;
+      }
+      if (entry.origin !== "serve" && !entry.nonce) {
+        res.writeHead(403, { "Content-Type": "text/plain" });
+        res.end("instance was not incubated remotely (editor bridge) — refusing shutdown");
+        return;
+      }
+      // TUI-incubated instance: the registered bridge is only the LEAF of the
+      // window's tree (cli → martty → bridge); killing it alone leaves the
+      // terminal window alive on a dead-agent error page (observed live
+      // 2026-09-19: shutdown 200'd, the window stayed). tuiPid — the
+      // incubation script's $$, exec'd into the CLI — names the whole tree:
+      // the group signal covers session-leader terminals (Terminal.app), the
+      // direct signals tear tab-hosted launches (Ghostty/Warp, where the
+      // group ESRCHs) via tui.ts's SIGTERM forward to martty. Mirrors
+      // terminateAfterFlush in session-close-endpoint.ts. Headless serve
+      // bridges (no tuiPid) keep the plain bridge kill — they have no tree.
+      const tuiPid =
+        entry.tuiPid !== undefined &&
+        Number.isInteger(entry.tuiPid) &&
+        entry.tuiPid > 1 &&
+        entry.tuiPid !== process.pid
+          ? entry.tuiPid
+          : undefined;
+      const directPids = [...(tuiPid !== undefined ? [tuiPid] : []), entry.pid].filter(
+        (pid, i, all) =>
+          Number.isInteger(pid) && pid > 1 && pid !== process.pid && all.indexOf(pid) === i,
+      );
+      if (tuiPid !== undefined) {
+        try {
+          process.kill(-tuiPid, "SIGTERM");
+          log(`hub: instance ${entry.id} shutdown — SIGTERM to TUI process group ${tuiPid}`);
+        } catch {
+          // Tab-hosted launch: the group ESRCHs — the direct pids below
+          // still tear the tree down.
+        }
+      }
+      if (directPids.length === 0) {
+        res.writeHead(409, { "Content-Type": "text/plain" });
+        res.end(`instance has no killable pid (${entry.pid})`);
+        return;
+      }
+      for (const pid of directPids) {
+        try {
+          process.kill(pid, "SIGTERM");
+          log(`hub: instance ${entry.id} (pid ${pid}) shut down from remote`);
+        } catch (e) {
+          // ESRCH = already gone (e.g. the tree died with an earlier signal);
+          // anything else is a real failure to report.
+          if ((e as NodeJS.ErrnoException).code !== "ESRCH") {
+            warn(
+              `hub: shutdown of instance ${entry.id} (pid ${pid}) failed: ` +
+                `${e instanceof Error ? e.message : String(e)}`,
+            );
+            res.writeHead(500, { "Content-Type": "text/plain" });
+            res.end("kill failed");
+            return;
+          }
+        }
+      }
+      instances.delete(entry.id);
+      idleSince = null; // re-arm the idle clock on membership change
+      log(`hub: instance ${entry.id} (pid ${entry.pid}) shut down from remote`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
       return;
     }
     // POST /api/instances/{id}/sessions/{sid}/close|rename — the remote HTTP
@@ -621,6 +2007,8 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           return;
         }
         const prev = instances.get(id);
+        // A fresh entry drops any unhealthySince probe mark — a bridge alive
+        // enough to heartbeat is alive, whatever its port did during a stall.
         instances.set(id, {
           id,
           port: bridgePort,
@@ -629,25 +2017,48 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           workspace: typeof body.workspace === "string" ? body.workspace : "",
           sessions,
           lastSeen: Date.now(),
+          origin: parseOrigin(body.origin),
+          // Incubation correlation (ADR-0016/0017); absent for hand-started
+          // bridges. A re-registration (heartbeat) refreshes it — a bridge's
+          // nonce never changes, so this is inert in practice.
+          ...(typeof body.nonce === "string" && body.nonce ? { nonce: body.nonce } : {}),
+          ...(typeof body.tuiPid === "number" && Number.isInteger(body.tuiPid) && body.tuiPid > 1
+            ? { tuiPid: body.tuiPid }
+            : {}),
         });
       } else {
         instances.delete(id);
         idleSince = null; // re-arm the idle clock on membership change
       }
-      // Version self-upgrade: a bridge NEWER than this hub just registered,
-      // so this process is running stale code. Reply first (the bridge
-      // re-spawns the hub from its own, newer dist when it sees `restarting`),
-      // then exit. Equal/older/absent versions never trigger a restart.
-      const stale =
-        url.pathname === "/api/register" &&
-        typeof body.version === "string" &&
-        compareVersions(body.version, AGENT_INFO.version) > 0;
+      // Self-upgrade: a bridge with a strictly NEWER VERSION just registered,
+      // so this process is stale. Reply first (the bridge re-spawns the hub
+      // from its own dist when it sees `restarting`), then exit.
+      //
+      // Content fingerprints are deliberately NOT a vote signal: a hash has
+      // no ordering (a lexically-higher fingerprint can be OLDER code), and
+      // the hub's respawn source is not guaranteed to be the voting bridge's
+      // dist — differing fingerprints could only ever produce a
+      // non-converging restart loop (observed live: a coexisting dist voted
+      // every respawned hub stale, ~5s churn, all instances wiped).
+      // Fingerprint comparison belongs to /api/upgrade ONLY, where the
+      // comparison target is the DISK a respawn would load — self-negating
+      // by construction.
+      //
+      // Cooldown: a fresh hub ignores stale votes for the first minute. If
+      // the respawn race ever produces another same-age hub, this breaks the
+      // loop — at most one restart per STALE_VOTE_COOLDOWN_MS.
+      const newerVersion =
+        typeof body.version === "string" && compareVersions(body.version, AGENT_INFO.version) > 0;
+      const cooledDown = Date.now() - startedAt > staleVoteCooldownMs;
+      const stale = url.pathname === "/api/register" && newerVersion && cooledDown;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(stale ? { ok: true, restarting: true } : { ok: true }));
       if (stale) {
         restartSoon(
           `hub: bridge ${body.version} is newer than hub ${AGENT_INFO.version} — restarting to upgrade`,
         );
+      } else if (url.pathname === "/api/register" && newerVersion && !cooledDown) {
+        log("hub: newer-bridge vote ignored (restart cooldown after a recent restart)");
       }
       return;
     }
@@ -658,6 +2069,11 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
   function startProxy(client: WebSocket, bridge: WebSocket): void {
     const pair = { client, bridge };
     proxyPairs.add(pair);
+    // Both legs start pong-responsive; the pinger below re-arms them.
+    pongResponsive.add(client);
+    pongResponsive.add(bridge);
+    client.on("pong", () => pongResponsive.add(client));
+    bridge.on("pong", () => pongResponsive.add(bridge));
     const teardown = (): void => {
       if (!proxyPairs.delete(pair)) return;
       client.close();
@@ -696,17 +2112,39 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
   timers.push(pruner);
 
   // Keepalive pings on both legs — tunnels (notably Cloudflare) drop idle WS.
+  // Pong supervision: a ping alone keeps NAT mappings warm but never detects a
+  // dead peer — a phone whose TCP was silently cut (sleep, network change)
+  // stays readyState OPEN forever, and every proxied session/update is sent
+  // into the void while the app waits for updates that never come (observed
+  // 2026-09: app showed a stale transcript until a manual refresh reconnected
+  // and replayed). Standard ws keepalive: mark unresponsive on each ping, let
+  // the pong re-mark responsive, terminate after one full interval with no
+  // pong. terminate (not close) fires the proxy pair's teardown — the bridge
+  // leg drops too, and the client's reconnect walks the full session/load
+  // replay instead of resuming a zombie link.
+  const pongResponsive = new WeakSet<WebSocket>();
   const pinger = setInterval(() => {
     for (const { client, bridge } of proxyPairs) {
-      if (client.readyState === WebSocket.OPEN) client.ping();
-      if (bridge.readyState === WebSocket.OPEN) bridge.ping();
+      for (const ws of [client, bridge]) {
+        if (ws.readyState !== WebSocket.OPEN) continue;
+        if (pongResponsive.has(ws)) {
+          pongResponsive.delete(ws);
+          ws.ping();
+        } else {
+          log("hub: proxy leg missed a keepalive pong — terminating (dead peer)");
+          ws.terminate();
+        }
+      }
     }
   }, pingIntervalMs);
   pinger.unref();
   timers.push(pinger);
 
-  // Idle exit: with nothing registered and nobody proxied, the hub exits; the
-  // next bridge re-spawns it on demand (see endpoint.ts).
+  // Idle exit: with nothing registered and nobody proxied for idleExitMs, the
+  // hub checks whether remote access is STILL enabled (live config re-read) —
+  // enabled means stay resident (a phone must be able to create/resume at any
+  // time, even with zero local bridges); disabled means retire, and the next
+  // bridge re-spawns the hub on demand (see endpoint.ts).
   const idleCheck = setInterval(
     () => {
       if (instances.size > 0 || proxyPairs.size > 0) {
@@ -715,7 +2153,12 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       }
       if (idleSince === null) idleSince = Date.now();
       if (Date.now() - idleSince >= idleExitMs) {
-        log("hub: idle for too long with no instances — exiting");
+        if (stayAliveCheck()) {
+          log("hub: idle with no instances, but remote is still enabled — staying resident");
+          idleSince = Date.now();
+          return;
+        }
+        log("hub: idle for too long with no instances and remote disabled — exiting");
         clearInterval(idleCheck);
         void close().finally(() => onIdleExit?.());
       }

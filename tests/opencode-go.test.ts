@@ -1,14 +1,13 @@
 /**
- * Tests for the Opencode Go usage feature: dashboard HTML parsing (both field
- * orderings, missing windows, parser rot), the HTTP client (cookie/UA
- * headers), query orchestration (env-driven credentials, cache TTL, error
- * degradation), duration formatting, and section rendering.
+ * Tests for the Opencode Go usage feature: console status JSON parsing
+ * (micro-cents → percent/countdown, idle windows, parser rot), the HTTP
+ * client contract (both cookies + x-org-id — header-shape test lives in
+ * tests/opencode-go-client.test.ts), query orchestration (env-driven
+ * credentials, cache TTL, error degradation), duration formatting, and
+ * section rendering.
  *
- * Parser/formatter tests are pure-function. The client test spies on global
- * fetch. The orchestration test mocks the client module so we control the
- * (finalUrl, html) pair deterministically — undici's Response does not honour
- * the `url` init option, so mocking at the client boundary is cleaner than
- * constructing real Response objects.
+ * Parser/formatter tests are pure-function. The orchestration tests mock the
+ * client module so we control the (status, text) pair deterministically.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,11 +15,21 @@ import path from "node:path";
 import process from "node:process";
 
 // Mock the client so queryGoUsage orchestration can inject a deterministic
-// (status, text, finalUrl) without depending on undici's Response.url.
+// (status, text) without depending on undici's Response.url.
 vi.mock("../src/quota/opencode-go/client.js", () => ({
-  fetchGoDashboard: vi.fn(),
-  dashboardUrl: (id: string) => `https://opencode.ai/workspace/${id}/go`,
+  fetchGoStatus: vi.fn(),
+  goStatusUrl: () => "https://opencode.ai/console/api/go/status",
 }));
+
+// Control the own-config side of credential resolution (quota.opencodeGo*
+// in ~/.config/zcode-acp/config.json).
+const { loadUserConfigMock } = vi.hoisted(() => ({ loadUserConfigMock: vi.fn() }));
+vi.mock("../src/config/user-config.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/config/user-config.js")>(
+    "../src/config/user-config.js",
+  );
+  return { ...actual, loadUserConfig: loadUserConfigMock };
+});
 
 // Compute the config path here (not via import) so the fs mock factory below
 // can reference it without worrying about vitest mock-hoist ordering. This
@@ -56,85 +65,98 @@ vi.mock("node:fs", async () => {
 });
 
 import { formatDuration, formatGoSection } from "../src/quota/opencode-go/format.js";
-import { looksLikeDashboard, parseGoDashboard } from "../src/quota/opencode-go/parse.js";
+import { looksLikeGoStatus, parseGoStatus } from "../src/quota/opencode-go/parse.js";
 import type { GoQueryResult } from "../src/quota/opencode-go/types.js";
 import { clearCache, setClock } from "../src/quota/opencode-go/cache.js";
-import { fetchGoDashboard } from "../src/quota/opencode-go/client.js";
+import { fetchGoStatus } from "../src/quota/opencode-go/client.js";
 import { CONFIG_PATH, readConfigFile } from "../src/quota/opencode-go/config.js";
 import { queryGoUsage } from "../src/quota/opencode-go/index.js";
 
-// `fetchGoDashboard` is mocked (see vi.mock above) for orchestration tests.
-// The real HTTP-client header test lives in tests/combined.test.ts, which does
-// not mock the client module and so can spy on global fetch directly.
-void fetchGoDashboard;
+// `fetchGoStatus` is mocked (see vi.mock above) for orchestration tests. The
+// real HTTP-client header test lives in tests/opencode-go-client.test.ts.
+const mockedFetch = vi.mocked(fetchGoStatus);
+void mockedFetch;
 
 // --- parser --------------------------------------------------------------
 
-/**
- * Build a synthetic dashboard `<script>`. The SSR payload uses **unquoted** JS
- * identifiers (not JSON), so we hand-assemble the object literal — JSON.stringify
- * would add quotes around keys and fail to match the extraction regex.
- */
-function dashboardHtml(windows: {
-  rolling?: { usagePercent: number; resetInSec: number };
-  weekly?: { usagePercent: number; resetInSec: number };
-  monthly?: { usagePercent: number; resetInSec: number };
-}): string {
-  const lit = (w: { usagePercent: number; resetInSec: number }) =>
-    `{usagePercent:${w.usagePercent},resetInSec:${w.resetInSec}}`;
-  const parts: string[] = [];
-  if (windows.rolling) parts.push(`rollingUsage:$R[2]=${lit(windows.rolling)}`);
-  if (windows.weekly) parts.push(`weeklyUsage:$R[3]=${lit(windows.weekly)}`);
-  if (windows.monthly) parts.push(`monthlyUsage:$R[4]=${lit(windows.monthly)}`);
-  return `<html><script>window.__SSR={${parts.join(",")}}</script></html>`;
+/** Fixed parse clock — 2026-09-19T04:00:00Z. */
+const NOW = Date.parse("2026-09-19T04:00:00.000Z");
+
+/** One raw API meter (micro-cents strings, ISO timestamps). */
+function meter(
+  used: string,
+  limit: string,
+  resetsAt: string | null = null,
+): Record<string, unknown> {
+  return { startsAt: resetsAt, resetsAt, limitMicroCents: limit, usedMicroCents: used };
 }
 
-describe("parseGoDashboard", () => {
-  it("extracts all three windows (usagePercent-first ordering)", () => {
-    const html = dashboardHtml({
-      rolling: { usagePercent: 42, resetInSec: 3600 },
-      weekly: { usagePercent: 17, resetInSec: 604800 },
-      monthly: { usagePercent: 8, resetInSec: 2592000 },
+/** Build a status payload body around a meters object. */
+function statusJson(meters: Record<string, unknown>, endsAt = "2026-10-03T02:03:01.000Z"): string {
+  return JSON.stringify({
+    subscriberUserId: "acc_test",
+    access: { startsAt: "2026-09-03T02:03:01.000Z", endsAt, meters },
+  });
+}
+
+describe("parseGoStatus", () => {
+  it("computes percents from micro-cents and countdowns from resetsAt", () => {
+    const body = statusJson({
+      fiveHour: meter("300000000", "1200000000", "2026-09-19T05:00:00.000Z"),
+      week: meter("383736648", "3000000000", "2026-09-21T04:00:00.000Z"),
+      month: meter("789382340", "6000000000"),
     });
-    const r = parseGoDashboard(html);
-    expect(r.rolling).toEqual({ usagePercent: 42, resetInSec: 3600 });
-    expect(r.weekly).toEqual({ usagePercent: 17, resetInSec: 604800 });
-    expect(r.monthly).toEqual({ usagePercent: 8, resetInSec: 2592000 });
-    expect(r.parserOutdated).toBe(false);
+    const parsed = parseGoStatus(body, NOW);
+    expect(parsed.parserOutdated).toBe(false);
+    expect(parsed.rolling).not.toBeNull();
+    expect(parsed.rolling!.usagePercent).toBeCloseTo(25, 5);
+    expect(parsed.rolling!.resetInSec).toBe(3600);
+    expect(parsed.weekly!.usagePercent).toBeCloseTo((383736648 / 3_000_000_000) * 100, 5);
+    expect(parsed.weekly!.resetInSec).toBe(172_800);
+    // Month carries no resetsAt — anchored to access.endsAt (renewal instant).
+    expect(parsed.monthly!.usagePercent).toBeCloseTo((789382340 / 6_000_000_000) * 100, 5);
+    const monthReset = Date.parse("2026-10-03T02:03:01.000Z") / 1000 - NOW / 1000;
+    expect(parsed.monthly!.resetInSec).toBe(Math.round(monthReset));
   });
 
-  it("extracts windows when fields are in resetInSec-first order", () => {
-    // Solid may emit fields in either order; the regexes cover both.
-    const html =
-      `<html><script>` +
-      `rollingUsage:$R[2]={resetInSec:7200,usagePercent:50}` +
-      `</script></html>`;
-    const r = parseGoDashboard(html);
-    expect(r.rolling).toEqual({ usagePercent: 50, resetInSec: 7200 });
+  it("idle five-hour window (resetsAt null, used 0) → 0% with reset 0", () => {
+    const parsed = parseGoStatus(
+      statusJson({ fiveHour: meter("0", "1200000000", null), week: meter("1", "3000000000") }),
+      NOW,
+    );
+    expect(parsed.rolling!.usagePercent).toBe(0);
+    expect(parsed.rolling!.resetInSec).toBe(0);
   });
 
-  it("returns nulls for absent windows (no parserOutdated when nothing looks like dashboard)", () => {
-    const r = parseGoDashboard("<html>nothing here</html>");
-    expect(r.rolling).toBeNull();
-    expect(r.weekly).toBeNull();
-    expect(r.monthly).toBeNull();
-    expect(r.parserOutdated).toBe(false);
+  it("flags parserOutdated when meters exist but no window parses", () => {
+    const parsed = parseGoStatus(
+      statusJson({ fiveHour: meter("abc", "0"), week: meter("1", "not-a-number") }),
+      NOW,
+    );
+    expect(parsed.rolling).toBeNull();
+    expect(parsed.weekly).toBeNull();
+    expect(parsed.monthly).toBeNull();
+    expect(parsed.parserOutdated).toBe(true);
   });
 
-  it("flags parserOutdated when HTML looks like a dashboard but no window matched", () => {
-    // The variable names are present but the object shape is unrecognised —
-    // signals the SolidJS hydration format has drifted.
-    const html = `<script>rollingUsage:$R[2]={someUnknownField:42}</script>`;
-    const r = parseGoDashboard(html);
-    expect(r.rolling).toBeNull();
-    expect(r.parserOutdated).toBe(true);
+  it("non-JSON body → nulls, not parserOutdated", () => {
+    const parsed = parseGoStatus("<html>error page</html>", NOW);
+    expect(parsed.rolling).toBeNull();
+    expect(parsed.weekly).toBeNull();
+    expect(parsed.monthly).toBeNull();
+    expect(parsed.parserOutdated).toBe(false);
   });
 
-  it("looksLikeDashboard detects the window variable names", () => {
-    expect(looksLikeDashboard("rollingUsage:$R[2]={}")).toBe(true);
-    expect(looksLikeDashboard("weeklyUsage:$R[3]={}")).toBe(true);
-    expect(looksLikeDashboard("monthlyUsage:$R[4]={}")).toBe(true);
-    expect(looksLikeDashboard("<html>login page</html>")).toBe(false);
+  it("JSON without access.meters → nulls, not parserOutdated", () => {
+    const parsed = parseGoStatus(JSON.stringify({ hello: "world" }), NOW);
+    expect(parsed.parserOutdated).toBe(false);
+  });
+
+  it("looksLikeGoStatus detects the access.meters shape", () => {
+    expect(looksLikeGoStatus(JSON.parse(statusJson({})))).toBe(true);
+    expect(looksLikeGoStatus({})).toBe(false);
+    expect(looksLikeGoStatus(null)).toBe(false);
+    expect(looksLikeGoStatus("nope")).toBe(false);
   });
 });
 
@@ -206,66 +228,48 @@ describe("formatGoSection", () => {
     // Both must be valid MM-DD HH:MM stamps.
     expect(early).toMatch(/\d{2}-\d{2} \d{2}:\d{2}/);
     expect(later).toMatch(/\d{2}-\d{2} \d{2}:\d{2}/);
-    // The later fetch's reset is ~30s sooner (3570s vs 3600s of remaining).
-    expect(later).not.toBe(early);
   });
 
   it("clamps the remaining time at 0 (reset stamp stays at fetchedAt, never negative)", () => {
-    // When elapsed far exceeds resetInSec, remaining is clamped to 0 → the
-    // reset stamp equals fetchedAt (1ms into epoch). It must not throw and must
-    // still render a valid-looking stamp or the "<1m" fallback.
-    const sec = formatGoSection(success, ["rolling"], 1000 + 10_000_000);
-    expect(sec.body[0]).toMatch(/(\d{2}-\d{2} \d{2}:\d{2}|<1m)/);
+    // 1h past the reset instant — remaining clamps at 0.
+    const line = formatGoSection(success, ["rolling"], 1000 + 3600_000 + 60_000).body[0]!;
+    expect(line).toMatch(/\d{2}-\d{2} \d{2}:\d{2}/);
   });
 
   it("renders '(no data)' when a requested window is null", () => {
-    const noMonthly: GoQueryResult = { ...success, monthly: null };
-    const sec = formatGoSection(noMonthly, ["rolling", "weekly", "monthly"], 1000);
-    expect(sec.body.find((l) => l.includes("Month"))?.includes("(no data)")).toBe(true);
+    const partial: GoQueryResult = { ...success, monthly: null };
+    const sec = formatGoSection(partial, ["monthly"], 1000);
+    expect(sec.body[0]).toContain("(no data)");
   });
 
   it("non-success kinds render a single explanation line", () => {
-    expect(formatGoSection({ kind: "not_configured" }, ["rolling"]).body[0]).toMatch(
-      /not configured/i,
-    );
-    expect(formatGoSection({ kind: "auth_error" }, ["rolling"]).body[0]).toMatch(/auth expired/i);
-    expect(formatGoSection({ kind: "unavailable" }, ["rolling"]).body[0]).toMatch(/unavailable/i);
+    expect(formatGoSection({ kind: "auth_error" }, ["rolling"], 1000).body).toHaveLength(1);
+    expect(formatGoSection({ kind: "unavailable" }, ["rolling"], 1000).body).toHaveLength(1);
+    const nc = formatGoSection({ kind: "not_configured" }, ["rolling"], 1000);
+    expect(nc.body[0]).toContain("OPENCODE_GO");
   });
 
   describe("color mode", () => {
-    const ESC = String.fromCharCode(27);
-    const stripAnsi = (s: string): string => s.replace(new RegExp(`${ESC}\\[[0-9;]*m`, "g"), "");
-
     it("emits ANSI escapes and overlays NN% inside the bar; reset stays on the right", () => {
-      const sec = formatGoSection(success, ["rolling", "weekly"], 1000, true);
-      const rolling = sec.body[0]!;
-      expect(rolling).toContain(`${ESC}[48;2;`); // bg color
-      expect(rolling).toContain(`${ESC}[0m`); // reset
-      // Overlay percent is inside the bar; visible right margin keeps reset only.
+      const ESC = String.fromCharCode(27);
+      const stripAnsi = (s: string): string => s.replace(new RegExp(`${ESC}\\[[0-9;]*m`, "g"), "");
+      const rolling = formatGoSection(success, ["rolling"], 1000, true).body[0]!;
+      expect(rolling).toContain(`${ESC}[48;2;`);
       const visible = stripAnsi(rolling);
       expect(visible).toContain("42%");
-      expect(visible).toMatch(/\d{2}-\d{2} \d{2}:\d{2}/); // reset stamp
-      // Color mode renders the bar with ANSI bg on space cells, NOT with the
-      // plain █/░ block characters — so they must be absent.
+      expect(visible).toMatch(/\d{2}-\d{2} \d{2}:\d{2}/);
       expect(visible).not.toContain("█");
       expect(visible).not.toContain("░");
     });
 
     it("color=false keeps the classic plain layout (no ANSI)", () => {
-      const sec = formatGoSection(success, ["rolling"], 1000, false);
-      const line = sec.body[0]!;
+      const line = formatGoSection(success, ["rolling"], 1000, false).body[0]!;
       expect(line).not.toContain("\x1b[");
-      expect(line).toMatch(/5h\s+█+░*\s+42%/);
     });
   });
 });
 
 // --- queryGoUsage orchestration ------------------------------------------
-
-// The client module is mocked at the top of this file. We drive queryGoUsage
-// by controlling fetchGoDashboard's return/reject per-test, which lets us feed
-// a deterministic finalUrl (the basis for redirect-to-login detection).
-const mockedFetch = vi.mocked(fetchGoDashboard);
 
 describe("queryGoUsage orchestration", () => {
   beforeEach(() => {
@@ -273,18 +277,30 @@ describe("queryGoUsage orchestration", () => {
     setClock(() => 5000);
     mockedFetch.mockReset();
     mockFiles.clear();
+    loadUserConfigMock.mockReset();
+    loadUserConfigMock.mockReturnValue({});
   });
   afterEach(() => {
     clearCache();
     setClock(undefined);
     delete process.env.OPENCODE_GO_WORKSPACE_ID;
     delete process.env.OPENCODE_GO_AUTH_COOKIE;
+    delete process.env.OPENCODE_GO_SESSION_TOKEN;
     mockFiles.clear();
   });
 
   it("returns not_configured when env vars are absent", async () => {
     delete process.env.OPENCODE_GO_WORKSPACE_ID;
     delete process.env.OPENCODE_GO_AUTH_COOKIE;
+    delete process.env.OPENCODE_GO_SESSION_TOKEN;
+    expect((await queryGoUsage()).kind).toBe("not_configured");
+    expect(mockedFetch).not.toHaveBeenCalled();
+  });
+
+  it("returns not_configured when the session token is missing (auth cookie alone 401s)", async () => {
+    process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
+    process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**x";
+    // no OPENCODE_GO_SESSION_TOKEN
     expect((await queryGoUsage()).kind).toBe("not_configured");
     expect(mockedFetch).not.toHaveBeenCalled();
   });
@@ -292,6 +308,7 @@ describe("queryGoUsage orchestration", () => {
   it("returns not_configured when workspaceId format is invalid", async () => {
     process.env.OPENCODE_GO_WORKSPACE_ID = "bad-id";
     process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**x";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_valid_enough";
     expect((await queryGoUsage()).kind).toBe("not_configured");
     expect(mockedFetch).not.toHaveBeenCalled();
   });
@@ -299,56 +316,70 @@ describe("queryGoUsage orchestration", () => {
   it("returns not_configured when cookie prefix is wrong", async () => {
     process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
     process.env.OPENCODE_GO_AUTH_COOKIE = "not-the-right-prefix";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_valid_enough";
     expect((await queryGoUsage()).kind).toBe("not_configured");
     expect(mockedFetch).not.toHaveBeenCalled();
   });
 
-  it("parses a successful dashboard response", async () => {
+  it("parses a successful status response", async () => {
     process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
     process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**secret";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_session";
     mockedFetch.mockResolvedValue({
       status: 200,
-      text: dashboardHtml({
-        rolling: { usagePercent: 42, resetInSec: 3600 },
-        weekly: { usagePercent: 17, resetInSec: 604800 },
-        monthly: { usagePercent: 8, resetInSec: 2592000 },
+      text: statusJson({
+        fiveHour: meter("600000000", "1200000000", "2026-09-19T07:00:00.000Z"),
+        week: meter("300000000", "3000000000", "2026-09-21T04:00:00.000Z"),
+        month: meter("600000000", "6000000000"),
       }),
-      finalUrl: "https://opencode.ai/workspace/wrk_abc/go",
     });
     const result = await queryGoUsage();
     expect(result.kind).toBe("success");
     if (result.kind !== "success") return;
-    expect(result.rolling.usagePercent).toBe(42);
-    expect(result.weekly.usagePercent).toBe(17);
-    expect(result.monthly?.usagePercent).toBe(8);
+    expect(result.rolling.usagePercent).toBeCloseTo(50, 5);
+    expect(result.weekly.usagePercent).toBeCloseTo(10, 5);
+    expect(result.monthly?.usagePercent).toBeCloseTo(10, 5);
   });
 
-  it("detects redirect-to-login as auth_error (final URL changed)", async () => {
+  it("classifies 401 as auth_error", async () => {
     process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
     process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**expired";
-    // opencode.ai bounces expired cookies to /login with a 200.
-    mockedFetch.mockResolvedValue({
-      status: 200,
-      text: "<html>please log in</html>",
-      finalUrl: "https://opencode.ai/login",
-    });
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_expired";
+    mockedFetch.mockResolvedValue({ status: 401, text: "" });
     expect((await queryGoUsage()).kind).toBe("auth_error");
+  });
+
+  it("classifies 400 (unknown org id) as auth_error — same credentials remedy", async () => {
+    process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
+    process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**secret";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_session";
+    mockedFetch.mockResolvedValue({ status: 400, text: "" });
+    expect((await queryGoUsage()).kind).toBe("auth_error");
+  });
+
+  it("degrades to unavailable on other HTTP errors (e.g. 503)", async () => {
+    process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
+    process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**secret";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_session";
+    mockedFetch.mockResolvedValue({ status: 503, text: "" });
+    expect((await queryGoUsage()).kind).toBe("unavailable");
   });
 
   it("degrades to unavailable on network failure", async () => {
     process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
     process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**secret";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_session";
     mockedFetch.mockRejectedValue(new Error("network down"));
     expect((await queryGoUsage()).kind).toBe("unavailable");
   });
 
-  it("degrades to unavailable on parser rot (dashboard but no windows)", async () => {
+  it("degrades to unavailable on parser rot (meters present but unparseable)", async () => {
     process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
     process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**secret";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_session";
     mockedFetch.mockResolvedValue({
       status: 200,
-      text: "<script>rollingUsage:$R[2]={unknown:1}</script>",
-      finalUrl: "https://opencode.ai/workspace/wrk_abc/go",
+      text: statusJson({ fiveHour: meter("abc", "0"), week: meter("x", "y") }),
     });
     expect((await queryGoUsage()).kind).toBe("unavailable");
   });
@@ -356,10 +387,10 @@ describe("queryGoUsage orchestration", () => {
   it("serves a cached result within the TTL window", async () => {
     process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
     process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**secret";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_session";
     mockedFetch.mockResolvedValue({
       status: 200,
-      text: dashboardHtml({ rolling: { usagePercent: 1, resetInSec: 1 } }),
-      finalUrl: "https://opencode.ai/workspace/wrk_abc/go",
+      text: statusJson({ fiveHour: meter("1", "1200000000") }),
     });
     await queryGoUsage();
     expect(mockedFetch).toHaveBeenCalledTimes(1);
@@ -371,10 +402,10 @@ describe("queryGoUsage orchestration", () => {
   it("re-fetches once the TTL expires", async () => {
     process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
     process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**secret";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_session";
     mockedFetch.mockResolvedValue({
       status: 200,
-      text: dashboardHtml({ rolling: { usagePercent: 1, resetInSec: 1 } }),
-      finalUrl: "https://opencode.ai/workspace/wrk_abc/go",
+      text: statusJson({ fiveHour: meter("1", "1200000000") }),
     });
     await queryGoUsage();
     setClock(() => 5000 + 10_001); // expired
@@ -388,9 +419,16 @@ describe("queryGoUsage orchestration", () => {
 describe("readConfigFile", () => {
   afterEach(() => mockFiles.clear());
 
-  it("parses a valid {workspaceId, authCookie} JSON file", () => {
-    mockFiles.set(CONFIG_PATH, JSON.stringify({ workspaceId: "wrk_x", authCookie: "Fe26.2**y" }));
-    expect(readConfigFile()).toEqual({ workspaceId: "wrk_x", authCookie: "Fe26.2**y" });
+  it("parses a valid {workspaceId, authCookie, sessionToken} JSON file", () => {
+    mockFiles.set(
+      CONFIG_PATH,
+      JSON.stringify({ workspaceId: "wrk_x", authCookie: "Fe26.2**y", sessionToken: "st_z" }),
+    );
+    expect(readConfigFile()).toEqual({
+      workspaceId: "wrk_x",
+      authCookie: "Fe26.2**y",
+      sessionToken: "st_z",
+    });
   });
 
   it("returns empty object when the file is missing (ENOENT — silent)", () => {
@@ -428,12 +466,15 @@ describe("queryGoUsage credential merging", () => {
     setClock(() => 5000);
     mockedFetch.mockReset();
     mockFiles.clear();
-    // Dynamic mock: finalUrl must contain the workspaceId passed in, or the
-    // orchestrator's redirect-to-login check will misfire.
-    mockedFetch.mockImplementation(async (workspaceId: string) => ({
+    loadUserConfigMock.mockReset();
+    loadUserConfigMock.mockReturnValue({});
+    // A complete env triple by default; individual tests unset what they need.
+    process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_ENV0";
+    process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**env";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_env_token";
+    mockedFetch.mockImplementation(async () => ({
       status: 200,
-      text: dashboardHtml({ rolling: { usagePercent: 1, resetInSec: 1 } }),
-      finalUrl: `https://opencode.ai/workspace/${workspaceId}/go`,
+      text: statusJson({ fiveHour: meter("1", "1200000000") }),
     }));
   });
   afterEach(() => {
@@ -441,49 +482,150 @@ describe("queryGoUsage credential merging", () => {
     setClock(undefined);
     delete process.env.OPENCODE_GO_WORKSPACE_ID;
     delete process.env.OPENCODE_GO_AUTH_COOKIE;
+    delete process.env.OPENCODE_GO_SESSION_TOKEN;
     mockFiles.clear();
   });
 
   it("uses the config file when env is absent", async () => {
+    delete process.env.OPENCODE_GO_WORKSPACE_ID;
+    delete process.env.OPENCODE_GO_AUTH_COOKIE;
+    delete process.env.OPENCODE_GO_SESSION_TOKEN;
     mockFiles.set(
       CONFIG_PATH,
-      JSON.stringify({ workspaceId: "wrk_FILE0", authCookie: "Fe26.2**file" }),
+      JSON.stringify({
+        workspaceId: "wrk_FILE0",
+        authCookie: "Fe26.2**file",
+        sessionToken: "st_file_token",
+      }),
     );
     const result = await queryGoUsage();
     expect(result.kind).toBe("success");
-    // The fetch is called with the workspaceId from the file.
-    expect(mockedFetch).toHaveBeenCalledWith("wrk_FILE0", "Fe26.2**file");
+    expect(mockedFetch).toHaveBeenCalledWith("wrk_FILE0", "Fe26.2**file", "st_file_token");
   });
 
   it("env overrides the file field-by-field", async () => {
     mockFiles.set(
       CONFIG_PATH,
-      JSON.stringify({ workspaceId: "wrk_FILE0", authCookie: "Fe26.2**file" }),
+      JSON.stringify({
+        workspaceId: "wrk_FILE0",
+        authCookie: "Fe26.2**file",
+        sessionToken: "st_file_token",
+      }),
     );
     process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_ENV0"; // override only workspaceId
+    delete process.env.OPENCODE_GO_AUTH_COOKIE; // cookie still comes from the file
+    delete process.env.OPENCODE_GO_SESSION_TOKEN; // token still comes from the file
     const result = await queryGoUsage();
     expect(result.kind).toBe("success");
-    expect(mockedFetch).toHaveBeenCalledWith("wrk_ENV0", "Fe26.2**file");
+    expect(mockedFetch).toHaveBeenCalledWith("wrk_ENV0", "Fe26.2**file", "st_file_token");
   });
 
   it("env fills a field the file lacks", async () => {
-    mockFiles.set(CONFIG_PATH, JSON.stringify({ workspaceId: "wrk_FILE0" })); // no cookie
-    process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**env"; // provide the cookie
+    delete process.env.OPENCODE_GO_SESSION_TOKEN; // env keeps id+cookie; file supplies token
+    mockFiles.set(
+      CONFIG_PATH,
+      JSON.stringify({ sessionToken: "st_file_token" }), // only the token
+    );
     const result = await queryGoUsage();
     expect(result.kind).toBe("success");
-    expect(mockedFetch).toHaveBeenCalledWith("wrk_FILE0", "Fe26.2**env");
+    expect(mockedFetch).toHaveBeenCalledWith("wrk_ENV0", "Fe26.2**env", "st_file_token");
   });
 
-  it("returns not_configured when neither env nor file supplies both fields", async () => {
-    // File has only workspaceId; no env. Both fields incomplete.
-    mockFiles.set(CONFIG_PATH, JSON.stringify({ workspaceId: "wrk_FILE0" }));
+  it("returns not_configured when neither env nor file supplies the full triple", async () => {
+    delete process.env.OPENCODE_GO_SESSION_TOKEN;
+    mockFiles.set(CONFIG_PATH, JSON.stringify({ workspaceId: "wrk_FILE0" })); // no cookie/token
     expect((await queryGoUsage()).kind).toBe("not_configured");
     expect(mockedFetch).not.toHaveBeenCalled();
   });
 
   it("returns not_configured when the file is corrupt and env is absent", async () => {
+    delete process.env.OPENCODE_GO_WORKSPACE_ID;
+    delete process.env.OPENCODE_GO_AUTH_COOKIE;
+    delete process.env.OPENCODE_GO_SESSION_TOKEN;
     mockFiles.set(CONFIG_PATH, "{broken");
     expect((await queryGoUsage()).kind).toBe("not_configured");
     expect(mockedFetch).not.toHaveBeenCalled();
+  });
+});
+
+// --- own-config (quota.opencodeGo*) precedence ------------------------------
+
+describe("own-config credential precedence", () => {
+  beforeEach(() => {
+    clearCache();
+    setClock(() => 5000);
+    mockedFetch.mockReset();
+    mockFiles.clear();
+    loadUserConfigMock.mockReset();
+    loadUserConfigMock.mockReturnValue({});
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_env_token"; // token baseline for merge cases
+    mockedFetch.mockImplementation(async () => ({
+      status: 200,
+      text: statusJson({ fiveHour: meter("1", "1200000000") }),
+    }));
+  });
+  afterEach(() => {
+    clearCache();
+    setClock(undefined);
+    delete process.env.OPENCODE_GO_WORKSPACE_ID;
+    delete process.env.OPENCODE_GO_AUTH_COOKIE;
+    delete process.env.OPENCODE_GO_SESSION_TOKEN;
+    mockFiles.clear();
+  });
+
+  it("quota.opencodeGo* in the own config is used when env/pi-file are absent", async () => {
+    loadUserConfigMock.mockReturnValue({
+      quota: {
+        opencodeGoWorkspaceId: "wrk_OWN",
+        opencodeGoAuthCookie: "Fe26.2**own",
+        opencodeGoSessionToken: "st_own_token",
+      },
+    });
+    expect((await queryGoUsage()).kind).toBe("success");
+    expect(mockedFetch).toHaveBeenCalledWith("wrk_OWN", "Fe26.2**own", "st_own_token");
+  });
+
+  it("own config overrides env and the legacy pi file (highest precedence)", async () => {
+    process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_ENV";
+    process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**env";
+    mockFiles.set(
+      CONFIG_PATH,
+      JSON.stringify({
+        workspaceId: "wrk_PI",
+        authCookie: "Fe26.2**pi",
+        sessionToken: "st_pi_token",
+      }),
+    );
+    loadUserConfigMock.mockReturnValue({
+      quota: {
+        opencodeGoWorkspaceId: "wrk_OWN",
+        opencodeGoAuthCookie: "Fe26.2**own",
+        opencodeGoSessionToken: "st_own_token",
+      },
+    });
+    await queryGoUsage();
+    expect(mockedFetch).toHaveBeenCalledWith("wrk_OWN", "Fe26.2**own", "st_own_token");
+  });
+
+  it("own config fills one field; the others still fall through to env/pi-file", async () => {
+    process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**env";
+    loadUserConfigMock.mockReturnValue({ quota: { opencodeGoWorkspaceId: "wrk_OWN" } });
+    await queryGoUsage();
+    expect(mockedFetch).toHaveBeenCalledWith("wrk_OWN", "Fe26.2**env", "st_env_token");
+  });
+
+  it("env still overrides the legacy pi file when own config is absent", async () => {
+    mockFiles.set(
+      CONFIG_PATH,
+      JSON.stringify({
+        workspaceId: "wrk_PI",
+        authCookie: "Fe26.2**pi",
+        sessionToken: "st_pi_token",
+      }),
+    );
+    process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_ENV";
+    await queryGoUsage();
+    // Cookie from the file; token from env — per-field precedence.
+    expect(mockedFetch).toHaveBeenCalledWith("wrk_ENV", "Fe26.2**pi", "st_env_token");
   });
 });

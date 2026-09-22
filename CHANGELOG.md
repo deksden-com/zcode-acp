@@ -5,10 +5,906 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.46.7](https://github.com/william0wang/zcode-acp/compare/v0.46.6...v0.46.7) (2026-09-22)
+
+
+### Bug Fixes
+
+* scope turn-internal history reads with the backend's native pagination ([#236](https://github.com/william0wang/zcode-acp/issues/236)) ([d475e31](https://github.com/william0wang/zcode-acp/commit/d475e3105df5be87dd19a24bbbd2b4a52211c727))
+
+## [0.46.6](https://github.com/william0wang/zcode-acp/compare/v0.46.5...v0.46.6) (2026-09-21)
+
+
+### Bug Fixes
+
+* align permission replies, turn terminals, model lists and backend layout with 0.16.9 ([#234](https://github.com/william0wang/zcode-acp/issues/234)) ([4f8b41f](https://github.com/william0wang/zcode-acp/commit/4f8b41f464054af73d41d922b42bbc60f5d31ec6))
+
+## [0.46.5](https://github.com/william0wang/zcode-acp/compare/v0.46.4...v0.46.5) (2026-09-21)
+
+
+### Bug Fixes
+
+* read turnId from the event envelope so turn attribution works on 0.16.9 ([#232](https://github.com/william0wang/zcode-acp/issues/232)) ([d4dcc3f](https://github.com/william0wang/zcode-acp/commit/d4dcc3f9465d45204d8db616c8028023d97118b6))
+
+## [0.46.4](https://github.com/william0wang/zcode-acp/compare/v0.46.3...v0.46.4) (2026-09-21)
+
+
+### Bug Fixes
+
+* remember slash model switches, target /resume replay, arbitrate choices across aliases ([#230](https://github.com/william0wang/zcode-acp/issues/230)) ([3fc37ab](https://github.com/william0wang/zcode-acp/commit/3fc37ab54eb6bb00015cd6954115ad7ad1a3de2e))
+
+## [0.46.3](https://github.com/william0wang/zcode-acp/compare/v0.46.2...v0.46.3) (2026-09-21)
+
+
+### Bug Fixes
+
+* carry the TUI stats dock filter into hub-incubated windows ([#227](https://github.com/william0wang/zcode-acp/issues/227)) ([d10e521](https://github.com/william0wang/zcode-acp/commit/d10e5219a1719dcae71f7890ba04814ee60ab4e0))
+
+## [0.46.2](https://github.com/william0wang/zcode-acp/compare/v0.46.1...v0.46.2) (2026-09-21)
+
+
+### Bug Fixes
+
+* replay targeting + model-choice hardening ([#225](https://github.com/william0wang/zcode-acp/issues/225)) ([f7628eb](https://github.com/william0wang/zcode-acp/commit/f7628eb77dfe1b73b851ecb560c8904251094cc5))
+
+## [0.46.1](https://github.com/william0wang/zcode-acp/compare/v0.46.0...v0.46.1) (2026-09-21)
+
+
+### Bug Fixes
+
+* re-assert remembered model choice after resume to stop silent reverts ([#223](https://github.com/william0wang/zcode-acp/issues/223)) ([87f6189](https://github.com/william0wang/zcode-acp/commit/87f6189d2950364ba29a2e0f6344c959e565ae7f))
+
+## [0.46.0](https://github.com/william0wang/zcode-acp/compare/v0.45.0...v0.46.0) (2026-09-21)
+
+
+### Features
+
+* drain-gate fast path, subagent status lines, turn stats, mcp health panel ([#221](https://github.com/william0wang/zcode-acp/issues/221)) ([6540ab7](https://github.com/william0wang/zcode-acp/commit/6540ab774788d7e3816b3478761e0b7bc5f5539c))
+
+## [0.45.0](https://github.com/william0wang/zcode-acp/compare/v0.44.4...v0.45.0) (2026-09-21)
+
+
+### Features
+
+* align with the open-sourced ZCode backend (compact outcomes, /compact focus, 0.16.9 lock wording) ([#220](https://github.com/william0wang/zcode-acp/issues/220)) ([2527f53](https://github.com/william0wang/zcode-acp/commit/2527f536cc968afae66b2957a8d71f1c3641aa57))
+
+
+### Bug Fixes
+
+* stop injecting the provider model endpoint as the app-server service origin ([#215](https://github.com/william0wang/zcode-acp/issues/215)) ([f7f97aa](https://github.com/william0wang/zcode-acp/commit/f7f97aa4f7aaa9410c052ad6bac4ebe23287db13))
+
+## [0.44.4](https://github.com/william0wang/zcode-acp/compare/v0.44.3...v0.44.4) (2026-09-20)
+
+
+### Bug Fixes
+
+* reject prompts during auto-compact instead of queuing behind the lock ([81fed9e](https://github.com/william0wang/zcode-acp/commit/81fed9e6473156781eafe6cbbeebacfa47bf9d5a))
+
+## [0.44.3](https://github.com/william0wang/zcode-acp/compare/v0.44.2...v0.44.3) (2026-09-20)
+
+
+### Bug Fixes
+
+* bound turn-internal history reads and harden the settle watermark ([9f5a76c](https://github.com/william0wang/zcode-acp/commit/9f5a76cd394979d797503ef278bcdb005c902691))
+* merge desktop provider_config.json models into the dropdown ([7a24f36](https://github.com/william0wang/zcode-acp/commit/7a24f3637d90b3d03c0cb2265c0499ae0b6da126))
+
+## [0.44.2](https://github.com/william0wang/zcode-acp/compare/v0.44.1...v0.44.2) (2026-09-20)
+
+
+### Bug Fixes
+
+* settle big-session hydration without re-paying capped reads on every load ([b5f9773](https://github.com/william0wang/zcode-acp/commit/b5f97734f6855134afb344a57cea0af41ddc3829))
+
+## [0.44.1](https://github.com/william0wang/zcode-acp/compare/v0.44.0...v0.44.1) (2026-09-19)
+
+
+### Bug Fixes
+
+* answer provider runtime headers at arrival so compact turns survive ([45a7f01](https://github.com/william0wang/zcode-acp/commit/45a7f014dbeed17817d7f80b69ddd534e74749ee))
+* guard compaction turns from stops and scope the runtime-headers responder ([7ec703b](https://github.com/william0wang/zcode-acp/commit/7ec703b92b4afcbbda2715bc971190be2be34419))
+* harden compaction stop guard and dead-reader settle from cross review ([34e9da1](https://github.com/william0wang/zcode-acp/commit/34e9da1f4ae0ced2a1b5f0cd8720406e5688b99d))
+* re-settle hydration on capped resumes and mark load_earlier pages ([52914c3](https://github.com/william0wang/zcode-acp/commit/52914c3e03e8028a1f694cd152ed8e30a69bf8ee))
+* run auto-compact detached from the turn so cancel/preempt cannot kill it ([01d222a](https://github.com/william0wang/zcode-acp/commit/01d222a61a43780d29bf4b3c678d28126ad49089))
+
+## [0.44.0](https://github.com/william0wang/zcode-acp/compare/v0.43.4...v0.44.0) (2026-09-19)
+
+
+### Features
+
+* **config:** maintain all user preferences in the config file ([6bfb1b2](https://github.com/william0wang/zcode-acp/commit/6bfb1b24898e31f763eff8d8f5918e99f5d688d8))
+
+## [0.43.4](https://github.com/william0wang/zcode-acp/compare/v0.43.3...v0.43.4) (2026-09-19)
+
+
+### Bug Fixes
+
+* attach dummy exit listeners before the shutdown kill to close a linux race ([5ae87ac](https://github.com/william0wang/zcode-acp/commit/5ae87ac3dc2e7c599c8357e5087e4bc381026ef0))
+* **quota:** migrate opencode go to the console status API ([5b4966b](https://github.com/william0wang/zcode-acp/commit/5b4966bf9cc9b8844fb721c5ff5ad254834a6339))
+* **remote:** tear the whole TUI tree down on instance shutdown ([f776da0](https://github.com/william0wang/zcode-acp/commit/f776da088c0b216bf392ee21e6ced7d799d2b785))
+
+## [0.43.3](https://github.com/william0wang/zcode-acp/compare/v0.43.2...v0.43.3) (2026-09-18)
+
+
+### Bug Fixes
+
+* report cache-exclusive inputTokens in turn usage for correct cache hit rate ([056574a](https://github.com/william0wang/zcode-acp/commit/056574a86bcb725da77e218de9d130218f765596))
+* resume deleted sessions honestly and reload store-recovered sessions before first use ([ddafa66](https://github.com/william0wang/zcode-acp/commit/ddafa6677a55fc126b4c3305f691c2ab8b3df643))
+
+## [0.43.2](https://github.com/william0wang/zcode-acp/compare/v0.43.1...v0.43.2) (2026-09-18)
+
+
+### Bug Fixes
+
+* derive the account-to-config provider id mapping without the bundled table ([2b2fc7b](https://github.com/william0wang/zcode-acp/commit/2b2fc7b363478763d2d51f99c0dd13288ced6c5d))
+
+## [0.43.1](https://github.com/william0wang/zcode-acp/compare/v0.43.0...v0.43.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* prefer the configured model context window over the backend's placeholder in usage_update ([41d719a](https://github.com/william0wang/zcode-acp/commit/41d719aa41802f0db64458d16022aa3dabcaf9f9))
+
+## [0.43.0](https://github.com/william0wang/zcode-acp/compare/v0.42.5...v0.43.0) (2026-09-18)
+
+
+### Features
+
+* adopt backend session titles and extend the busy window for background notification turns ([2cc671e](https://github.com/william0wang/zcode-acp/commit/2cc671e2c06111537e119bafd263605c0ea75167))
+
+## [0.42.5](https://github.com/william0wang/zcode-acp/compare/v0.42.4...v0.42.5) (2026-09-17)
+
+
+### Bug Fixes
+
+* answer provider runtime headers with the coding-plan API key so GLM turns run ([ce3bdec](https://github.com/william0wang/zcode-acp/commit/ce3bdec14cd9f17090ca46a8ca00d235e2e144ce))
+
+## [0.42.4](https://github.com/william0wang/zcode-acp/compare/v0.42.3...v0.42.4) (2026-09-17)
+
+
+### Bug Fixes
+
+* inject both provider-config env vars so the 3.12+ CLI uses the bundled table verbatim ([b0ecb89](https://github.com/william0wang/zcode-acp/commit/b0ecb8926860c1ee70a0f6f14aa1d2fc020f346f)), closes [#202](https://github.com/william0wang/zcode-acp/issues/202)
+
+## [0.42.3](https://github.com/william0wang/zcode-acp/compare/v0.42.2...v0.42.3) (2026-09-17)
+
+
+### Bug Fixes
+
+* push the account provider snapshot and use the 3.12+ setModel shape so coding-plan models switch ([80ad523](https://github.com/william0wang/zcode-acp/commit/80ad523d42bea857bf920f9c4fe223b17f653b57))
+
+## [0.42.2](https://github.com/william0wang/zcode-acp/compare/v0.42.1...v0.42.2) (2026-09-17)
+
+
+### Bug Fixes
+
+* inject ZCODE_BUILTIN_PROVIDER_CONFIG_FILE for bundled CLI launches ([8293b7c](https://github.com/william0wang/zcode-acp/commit/8293b7c4c3c8210e779a4f894018a8c5760010b6))
+* require sustained probe failure before pruning a hub instance ([ea918c5](https://github.com/william0wang/zcode-acp/commit/ea918c51fa50eef641f8191f828abb9e72aeb0eb))
+
+## [0.42.1](https://github.com/william0wang/zcode-acp/compare/v0.42.0...v0.42.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* show Ollama Cloud dock percent at one-decimal precision and drop the constant window label ([95f01c9](https://github.com/william0wang/zcode-acp/commit/95f01c935d149b4d5c4a67e61094a3264eef1a6a))
+
+## [0.42.0](https://github.com/william0wang/zcode-acp/compare/v0.41.0...v0.42.0) (2026-09-17)
+
+
+### Features
+
+* drop the TPS dock segment and show Ollama Cloud quota with derived reset times ([83e7bcb](https://github.com/william0wang/zcode-acp/commit/83e7bcbacec46556db57edb044dd8c99f2f9c34c))
+
+## [0.41.0](https://github.com/william0wang/zcode-acp/compare/v0.40.1...v0.41.0) (2026-09-16)
+
+
+### Features
+
+* add Ollama Cloud quota card with dual-plan support and unified quota credentials in user config ([2c9a076](https://github.com/william0wang/zcode-acp/commit/2c9a076e490fab97902f977f9a7a6428ad6e7f67))
+
+## [0.40.1](https://github.com/william0wang/zcode-acp/compare/v0.40.0...v0.40.1) (2026-09-16)
+
+
+### Bug Fixes
+
+* disallow unservable Cron tools by default and record in-flight background tasks on shutdown ([#192](https://github.com/william0wang/zcode-acp/issues/192), [#194](https://github.com/william0wang/zcode-acp/issues/194)) ([444d13f](https://github.com/william0wang/zcode-acp/commit/444d13ff1b4c0bbbe9f1c5627327c67115e69ac5))
+* re-send client mcpServers on every backend session load ([#193](https://github.com/william0wang/zcode-acp/issues/193)) ([90ccc13](https://github.com/william0wang/zcode-acp/commit/90ccc138f89400cfdae86c10eb710d0e7c0c2156))
+* skip keyless builtin providers and keep self-consistent env base URL overrides ([#183](https://github.com/william0wang/zcode-acp/issues/183)) ([d510d37](https://github.com/william0wang/zcode-acp/commit/d510d37025976a200a127fa00cd44180f66457a6))
+
+## [0.40.0](https://github.com/william0wang/zcode-acp/compare/v0.39.0...v0.40.0) (2026-09-16)
+
+
+### Features
+
+* notify serve-origin clients on remote session close ([387a2c4](https://github.com/william0wang/zcode-acp/commit/387a2c4da30fe334bc503148c435b62ab9f68b70))
+
+
+### Bug Fixes
+
+* broadcast extension settings switches to every attached client ([e005045](https://github.com/william0wang/zcode-acp/commit/e0050450f904b9155bf26c97870062a961c5ddfd))
+* tell attached clients when a raced interaction ask was decided ([f5d5e5a](https://github.com/william0wang/zcode-acp/commit/f5d5e5ad625bef95284a075c8dc58d8c246bf884))
+
+## [0.39.0](https://github.com/william0wang/zcode-acp/compare/v0.38.0...v0.39.0) (2026-09-16)
+
+
+### Features
+
+* choose the initial session mode with ZCODE_ACP_MODE ([#189](https://github.com/william0wang/zcode-acp/issues/189)) ([a1aa2e0](https://github.com/william0wang/zcode-acp/commit/a1aa2e0217386ecabe57d59b33fce0cf783dbea8))
+* honor ZCODE_HOME for the config and lazy-session store paths ([#187](https://github.com/william0wang/zcode-acp/issues/187)) ([0593488](https://github.com/william0wang/zcode-acp/commit/059348851a85bb9704c2b68eca91c4f1f3a7fbf9))
+* pin the provider and model with ZCODE_PROVIDER and ZCODE_MODEL ([#188](https://github.com/william0wang/zcode-acp/issues/188)) ([6aa8999](https://github.com/william0wang/zcode-acp/commit/6aa8999f72fe2ca35ed3d4bcf05263754c60ba1c))
+
+## [0.38.0](https://github.com/william0wang/zcode-acp/compare/v0.37.3...v0.38.0) (2026-09-15)
+
+
+### Features
+
+* pass ZCODE_DISALLOWED_TOOLS to the app-server as --disallowed-tools ([#190](https://github.com/william0wang/zcode-acp/issues/190)) ([85ecb4f](https://github.com/william0wang/zcode-acp/commit/85ecb4fa6bf6daecd77efe4bb068864ce6f217e9))
+
+
+### Bug Fixes
+
+* carry the backend assistantMessageId onto streamed text and reasoning chunks ([#186](https://github.com/william0wang/zcode-acp/issues/186)) ([d346fcf](https://github.com/william0wang/zcode-acp/commit/d346fcf25a6afdc3e489124c5d80f1b1dded633a))
+
+## [0.37.3](https://github.com/william0wang/zcode-acp/compare/v0.37.2...v0.37.3) (2026-09-14)
+
+
+### Bug Fixes
+
+* pin the zcode dns lookup to ipv4first so localhost ipv4 providers connect ([522cd89](https://github.com/william0wang/zcode-acp/commit/522cd8970ddb077491dd847cd83b47f557588ba3))
+* **tui:** pin zcode-acp-martty so the approval popup shows the full request ([bd72cd9](https://github.com/william0wang/zcode-acp/commit/bd72cd9debe36df490b9e5b4d50d868d1db2e841))
+
+## [0.37.2](https://github.com/william0wang/zcode-acp/compare/v0.37.1...v0.37.2) (2026-09-14)
+
+
+### Bug Fixes
+
+* disable Happy Eyeballs for the zcode launch so slow-edge networks connect ([#182](https://github.com/william0wang/zcode-acp/issues/182)) ([2d1496f](https://github.com/william0wang/zcode-acp/commit/2d1496fbb2676b2eab7211a790432242fae96ad3))
+* **goals:** route /goal through the bridge-driven loop so clients see goal progress ([#181](https://github.com/william0wang/zcode-acp/issues/181)) ([357b1e0](https://github.com/william0wang/zcode-acp/commit/357b1e086b18b094b5d229f267eb9d6e575fd92f))
+* **mcp:** advertise http MCP support so clients mount http servers ([c7949ec](https://github.com/william0wang/zcode-acp/commit/c7949ec4149c1b63cba09cf00605ed6dcb1ba57d)), closes [#180](https://github.com/william0wang/zcode-acp/issues/180)
+
+## [0.37.1](https://github.com/william0wang/zcode-acp/compare/v0.37.0...v0.37.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* hold replay batch guard across the history fetch so live turns queue behind replay ([0bf6790](https://github.com/william0wang/zcode-acp/commit/0bf6790a80b3740c6f836a6546ad0cab78e208c1))
+
+## [0.37.0](https://github.com/william0wang/zcode-acp/compare/v0.36.0...v0.37.0) (2026-09-11)
+
+
+### Features
+
+* **quota:** add Opencode Go monthly window and reset times to the TUI quota dock ([d322fca](https://github.com/william0wang/zcode-acp/commit/d322fcaaa81f14bcf6e47b3f79a621dfeac3ecdd))
+
+
+### Bug Fixes
+
+* disambiguate colliding builtin model ids in configOptions ([#175](https://github.com/william0wang/zcode-acp/issues/175)) ([c1bb059](https://github.com/william0wang/zcode-acp/commit/c1bb0597c50f8918f42a5b8f4555054ba0bd01f7))
+
+## [0.36.0](https://github.com/william0wang/zcode-acp/compare/v0.35.2...v0.36.0) (2026-09-11)
+
+
+### Features
+
+* recover auto-mode turns from backend-lost failures (respawn + reload + retry) ([e9ca946](https://github.com/william0wang/zcode-acp/commit/e9ca946f900b4678db5138ba5f3e50f7b2bacbf6))
+
+
+### Bug Fixes
+
+* skip goal-loop turns when cancelling siblings during backend recovery ([5acd76d](https://github.com/william0wang/zcode-acp/commit/5acd76d17bae08812ea0c0661015c63b72c2dcfc))
+* supervise hub proxy keepalive pongs so dead phone links are terminated ([4c8436c](https://github.com/william0wang/zcode-acp/commit/4c8436c594ea108649b96adc54ee8d0aee3ef329))
+
+## [0.35.2](https://github.com/william0wang/zcode-acp/compare/v0.35.1...v0.35.2) (2026-09-10)
+
+
+### Bug Fixes
+
+* isolate stalled client sends in broadcast so one dead link cannot silence others ([b76fd3f](https://github.com/william0wang/zcode-acp/commit/b76fd3fb74a8249a04fb90bb39633f42f63beaab))
+* skip hidden tool-result user messages when computing replay turn starts ([8c77ef2](https://github.com/william0wang/zcode-acp/commit/8c77ef2e1d89c79f97afa45b9bc6038c83184991))
+
+## [0.35.1](https://github.com/william0wang/zcode-acp/compare/v0.35.0...v0.35.1) (2026-09-10)
+
+
+### Bug Fixes
+
+* gate plan-approval elicitation form to martty so editors keep markdown popups ([0542935](https://github.com/william0wang/zcode-acp/commit/0542935e210f59e683c50fe9c35a024039acab51))
+* keep the tail of long paths in permission popup titles ([7be5350](https://github.com/william0wang/zcode-acp/commit/7be53509f65e8bd97550b1ca0a89cfe0b205ab12))
+
+## [0.35.0](https://github.com/william0wang/zcode-acp/compare/v0.34.0...v0.35.0) (2026-09-10)
+
+
+### Features
+
+* name the terminal tab "project · topic" for martty-hosted TUI windows ([300aa9c](https://github.com/william0wang/zcode-acp/commit/300aa9c9701e1e0f83487c0cf78d00b283931c2d))
+
+
+### Bug Fixes
+
+* single-flight session resume with hydration settle to stop partial first-entry replay ([aeff59e](https://github.com/william0wang/zcode-acp/commit/aeff59e028710dacce1bcb0986507b79eda6d5b5))
+
+## [0.34.0](https://github.com/william0wang/zcode-acp/compare/v0.33.0...v0.34.0) (2026-09-09)
+
+
+### Features
+
+* show tool input details in permission popups and route plan approval through elicitation forms ([c7cb6c3](https://github.com/william0wang/zcode-acp/commit/c7cb6c3c7375debb1d751963bfb70b2bd11c4193))
+
+## [0.33.0](https://github.com/william0wang/zcode-acp/compare/v0.32.0...v0.33.0) (2026-09-09)
+
+
+### Features
+
+* **acp:** forward per-turn token usage on the session/prompt result ([#165](https://github.com/william0wang/zcode-acp/issues/165)) ([cc8124a](https://github.com/william0wang/zcode-acp/commit/cc8124a3e1e8abb386d138a185a2767b39feb9ca))
+
+
+### Bug Fixes
+
+* **acp:** per-kind replay dedup so GLM thinking reaches the client ([#167](https://github.com/william0wang/zcode-acp/issues/167)) ([b145029](https://github.com/william0wang/zcode-acp/commit/b145029f046f57579ce8aca2c8944052b309867c))
+
+## [0.32.0](https://github.com/william0wang/zcode-acp/compare/v0.31.1...v0.32.0) (2026-09-09)
+
+
+### Features
+
+* bridge-driven auto loop behind /auto with boundary compaction (ADR-0022) ([b4dde43](https://github.com/william0wang/zcode-acp/commit/b4dde43865d233211291b567132c3479d82c382d))
+
+## [0.31.1](https://github.com/william0wang/zcode-acp/compare/v0.31.0...v0.31.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* attribute internal turns by turnId, filter unusable providers, shorten terminal fallback ([#163](https://github.com/william0wang/zcode-acp/issues/163)) ([1ee5163](https://github.com/william0wang/zcode-acp/commit/1ee51638b0697638b3b50897afb3a6c8ae1d8262))
+
+## [0.31.0](https://github.com/william0wang/zcode-acp/compare/v0.30.0...v0.31.0) (2026-09-08)
+
+
+### Features
+
+* **remote:** ordered terminal preference list with chained fallback ([#161](https://github.com/william0wang/zcode-acp/issues/161)) ([04fbf42](https://github.com/william0wang/zcode-acp/commit/04fbf42de76e6dea425b1c4bf814628bf4bc1b41))
+
+## [0.30.0](https://github.com/william0wang/zcode-acp/compare/v0.29.0...v0.30.0) (2026-09-08)
+
+
+### Features
+
+* **remote:** terminate serve-origin CLI on last close and list skill commands per client ([#159](https://github.com/william0wang/zcode-acp/issues/159)) ([a728a5c](https://github.com/william0wang/zcode-acp/commit/a728a5c7eb0b1f30db681416e39f3fb4cf2207e3))
+
+## [0.29.0](https://github.com/william0wang/zcode-acp/compare/v0.28.1...v0.29.0) (2026-09-08)
+
+
+### Features
+
+* **remote:** hub staleness detection via dist content fingerprint with automatic upgrade pokes ([#157](https://github.com/william0wang/zcode-acp/issues/157)) ([7e592d5](https://github.com/william0wang/zcode-acp/commit/7e592d55ee5ca5ad25bfcd3849956ee09a715b23))
+
+## [0.28.1](https://github.com/william0wang/zcode-acp/compare/v0.28.0...v0.28.1) (2026-09-07)
+
+
+### Bug Fixes
+
+* **remote:** keep Ghostty tab incubation alive on a locked screen ([28bb8f7](https://github.com/william0wang/zcode-acp/commit/28bb8f7bac6ebf32ef022ee92b966b956cb69d86))
+
+## [0.28.0](https://github.com/william0wang/zcode-acp/compare/v0.27.3...v0.28.0) (2026-09-07)
+
+
+### Features
+
+* **remote:** launch Ghostty TUI via AppleScript new tab, bypassing its -e confirm gate ([229da20](https://github.com/william0wang/zcode-acp/commit/229da208887c16cbfa2ddd29910d39941d53ae98))
+* **remote:** show phone-created empty sessions in the active list while their CLI bridge lives ([9d19d3e](https://github.com/william0wang/zcode-acp/commit/9d19d3e616e85f9db2aae6b7caa3d4e56895989f))
+* **tui:** condense replayed tool records to the most recent turns in the CLI resume replay ([0ee1064](https://github.com/william0wang/zcode-acp/commit/0ee10641112c863011a8afca9ad9977d7bdbf503))
+
+## [0.27.3](https://github.com/william0wang/zcode-acp/compare/v0.27.2...v0.27.3) (2026-09-07)
+
+
+### Bug Fixes
+
+* **sandbox:** centralize profile dirs under ~/.zcode-acp/sandbox with pid-aware sweeping ([#152](https://github.com/william0wang/zcode-acp/issues/152)) ([6830c4d](https://github.com/william0wang/zcode-acp/commit/6830c4d930a697f9c76922ff08af32bfab498a48))
+
+## [0.27.2](https://github.com/william0wang/zcode-acp/compare/v0.27.1...v0.27.2) (2026-09-07)
+
+
+### Bug Fixes
+
+* **handlers:** never TTL-prune materialized lazy aliases; distinct evicted-session error ([#150](https://github.com/william0wang/zcode-acp/issues/150)) ([21b0b29](https://github.com/william0wang/zcode-acp/commit/21b0b29f267233bd79e0a4379441b241258f2609))
+
+## [0.27.1](https://github.com/william0wang/zcode-acp/compare/v0.27.0...v0.27.1) (2026-09-07)
+
+
+### Bug Fixes
+
+* **handlers:** session-scoped /resume elicitation and atomic lazy-alias store ([#148](https://github.com/william0wang/zcode-acp/issues/148)) ([a45d82b](https://github.com/william0wang/zcode-acp/commit/a45d82b456f6e9bee7ec36f3ad503445cc94a80a))
+
+## [0.27.0](https://github.com/william0wang/zcode-acp/compare/v0.26.1...v0.27.0) (2026-09-06)
+
+
+### Features
+
+* **handlers:** /resume slash command adopts a past session into an empty editor thread ([a24084c](https://github.com/william0wang/zcode-acp/commit/a24084c3b125eecdada4f84470fe3df581e8ffcd))
+* **remote:** real session close (backend eviction) and instance shutdown route ([5e457a0](https://github.com/william0wang/zcode-acp/commit/5e457a032185e068f98d70c7b6ff25705c43b4bc))
+
+## [0.26.1](https://github.com/william0wang/zcode-acp/compare/v0.26.0...v0.26.1) (2026-09-06)
+
+
+### Bug Fixes
+
+* **remote:** bind create TUI to the shared session; quota dock fixes ([#145](https://github.com/william0wang/zcode-acp/issues/145)) ([a613384](https://github.com/william0wang/zcode-acp/commit/a61338497c595fe8eae9ed153963c97f006a90cd))
+
+## [0.26.0](https://github.com/william0wang/zcode-acp/compare/v0.25.1...v0.26.0) (2026-09-06)
+
+
+### Features
+
+* prefer bun &gt;=1.4 (--smol) for bridge and hub processes with node fallback ([#143](https://github.com/william0wang/zcode-acp/issues/143)) ([4f33d34](https://github.com/william0wang/zcode-acp/commit/4f33d349db7414fd63a49d0b1eebcc4ed9dddfaa))
+
+## [0.25.1](https://github.com/william0wang/zcode-acp/compare/v0.25.0...v0.25.1) (2026-09-06)
+
+
+### Bug Fixes
+
+* **tui:** keep quota dock resident during turns and show reset as a clock time ([#141](https://github.com/william0wang/zcode-acp/issues/141)) ([df79531](https://github.com/william0wang/zcode-acp/commit/df795313fe9d4de167273bfa7fc7e0699534bd63))
+
+## [0.25.0](https://github.com/william0wang/zcode-acp/compare/v0.24.0...v0.25.0) (2026-09-06)
+
+
+### Features
+
+* **tui:** resident quota dock + project-bound terminal incubation ([#139](https://github.com/william0wang/zcode-acp/issues/139)) ([f086c51](https://github.com/william0wang/zcode-acp/commit/f086c5183df49a207fd478c96fa7c237b3a98232))
+
+## [0.24.0](https://github.com/william0wang/zcode-acp/compare/v0.23.0...v0.24.0) (2026-09-06)
+
+
+### Features
+
+* **remote:** name the resumed TUI tab after the conversation ([#137](https://github.com/william0wang/zcode-acp/issues/137)) ([eaa0e5a](https://github.com/william0wang/zcode-acp/commit/eaa0e5ad6ca0361603c9d8856927b07d385e5753))
+
+## [0.23.0](https://github.com/william0wang/zcode-acp/compare/v0.22.0...v0.23.0) (2026-09-06)
+
+
+### Features
+
+* **remote:** show resumed history immediately in the booting TUI ([#135](https://github.com/william0wang/zcode-acp/issues/135)) ([52592e9](https://github.com/william0wang/zcode-acp/commit/52592e9bad0de37cd188f0b07aace4b1d8a73bff))
+
+## [0.22.0](https://github.com/william0wang/zcode-acp/compare/v0.21.4...v0.22.0) (2026-09-06)
+
+
+### Features
+
+* **cli:** replace in-house REPL with Martty as the TUI frontend (ADR-0020) ([#133](https://github.com/william0wang/zcode-acp/issues/133)) ([67553be](https://github.com/william0wang/zcode-acp/commit/67553beda9c167326e0927580e4bd5ecb1d113b8))
+
+## [0.21.4](https://github.com/william0wang/zcode-acp/compare/v0.21.3...v0.21.4) (2026-09-06)
+
+
+### Bug Fixes
+
+* allow pty allocation under the Seatbelt sandbox and surface EPERM denials ([#130](https://github.com/william0wang/zcode-acp/issues/130)) ([aab355b](https://github.com/william0wang/zcode-acp/commit/aab355b14d50e5e473419891ca5c6351aaaec262))
+
+## [0.21.3](https://github.com/william0wang/zcode-acp/compare/v0.21.2...v0.21.3) (2026-09-06)
+
+
+### Bug Fixes
+
+* decline Start Plan provider runtime headers with a clear reason ([#128](https://github.com/william0wang/zcode-acp/issues/128)) ([f7d6253](https://github.com/william0wang/zcode-acp/commit/f7d6253a83653d86f628b60e2867775a6949d0a2))
+
+## [0.21.2](https://github.com/william0wang/zcode-acp/compare/v0.21.1...v0.21.2) (2026-09-06)
+
+
+### Bug Fixes
+
+* keep active tools alive past stale freeze ([#122](https://github.com/william0wang/zcode-acp/issues/122)) ([5a5d201](https://github.com/william0wang/zcode-acp/commit/5a5d201af7de67161383487ba3046d89be632610))
+
+## [0.21.1](https://github.com/william0wang/zcode-acp/compare/v0.21.0...v0.21.1) (2026-09-05)
+
+
+### Bug Fixes
+
+* **remote:** session-create always incubates a visible terminal REPL (ADR-0016 amendment) ([#124](https://github.com/william0wang/zcode-acp/issues/124)) ([8f8ff61](https://github.com/william0wang/zcode-acp/commit/8f8ff61d2972c5507dc03871ae5897b920037f7d))
+
+## [0.21.0](https://github.com/william0wang/zcode-acp/compare/v0.20.1...v0.21.0) (2026-09-04)
+
+
+### Features
+
+* REPL attaches to live sessions through the hub; fix plan-approval and replay visibility in the CLI ([#119](https://github.com/william0wang/zcode-acp/issues/119)) ([cbd6a7a](https://github.com/william0wang/zcode-acp/commit/cbd6a7a400a93abdab9e1186ea32e168efd33be2))
+
+## [0.20.1](https://github.com/william0wang/zcode-acp/compare/v0.20.0...v0.20.1) (2026-09-03)
+
+
+### Bug Fixes
+
+* forward authoritative progress during silent turns ([#110](https://github.com/william0wang/zcode-acp/issues/110)) ([4ceff1e](https://github.com/william0wang/zcode-acp/commit/4ceff1e573b54a4d875bf0a4d8ef52e50805e5cd))
+
+## [0.20.0](https://github.com/william0wang/zcode-acp/compare/v0.19.1...v0.20.0) (2026-09-03)
+
+
+### Features
+
+* **remote:** terminal-REPL session-resume and executing-session listing exclusion (ADR-0017) ([#116](https://github.com/william0wang/zcode-acp/issues/116)) ([f9440eb](https://github.com/william0wang/zcode-acp/commit/f9440eb2ac79b1bdb2eeda8376a3e16f07da2c2f))
+
+## [0.19.1](https://github.com/william0wang/zcode-acp/compare/v0.19.0...v0.19.1) (2026-09-03)
+
+
+### Bug Fixes
+
+* **hub:** self-relaunch outside the sandbox via launchd when born wrapped ([#114](https://github.com/william0wang/zcode-acp/issues/114)) ([eac374f](https://github.com/william0wang/zcode-acp/commit/eac374fc481f943ed9ea6e904c0196a392f26440))
+
+## [0.19.0](https://github.com/william0wang/zcode-acp/compare/v0.18.3...v0.19.0) (2026-09-03)
+
+
+### Features
+
+* **remote:** per-project session history and terminal-REPL session-create (ADR-0015, ADR-0016) ([#111](https://github.com/william0wang/zcode-acp/issues/111)) ([95bd694](https://github.com/william0wang/zcode-acp/commit/95bd694d2c1a910dd8e9cdaef05b240e82aa0db1))
+
+## [0.18.3](https://github.com/william0wang/zcode-acp/compare/v0.18.2...v0.18.3) (2026-09-03)
+
+
+### Bug Fixes
+
+* **sandbox:** batch allow-restarts into one window with cooldown asks and chained continuations ([#107](https://github.com/william0wang/zcode-acp/issues/107)) ([2570a12](https://github.com/william0wang/zcode-acp/commit/2570a12e1ffc1ef87f7e02f23afc8dbe58578304))
+
+## [0.18.2](https://github.com/william0wang/zcode-acp/compare/v0.18.1...v0.18.2) (2026-09-02)
+
+
+### Bug Fixes
+
+* default-allow well-known system temp trees in the sandbox ([#105](https://github.com/william0wang/zcode-acp/issues/105)) ([161de73](https://github.com/william0wang/zcode-acp/commit/161de73f71c61bedc46a2ae4fa8c2c55da6b9d60))
+
+## [0.18.1](https://github.com/william0wang/zcode-acp/compare/v0.18.0...v0.18.1) (2026-09-02)
+
+
+### Bug Fixes
+
+* **registry:** skip providers with zero models in provider registry ([#102](https://github.com/william0wang/zcode-acp/issues/102)) ([25fa4f4](https://github.com/william0wang/zcode-acp/commit/25fa4f4b85fa8e47ea757d14da3d70d90a3e36a9))
+
+## [0.18.0](https://github.com/william0wang/zcode-acp/compare/v0.17.2...v0.18.0) (2026-09-02)
+
+
+### Features
+
+* quit the REPL on bare exit/quit/q without slash ([#100](https://github.com/william0wang/zcode-acp/issues/100)) ([a93987c](https://github.com/william0wang/zcode-acp/commit/a93987c1dc371e1b2d3f10fb5cf3033baf5a9e17))
+
+## [0.17.2](https://github.com/william0wang/zcode-acp/compare/v0.17.1...v0.17.2) (2026-09-02)
+
+
+### Bug Fixes
+
+* recover sandbox continuation cold starts and stream REPL tool output ([#98](https://github.com/william0wang/zcode-acp/issues/98)) ([82b92c5](https://github.com/william0wang/zcode-acp/commit/82b92c5fd0cbd8b4d2957f168ffff552d46afac2))
+
+## [0.17.1](https://github.com/william0wang/zcode-acp/compare/v0.17.0...v0.17.1) (2026-09-02)
+
+
+### Bug Fixes
+
+* upgrade npm in release publish job for trusted publishing ([#95](https://github.com/william0wang/zcode-acp/issues/95)) ([2e9b343](https://github.com/william0wang/zcode-acp/commit/2e9b343071c5ea8e4035168af20100c3ea9ebf08))
+
+## [0.17.0](https://github.com/william0wang/zcode-acp/compare/v0.16.2...v0.17.0) (2026-09-02)
+
+
+### Features
+
+* remote session-create via known projects and headless serve bridges (ADR-0014) ([#92](https://github.com/william0wang/zcode-acp/issues/92)) ([6956442](https://github.com/william0wang/zcode-acp/commit/69564427f8494bfce72456e348bbdbfffa335649))
+
+## [0.17.0] - 2026-09-01
 
 ### Added
 
+Remote session-create (ADR-0014): a remote client can start a NEW agent
+session in any of the machine's known projects, no editor required.
+
+- `GET /api/projects` (hub, token auth): the known-project list aggregated
+  from the App's `tasks-index.sqlite` — every workspace that ever ran a
+  session, filtered (system temp trees, `~/.zcode` itself, vanished
+  directories) and sorted by last activity.
+- `POST /api/instances {workspacePath}` (hub, token auth): spawns
+  `zcode-acp serve` — a headless bridge — detached in the project cwd,
+  waits for its heartbeat registration, and returns `{id, reused}`. The
+  project list gates the create: paths outside it get 403 (a convenience
+  bound, not a security boundary — the trust boundary is the token). A live
+  serve instance for the same workspace is reused instead of re-spawned.
+- `zcode-acp serve` CLI subcommand: the same ACP surface as the stdio
+  server minus the editor — spawned by the hub with remote ENV, it
+  registers back, serves remote WS clients, and exits after 10 idle
+  minutes with no clients and no running turns (ADR-0001's headless
+  counterpart). In serve mode `session/new` ignores client cwds and always
+  uses the process cwd, pinning the session cwd end to end.
+- Registration heartbeats and `/api/instances` now carry an `origin`
+  field (`"editor"` or `"serve"`, older bridges default to `"editor"`)
+  so remote UIs can label CLI-started instances and the hub can dedupe
+  them per workspace.
+
+### Fixed
+
+- A bridge rejected by the hub (401, typically a token rotation it did
+  not observe) permanently stopped registering — its sessions vanished
+  from remote until the editor window was manually restarted. 401 no
+  longer poisons the heartbeat: the bridge keeps retrying every 10s and
+  spawns a replacement hub carrying its own token, with exponential
+  backoff (60s doubling to a 10min cap) so a mixed-token fleet that
+  keeps the stale hub alive cannot churn spawn attempts forever. Once
+  the stale hub exits — immediately if the port is free, or via its
+  zero-instance idle-exit — the next spawn installs a hub that accepts
+  the bridge and everything converges without manual restarts.
+- Hardening from an adversarial review of the new remote surfaces:
+  - serve-mode cwd pinning now covers EVERY cwd entry point, not just
+    `session/new`: a durable lazy-session alias minted with an arbitrary
+    cwd on an editor bridge can no longer be resumed on a serve bridge to
+    drag it into a foreign workspace (foreign-cwd records read as unknown
+    ids; resume/load pin the root and never adopt the backend's returned
+    workspace — the value the `/fs` file endpoint scopes to).
+  - `POST /api/instances` keeps one in-flight spawn per workspace:
+    concurrent creates join the same incubation instead of racing a
+    duplicate detached process past the live-instance check.
+  - Registration answers that are neither 2xx nor 401 (e.g. the port
+    held by a non-hub service) now warn once per stretch instead of
+    silently disabling remote discovery.
+  - `listKnownWorkspaces(dbPath)` actually opens the injected path —
+    `withSqliteRetry` used to hardcode the default tasks index, so the
+    parameter only gated the existence check.
+  - The known-project list is documented as a convenience bound, not a
+    security boundary: bridge-side session materialization also writes
+    list rows, so the real trust boundary is the token itself.
+- Second adversarial round over the branch:
+  - Serve-instance dedupe (and every serve-side workspace comparison)
+    now canonicalizes paths via realpath: a whitelist row or registration
+    carrying a symlinked spelling previously never matched the serve
+    child's resolved process cwd — every create 502'd after 10s and each
+    retry spawned another duplicate serve bridge.
+  - serve mode also pins `session/list` to the project cwd (a client cwd
+    could enumerate sessions in other projects) and refuses to resume or
+    load a raw backend session id that lives in another workspace.
+  - 401 recovery resets the whole replacement-hub schedule, so a second
+    token rotation self-heals at full speed instead of inheriting the
+    previous stretch's backoff timestamp.
+  - The serve spawn forwards `ZCODE_ACP_HUB_HOST` (parity with
+    bridge-side hub spawns) and fails fast on async spawn errors instead
+    of burning the 10s registration budget.
+
+## [0.16.2] - 2026-09-01
+
+### Fixed
+
+Second dual Review + Adversary pass over the 0.16.1 commit (pre-publish gate):
+
+- `setting.json` with an empty-string `localePreference` (`""`) read as a
+  real preference and masked a valid `locale`; the empty string now reads
+  as unset and the effective locale wins.
+- A UTF-8 BOM prefix in `setting.json` made `JSON.parse` throw and the
+  bridge silently fell back to English; the BOM is stripped before parsing.
+- Two more suites asserted English output without pinning
+  `ZCODE_ACP_LANG` (`tests/auto-compact.test.ts`,
+  `tests/background-tasks.test.ts`) — the same zh-machine redness 0.16.1
+  fixed for `mcp-list.test.ts` (6 cases went red per run). Both are now
+  pinned to `en`.
+- `tests/i18n.test.ts`'s crash-guard loop reused one module instance for
+  all five malformed locale values, so memoization short-circuited four of
+  them; each value now parses through a fresh module.
+- Removed a dead `?? ""` on `resp.error.message` (non-optional) in
+  `src/handlers/slash.ts`, and corrected 0.16.1's overstated "import order
+  normalized" claim below.
+
+## [0.16.1] - 2026-09-01
+
+### Fixed
+
+Cross-review follow-ups to 0.16.0 (found by a dual Review + Adversary pass):
+
+- Startup crash: a `setting.json` carrying a non-string `locale` (number,
+  bool, array, object) threw `TypeError` inside `pick()` — the bridge died
+  at `buildAllCommands()` before serving anything. `pick()` now narrows to
+  strings, and the settings parse validates both keys.
+- The app-locale cache used a null sentinel that a literal `"locale": null`
+  punched through — every `messages()` call then re-read and re-parsed the
+  settings file synchronously (~6ms each on a large file). Replaced with an
+  explicit read-once flag.
+- `tests/mcp-list.test.ts` asserted the English `/mcp` card without pinning
+  `ZCODE_ACP_LANG`, and its fs mock falls through to the real fs — so the
+  suite read the developer's real `~/.zcode/v2/setting.json` and failed 6
+  cases on any zh-locale machine. Now pinned to `en`.
+- Localized the strings the first pass missed: auto-compact status lines,
+  the pre-popup tool_call titles ("Ready to code?", "tool permission (…)",
+  "interaction"), the replay "tool call" fallback, background-task card
+  titles, and the slash-command error messages (which previously stayed
+  English next to localized success feedback).
+- `tests/i18n.test.ts` now asserts the nested `slashCommandDescriptions`
+  key sets match across languages and cover every static command.
+- CHANGELOG wording: 0.16.0's "covers every string" overstated — token-form
+  feedback (`✓ /mode = yolo`) and argument hints intentionally stay
+  as-is (language-neutral).
+
+## [0.16.0] - 2026-09-01
+
+### Added
+
+- Bilingual user-facing strings (zh/en) with `ZCODE_ACP_LANG` (`zh`/`en`).
+  When unset, the bridge inherits the ZCode app's language choice
+  (`localePreference`/`locale` in `~/.zcode/v2/setting.json`), then falls
+  back to the `LC_ALL`/`LC_MESSAGES`/`LANG` locale, defaulting to English.
+  Covers every string the bridge renders to the user in the editor: the
+  sandbox permission popup, ExitPlanMode and AskUserQuestion popup labels
+  ("Skip", "Skip this question", Include/Skip per option), slash-command
+  feedback lines, status/hint lines, the post-allow continuation prompt,
+  the changed-files card, the `/mcp` server listing, and the collapsed
+  titles built during session/load replay — previously a mix of hardcoded
+  Chinese and English. Developer-facing `log()`/`warn()` diagnostics stay
+  English; the standalone REPL TUI and the `/quota` card formatter remain
+  English-only for now.
+
+## [0.15.0] - 2026-09-01
+
+### Added
+
+- Opt-in Seatbelt sandbox (`ZCODE_ACP_SANDBOX=1`, macOS) confining the
+  agent's file writes (ADR-0011): the zcode backend subprocess — and every
+  Bash/Edit/Write plus child process it runs — is wrapped in a generated
+  `sandbox-exec` profile that denies writes outside the workspace roots,
+  `~/.zcode*`, the system temp dir, regenerable tool caches, and the
+  per-project allowlist. Reads/execution stay open; deletion is a
+  write-class syscall, so `rm` (and every variant of it) is stopped by the
+  write denial regardless of the binary performing it. A write outside the
+  whitelist surfaces as an `Operation not permitted` in the tool output and
+  triggers the editor's permission popup: allow the directory **once**
+  (bridge-lifetime) or **always** — persisted by the bridge into
+  `<workspace>/.zcode/acp/sandbox.json` (auto-created; the `.zcode/acp/`
+  deny island keeps the agent from editing its own allowlist). After an
+  allow the backend restarts with the widened profile and the bridge
+  auto-continues the interrupted task. `"strictGit": true` in the config
+  puts `.git` behind the popup. Verified by `scripts/verify-sandbox.sh`
+  (four-state: workspace writable / outside denied / island protected /
+  config-allowed honored); two real bugs fell out of that verification —
+  SBPL resolves overlapping rules by LAST match (deny carve-outs must be
+  emitted after all allows), and every subpath must be realpath-resolved or
+  symlinked prefixes (/tmp → /private/tmp) silently fail to match.
+- Project-level sandbox switch: `"enabled": true` in
+  `<workspace>/.zcode/acp/sandbox.json` arms the sandbox for that project
+  without the global env. The template is auto-created with
+  `"enabled": false` on first open (discovery without arming); a malformed
+  config reads as enabled (fail closed — corruption must not silently
+  disarm). A mid-run flip to `true` is applied at the next prompt (the
+  unsandboxed backend is killed and respawned; the session reloads via the
+  subscribe-recovery path); flipping back drops the wrap on the next natural
+  backend respawn.
+- Sandbox hardening from adversarial cross-review (all findings reproduced,
+  then closed): the profile is generated into a fresh unpredictable dir per
+  respawn (O_EXCL) and self-denies its own directory — the previous stable
+  $TMPDIR path let a sandboxed agent race the write (full escape), symlink
+  it at a victim file, park a FIFO on it (bridge freeze), or occupy it with
+  a directory (respawn DoS); symlinked/hardlinked sandbox.json now reads as
+  armed with persistence disabled (writing the link target inside the
+  workspace pierced the deny island and let the agent edit its own
+  allowlist); `/dev/null` is allow-listed (git commit and every
+  `2>/dev/null` failed without it); island/strictGit paths get an
+  explanatory hint instead of a popup that could never override the
+  last-match deny; killing the backend now cancels all in-flight turns
+  (other sessions hung up to ~10min on the dead reader); the allow popup
+  uses the correct `session/request_permission` wire name with the source
+  `toolCall` (the camelCase form was method-not-found on every real
+  client, silently disabling the whole dynamic-allow flow); non-object JSON
+  configs fail closed; relative `allow` entries are dropped.
+- Second-round hardening (re-review found a regression and a fail-open gap,
+  both reproduced): the profile dir moved from $TMPDIR to a home-based
+  `~/.zcode-acp-sbx-*` mkdtemp — prior sandboxed generations (setsid
+  survivors) keep their old allows and could race the write→exec window of a
+  TMPDIR-placed profile regardless of name freshness (38–80% full escape);
+  a config previously read as armed that then turns unreadable (EACCES,
+  ENOTDIR) or vanishes now reads as armed instead of silently disarming via
+  the auto-created template; protected-path matching folds case on macOS
+  (`.ZCODE/ACP` variants no longer get a doomed popup).
+
+### Fixed
+
+- The dynamic-allow popup never fired for the most common denial shapes
+  (found by live testing right after arming): zsh prints redirect denials as
+  `zsh:2: operation not permitted: /path` — lowercase with the path AFTER the
+  phrase — which the extractor's `path: Operation not permitted` pattern and
+  the case-sensitive gate both missed, so `echo > /outside/f` (the standard
+  agent write) silently got no ask at all. The extractor now handles the zsh
+  redirect form, the Node fs form (`EPERM: operation not permitted, open
+'/path'` — quoted paths keep spaces, any libuv syscall name matches, and a
+  truncated apostrophe-in-path match is refused rather than allowed to
+  persist an over-broad directory), and explicit `./`/`../` relative
+  paths, which the handler resolves against the session cwd instead of the
+  bridge's own cwd (they differ for remote/hub clients); the gate is
+  case-insensitive; read-only tools (Read/Grep/Glob/... — their output
+  merely echoes text) are excluded from the scan to avoid phantom asks, and
+  asks resolving to $HOME or an ancestor are refused outright.
+- Backend respawn (sandbox allow-restart, idle-eviction recovery) restored
+  the session via a bare `session/resume`, skipping the provider-registry
+  sync and the stale-model repair that the ACP resume/load handlers
+  perform — the session history references a model whose provider the
+  fresh backend never registered, so every send failed persistently with
+  the backend's "历史任务使用的模型已不可用" error (auto-continuation
+  after an allow died silently; user messages hung on the send retry).
+  `reloadBackendSession` now performs the same sync → resume → repair
+  sequence as the ACP paths.
+- The post-allow continuation ran as a detached bridge-internal prompt: the
+  editor had no pending request behind it, so it showed no running state —
+  the respawn+reload window (~7s) read as "it just stopped", any message
+  typed there preempted the continuation for real, and only the session/load
+  replay later surfaced the orphaned continuation bubble. The continuation
+  now chains INSIDE the original `session/prompt` request (wrapper in
+  `prompt()`), so the editor's spinner spans the restart and the resumed
+  work renders as the same turn; preempt/ESC during the continuation still
+  cancels it. The continuation round also emits a status line
+  ("[沙箱后端已重启,会话已恢复,自动继续刚才的任务…]") at send-accept, so the
+  respawn+reload window no longer ends in an unexplained thinking block.
+- Rejection is explicit config, not hidden memory: the popup now offers all
+  four ACP kinds — 始终允许 / 仅此一次 / 拒绝一次 / 始终拒绝. "始终拒绝"
+  persists the path into the project config's `deny` list (the same ask
+  never resurfaces; review or undo by editing the file); "拒绝一次" and
+  timeouts/dismissals persist nothing and will ask again — no rejection is
+  remembered anywhere but the config.
+
+## [0.14.3] - 2026-09-01
+
+### Fixed
+
+- Turns running silently behind a sub-agent (or any long quiet operation) are
+  no longer killed after 120 seconds of stream silence. 0.14.2's deadline
+  check probed the prompt lock via `session/goal show` and killed the turn on
+  a released or indeterminate lock — but raw-backend probes against the
+  Aug-28 app-server proved the prompt lock is not a liveness signal:
+  `session/goal show` succeeds mid-turn, and a probe `session/send` is
+  accepted (queued as steer input) while the turn runs, because the lock is
+  only held during turn finalisation. The deadline now keys on the
+  `session/read` projection watermark (contextUsed / totalTokenCount /
+  turnCount / currentTurnId), refreshed by the 15-second stall reconcile: an
+  advancing watermark proves the backend is still making progress and defers
+  the terminal decision indefinitely, and only a watermark frozen for ten
+  minutes (STALE_FREEZE_MS) ends the turn — reply fetch first, bounded stop
+  as the last resort.
+
+## [0.14.2] - 2026-08-31
+
+### Fixed
+
+- The turn loop's 120-second no-progress watchdog can no longer be kept
+  alive indefinitely by a stale backend projection stuck at
+  `status: "running"`: projection probes no longer refresh the deadline.
+  At the deadline the bridge now probes the authoritative prompt lock via
+  `session/goal show` (lock-busy matched by error code 1308, message text
+  as fallback). A held lock defers the terminal decision by another 120
+  seconds — protecting legitimately long model/tool operations — while a
+  released or indeterminate lock ends the turn with the existing bounded
+  `max_turn_requests` outcome. Queued events are consumed before a
+  deadline decision. (Originally by GuanBear in #83; rebased and adapted
+  to the post-#84 cancel machinery in #85.)
+
+## [0.14.1] - 2026-08-31
+
+### Fixed
+
+- REPL live turn: streamed prose now interleaves with thinking and tool
+  entries in stream order. Prose segments are flushed as entries whenever
+  thinking resumes, a fresh tool row starts, or a plan note arrives —
+  previously the whole reply accumulated in a single buffer pinned to the
+  bottom of the live-turn tail until the turn ended, rendering later
+  thinking/tool entries above earlier prose and letting long replies crowd
+  the tail. Whitespace-only thought chunks are ignored as segment
+  transitions so they cannot shred prose.
+
+## [0.14.0] - 2026-08-31
+
+### Added
+
+- REPL prompt history: every submit is recorded per project
+  (`~/.zcode/acp/repl-history/<sha1(cwd)>.jsonl`, newest 500 kept, runs of
+  duplicates collapsed) and recalled across restarts with `↑`/`↓` while the
+  completion menu is closed — the first `↑` stashes the live draft and `↓`
+  past the newest entry restores it.
+- Pasted text is folded to a single line before it reaches the prompt:
+  bracketed-paste mode (`?2004`) is armed so ink delivers pastes as one
+  chunk, and newlines/tabs inside them (or any multi-character chunk
+  carrying a newline, for terminals without `?2004`) become single spaces.
+  Previously every newline in a paste submitted mid-paste, firing a
+  multi-paragraph paste line-by-line as separate prompts.
+- REPL `/new` starts a fresh session without leaving the terminal: the live
+  session is swapped client-side for a new `session/new` placeholder
+  (config selects reseeded from the response), a divider note marks the
+  boundary, and the prompt draft is cleared. A running turn refuses it
+  (`esc` interrupts first); it is registered as a one-shot command, so
+  picking it in the completion menu executes immediately.
+- A live status row while a turn runs — `⠋ working… (12s · esc to interrupt)`,
+  phase-labeled thinking/writing/working — re-rendering every second so
+  stretches with no streamed output (long tool calls) are visibly alive; the
+  old dim "ctrl-c to cancel" line carried no liveness signal. Help lines and
+  the input-box hint now advertise `esc` as the interrupt (ctrl-c is quit).
 - Interactive REPL (bare `zcode-acp`): an Ink terminal chat over the same
   bridge the editor uses, including slash-command completion with an
   interactive menu, a caret-aware prompt line (arrows/Ctrl-B/F/A/E/U),
@@ -52,8 +948,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `session/cancel` now sends an idempotent backend stop even when a background
-  completion starts a root turn after the ACP prompt request has returned.
+- `esc`/stop now takes effect immediately. The Aug-28 app-server build
+  (still reporting 0.16.5) accepts `session/stop` but never aborts the
+  in-flight model stream — its own log records every stop with
+  `hadActivePrompt: false`, i.e. the generation's abort controller is never
+  registered, so the stream ran ~10s past the stop to its natural end while
+  the turn loop waited for a terminal event. Digging through the desktop
+  app's bundle revealed the stop path the official client actually uses: a
+  `v4/command` RPC of type `stop` that asks the runtime to stop the active
+  foreground execution (not the broken `session/stop`). The bridge now sends
+  that v4 stop alongside `session/stop` — verified live: the generation dies
+  the instant the command lands (`turn.completed` in 0.0s, vs +39.7s natural
+  drift before). The turn loop also returns `stopReason: "cancelled"` at
+  once instead of waiting for a terminal event.
+- A follow-up prompt sent right after a cancel/preempt is no longer silently
+  dropped. The same backend build accepts a mid-generation `session/send`
+  as a steer and discards its input when the old turn finishes (verified:
+  only one `turn.completed` ever arrives, for the old prompt). The bridge
+  now settles the backend before sending: with the v4 stop the probe sees
+  idle immediately; on a backend that honours `session/stop` it polls the
+  projection until idle; if a generation somehow survives both stops, a
+  `session/close` escalation after a 5s grace tears down the runtime (the
+  probe then fails into a session reload). A visible
+  `[上一个回复仍在生成，等待结束后发送…]` note explains the wait — bounded at
+  90s, still interruptible with `esc`, falling back to a direct send on
+  timeout or probe failure. Two edge paths found in review are also closed:
+  after a close-escalation reload the bridge re-subscribes the event stream
+  (the reload revives the session but not its push — without this the next
+  turn runs deaf until the watchdog) and re-baselines the projection differ
+  so the cancelled turn's residue is never replayed as the next reply; and a
+  send that does land mid-generation is reported at once via the backend's
+  `turn.steerQueued` event (`[消息被并入仍在生成的回合，将被丢弃，请重新发送]`)
+  instead of hanging silently until the 120s watchdog.
 - Pressing ↓ with no completion menu open no longer zombifies the whole UI:
   the setState updater dereferenced a null menu during render, unmounting
   React's tree under ink without any crash signal (found by review,
@@ -67,6 +993,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overwrite the resumed one; the placeholder is now discarded.
 - Resume no longer force-pins a session to the first config.json model
   (faithful model preservation, overlay demoted to one-retry fallback).
+- Turns driven from another client (mobile app, second editor) now render
+  live in the REPL even when the two hold different ACP session ids for the
+  same conversation — the common "fresh REPL session, mobile follow-up"
+  path previously stayed completely silent (no live turn, no streaming, no
+  completion, while the other client saw everything). Session-scoped
+  notifications (updates, turnState, prompt echo) are now emitted once per
+  attached session alias.
+- ESC (and ctrl-c) now interrupts a running turn immediately. The backend
+  ignores `session/stop` (verified against app-server 0.16.5 — the model
+  stream runs to its natural end regardless), and the turn loop used to wait
+  for that terminal event before reporting cancelled, so the reply kept
+  streaming for the whole remaining generation (10s+ observed) while the
+  status row kept spinning. The loop now returns `cancelled` at once; a
+  follow-up prompt sent during the abandoned turn's finalisation arms the
+  turn-attribution gate so the residue is dropped instead of bleeding into
+  the new reply. REPL hint copy now advertises esc as the interrupt
+  ("esc interrupt") instead of ctrl-c.
 
 ## [0.13.0] - 2026-08-26
 

@@ -7,8 +7,8 @@
  * resubscribe from it to recover missed events after a stall.
  *
  * `TurnMonitor` is the legacy snapshot path: a one-shot `session/read` that
- * returns the authoritative projection. Used for stall reconciliation and
- * lock-release probing.
+ * returns the latest projection. Used for stall reconciliation, but never as
+ * proof of protocol progress because a `running` projection may be stale.
  */
 
 import type { ZcodeBackend } from "./client.js";
@@ -57,11 +57,12 @@ export class EventStreamListener {
    */
   async subscribe(nextId: NextId): Promise<ZcodeSnapshot> {
     // Retry transient timeouts as a lightweight safety net for cold-start /
-    // network blips. The cancel-preempt path no longer needs subscribe retries
-    // to absorb a backend stop-finalization window: the turn loop now blocks
-    // until the backend emits turn.completed/turn.failed before its prompt()
-    // exits, so by the time the next prompt reaches subscribe the backend is
-    // already idle. These retries are just a last-resort cushion.
+    // network blips. The cancel path returns from prompt() at once (the
+    // backend ignores session/stop), so a prompt sent right after a cancel
+    // CAN reach subscribe while the abandoned turn is still generating —
+    // prompt()'s drain gate polls the backend to idle before sending, so
+    // residue is gone by the time this subscribes. These retries are just a
+    // last-resort cushion.
     //
     // Only `timeout` is retried — non-transient errors (reader dead, pipe
     // broken, method-not-found, session-level business error) fail fast.
@@ -87,7 +88,12 @@ export class EventStreamListener {
           sessionId: this.sid,
           deliveryKind: "desktop-continuous",
           includeSnapshot: false,
-          afterSeq: 0,
+          // afterSeq deliberately OMITTED: a fresh subscribe wants no replay,
+          // and passing an explicit afterSeq makes the backend materialize the
+          // missed window into the response (`events`) — with afterSeq: 0 that
+          // was the FULL event log, computed and thrown away on every turn
+          // (O(session length); observed costly on multi-thousand-message
+          // sessions). The eventSeq watermark below is all we need.
         },
         5000,
       );
@@ -165,9 +171,13 @@ export class EventStreamListener {
 
   /**
    * Stall recovery: resubscribe from `lastSeq` so the server replays missed
-   * events. Failure is logged but non-fatal — the caller degrades to polling.
-   * The snapshot (if returned despite `includeSnapshot:false`) is intentionally
-   * not consumed; resubscribe only refreshes the watermark + resumes the push.
+   * events — the missed window arrives IN the response (`events`, source:
+   * subscribeSession returns every event with seq > afterSeq) and is queued
+   * into the stream in seq order, so the turn loop sees the gap instead of a
+   * silently advanced watermark (the attribution gate still decides which
+   * events belong to the current turn). Failure is logged but non-fatal —
+   * the caller degrades to polling. The snapshot (if returned despite
+   * `includeSnapshot:false`) is intentionally not consumed.
    */
   async resubscribe(nextId: NextId): Promise<boolean> {
     const resp = await this.backend.request(
@@ -188,6 +198,12 @@ export class EventStreamListener {
       return false;
     }
     const result = (resp.result ?? {}) as ZcodeSubscribeResult;
+    const missed = (result.events ?? []).slice().sort((a, b) => a.seq - b.seq);
+    for (const event of missed) {
+      // The live push may have delivered some of the window already; the
+      // watermark check skips those instead of double-dispatching.
+      if (event.seq > this.lastSeq) this.handleEvent(event);
+    }
     if ((result.eventSeq ?? this.lastSeq) > this.lastSeq) {
       this.lastSeq = result.eventSeq ?? this.lastSeq;
     }
@@ -196,8 +212,9 @@ export class EventStreamListener {
 }
 
 /**
- * Legacy snapshot path: a single `session/read` returning the authoritative
- * projection. Used in stall reconciliation and lock-release probing.
+ * Legacy snapshot path: a single `session/read` returning the latest
+ * projection. Used in stall reconciliation; prompt-lock state is probed
+ * separately because a `running` projection may be stale.
  */
 export class TurnMonitor {
   private readonly backend: ZcodeBackend;
@@ -215,7 +232,10 @@ export class TurnMonitor {
     const resp = await this.backend.request(
       this.nextId(),
       "session/read",
-      { sessionId: this.zcodeSid },
+      // messageLimit: only `projection` is read here, and the backend
+      // serializes the snapshot's whole message array without the cap — this
+      // poll runs every second for the length of a turn.
+      { sessionId: this.zcodeSid, messageLimit: 1 },
       5000,
     );
     if (resp.error) return null;

@@ -11,11 +11,25 @@ export default [
       "node_modules/**",
       "coverage/**",
       ".zcode/**",
+      // Local codesearch/tgrep scratch (gitignored); its loose .mjs probes have
+      // no node globals configured and would otherwise fail `pnpm lint`.
+      "**/.tgrep/**",
       "*.config.js",
       "eslint.config.js",
     ],
   },
   js.configs.recommended,
+  {
+    // Node build scripts (plain .mjs, not compiled): node globals only.
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        URL: "readonly",
+      },
+    },
+  },
   {
     files: ["src/**/*.ts", "tests/**/*.ts"],
     languageOptions: {

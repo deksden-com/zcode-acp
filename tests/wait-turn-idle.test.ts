@@ -71,4 +71,22 @@ describe("waitForTurnIdle lock-watching grace", () => {
     const released = await waitForTurnIdle(server, "zs1", 50, "session/goal", true, 10_000);
     expect(released).toBe(false);
   });
+
+  it("dead reader after lock seen → false, never a false released", async () => {
+    // The backend died mid-compaction (sandbox allow-restart, crash): the
+    // probe error is the reader-exited marker. Reading it as "non-lock error
+    // after lock → released" reported a FALSE "✓ compressed" while the
+    // compaction died with the process — it must fail honestly instead.
+    const deadReader = { error: { message: "zcode backend reader exited (backend dead)" } };
+    const server = makeServer([LOCK_HELD, deadReader]);
+    const released = await waitForTurnIdle(server, "zs1", 10_000, "session/goal", true);
+    expect(released).toBe(false);
+  });
+
+  it("dead reader before lock seen → false as well", async () => {
+    const deadReader = { error: { message: "zcode backend reader exited (backend dead)" } };
+    const server = makeServer([deadReader, deadReader]);
+    const released = await waitForTurnIdle(server, "zs1", 10_000, "session/goal", true, 50);
+    expect(released).toBe(false);
+  });
 });

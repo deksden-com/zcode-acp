@@ -8,7 +8,10 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ZcodeAcpServer } from "../src/server.js";
 import type { ZcodeResponse } from "../src/backend/types.js";
@@ -21,7 +24,11 @@ vi.mock("../src/handlers/extensions.js", () => ({
 }));
 
 // Import AFTER mocks are registered.
-import { autoCompactThreshold, maybeAutoCompact } from "../src/config/auto-compact.js";
+import {
+  autoCompactThreshold,
+  maybeAutoCompact,
+  runAutoCompactDetached,
+} from "../src/config/auto-compact.js";
 
 /** Mock AgentContext that records notify calls (sendTextChunk + emitInitialUsage). */
 function mockContext(notifySpy?: ReturnType<typeof vi.fn>): acp.AgentContext {
@@ -43,17 +50,18 @@ interface FakeBackend {
 }
 
 /** Build a server with a fake backend that returns the given projection. */
-function makeServerWithProjection(
-  contextUsed: number | null,
-): { server: ZcodeAcpServer; backend: FakeBackend; compactCalls: typeof compactMock } {
+function makeServerWithProjection(contextUsed: number | null): {
+  server: ZcodeAcpServer;
+  backend: FakeBackend;
+  compactCalls: typeof compactMock;
+} {
   const backend: FakeBackend = {
     request: vi.fn(async (_id: number, method: string): Promise<ZcodeResponse> => {
       if (method === "session/read") {
         return {
           id: _id,
           result: {
-            projection:
-              contextUsed === null ? {} : { contextUsed, contextWindow: 200_000 },
+            projection: contextUsed === null ? {} : { contextUsed, contextWindow: 200_000 },
           },
         };
       }
@@ -68,7 +76,14 @@ function makeServerWithProjection(
   return { server, backend, compactCalls: compactMock };
 }
 
+// Pin the language: asserted status lines are English and fs is not mocked
+// (a real zh ~/.zcode/v2/setting.json would flip them on a zh-locale machine).
+beforeEach(() => {
+  vi.stubEnv("ZCODE_ACP_LANG", "en");
+});
+
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -118,10 +133,11 @@ describe("maybeAutoCompact", () => {
     const { server, backend, compactCalls } = makeServerWithProjection(50_000);
     await maybeAutoCompact(server, mockContext(), "acp_1", "zc_1");
     // session/read was called to check usage, but compact was NOT.
+    // messageLimit caps the snapshot's message array: only projection is read.
     expect(backend.request).toHaveBeenCalledWith(
       expect.any(Number),
       "session/read",
-      { sessionId: "zc_1" },
+      { sessionId: "zc_1", messageLimit: 1 },
       5000,
     );
     expect(compactCalls).not.toHaveBeenCalled();
@@ -144,13 +160,29 @@ describe("maybeAutoCompact", () => {
     expect(compactCalls).toHaveBeenCalledTimes(1);
   });
 
+  it("triggers compact when the threshold comes from the config file (no env var)", async () => {
+    delete process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD;
+    const cfgScratch = mkdtempSync(path.join(tmpdir(), "zacp-ac-cfg-"));
+    try {
+      mkdirSync(path.join(cfgScratch, "zcode-acp"), { recursive: true });
+      writeFileSync(
+        path.join(cfgScratch, "zcode-acp", "config.json"),
+        JSON.stringify({ autoCompact: { threshold: 100000 } }),
+      );
+      vi.stubEnv("XDG_CONFIG_HOME", cfgScratch);
+      const { server, compactCalls } = makeServerWithProjection(150_000);
+      await maybeAutoCompact(server, mockContext(), "acp_1", "zc_1");
+      expect(compactCalls).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(cfgScratch, { recursive: true, force: true });
+    }
+  });
+
   it("does not throw when compact fails (best-effort)", async () => {
     process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD = "100000";
     const { server, compactCalls } = makeServerWithProjection(150_000);
     compactCalls.mockRejectedValueOnce(new Error("compact failed: backend error"));
-    await expect(
-      maybeAutoCompact(server, mockContext(), "acp_1", "zc_1"),
-    ).resolves.toBeUndefined();
+    await expect(maybeAutoCompact(server, mockContext(), "acp_1", "zc_1")).resolves.toBeUndefined();
     expect(compactCalls).toHaveBeenCalledTimes(1);
   });
 
@@ -167,9 +199,7 @@ describe("maybeAutoCompact", () => {
     compactMock.mockReset();
     compactMock.mockResolvedValue({});
 
-    await expect(
-      maybeAutoCompact(server, mockContext(), "acp_1", "zc_1"),
-    ).resolves.toBeUndefined();
+    await expect(maybeAutoCompact(server, mockContext(), "acp_1", "zc_1")).resolves.toBeUndefined();
     expect(compactMock).not.toHaveBeenCalled();
   });
 
@@ -204,6 +234,18 @@ describe("maybeAutoCompact", () => {
     expect(texts[1]).toContain("⚠ auto-compact timed out");
   });
 
+  it("reports failure when the backend swallowed a compaction failure (__compactFailed)", async () => {
+    process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD = "100000";
+    const { server } = makeServerWithProjection(150_000);
+    compactMock.mockResolvedValueOnce({ __compactFailed: true });
+    const notifySpy = vi.fn().mockResolvedValue(undefined);
+    await maybeAutoCompact(server, mockContext(notifySpy), "acp_1", "zc_1");
+    const texts = chunkTexts(notifySpy);
+    expect(texts).toHaveLength(2);
+    expect(texts[1]).toContain("⚠ auto-compact failed");
+    expect(texts[1]).toContain("session_compact_failed");
+  });
+
   it("sends an error notification when compact throws", async () => {
     process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD = "100000";
     const { server } = makeServerWithProjection(150_000);
@@ -223,5 +265,31 @@ describe("maybeAutoCompact", () => {
     const notifySpy = vi.fn().mockResolvedValue(undefined);
     await maybeAutoCompact(server, mockContext(notifySpy), "acp_1", "zc_1");
     expect(chunkTexts(notifySpy)).toHaveLength(0);
+  });
+});
+
+describe("runAutoCompactDetached (single-flight)", () => {
+  it("swallows a second arm while one compaction runs, and clears the flag on settle", async () => {
+    process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD = "100000";
+    const { server, compactCalls } = makeServerWithProjection(150_000);
+    let release!: (v: unknown) => void;
+    const gate = new Promise((r) => (release = r));
+    compactCalls.mockReset();
+    compactCalls.mockReturnValue(gate.then(() => ({})));
+
+    // Two arms while the first still runs — one compaction, flag held.
+    runAutoCompactDetached(server, mockContext(), "acp_1", "zc_1");
+    runAutoCompactDetached(server, mockContext(), "acp_1", "zc_1");
+    await vi.waitFor(() => expect(compactCalls).toHaveBeenCalledTimes(1));
+    expect(server.autoCompactInFlight.has("zc_1")).toBe(true);
+
+    release({});
+    await vi.waitFor(() => expect(server.autoCompactInFlight.has("zc_1")).toBe(false));
+
+    // Flag cleared → a later arm runs again.
+    compactCalls.mockResolvedValue({});
+    runAutoCompactDetached(server, mockContext(), "acp_1", "zc_1");
+    await vi.waitFor(() => expect(compactCalls).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(server.autoCompactInFlight.has("zc_1")).toBe(false));
   });
 });

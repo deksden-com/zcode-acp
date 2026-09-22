@@ -11,6 +11,7 @@
  */
 
 import { homedir } from "node:os";
+import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -51,8 +52,7 @@ vi.mock("node:fs", async () => {
       return entries.length > 0 ? entries : actual.readdirSync(p);
     },
     statSync: (p: string) => {
-      if (mockDirs.has(p))
-        return { isDirectory: () => true } as ReturnType<typeof actual.statSync>;
+      if (mockDirs.has(p)) return { isDirectory: () => true } as ReturnType<typeof actual.statSync>;
       return actual.statSync(p);
     },
   };
@@ -154,6 +154,59 @@ describe("loadPluginCommands", () => {
     );
 
     expect(loadPluginCommands()).toEqual([]);
+  });
+
+  it("reads the CLI config and plugin cache from ZCODE_HOME when set", () => {
+    resetMocks();
+
+    // An isolated data root that shares nothing with the real ~/.zcode:
+    // config + plugin cache there must be discovered, the real home ignored.
+    const altRoot = path.join(homedir(), "zcode-alt-home");
+    const configPath = `${altRoot}/cli/config.json`;
+    const cacheDir = `${altRoot}/cli/plugins/cache`;
+
+    // Real-home plugin of the same name — must NOT be picked up.
+    const realCache = `${homedir()}/.zcode/cli/plugins/cache`;
+    mockFiles.set(
+      `${homedir()}/.zcode/cli/config.json`,
+      JSON.stringify({
+        plugins: { enabledPlugins: { "decoy@claude-plugins-official": true } },
+      }),
+    );
+    mockDirs.add(realCache);
+    mockDirs.add(`${realCache}/claude-plugins-official`);
+    mockDirs.add(`${realCache}/claude-plugins-official/decoy`);
+    mockDirs.add(`${realCache}/claude-plugins-official/decoy/0.0.0`);
+    mockDirs.add(`${realCache}/claude-plugins-official/decoy/0.0.0/commands`);
+    mockFiles.set(
+      `${realCache}/claude-plugins-official/decoy/0.0.0/commands/decoy.md`,
+      `---\ndescription: Real-home decoy command\n---\n`,
+    );
+
+    mockFiles.set(
+      configPath,
+      JSON.stringify({
+        plugins: { enabledPlugins: { "code-review@claude-plugins-official": true } },
+      }),
+    );
+    mockDirs.add(cacheDir);
+    mockDirs.add(`${cacheDir}/claude-plugins-official`);
+    mockDirs.add(`${cacheDir}/claude-plugins-official/code-review`);
+    mockDirs.add(`${cacheDir}/claude-plugins-official/code-review/0.0.0`);
+    mockDirs.add(`${cacheDir}/claude-plugins-official/code-review/0.0.0/commands`);
+    mockFiles.set(
+      `${cacheDir}/claude-plugins-official/code-review/0.0.0/commands/code-review.md`,
+      `---\ndescription: Code review a pull request\n---\n`,
+    );
+
+    vi.stubEnv("ZCODE_HOME", altRoot);
+    try {
+      const commands = loadPluginCommands();
+      expect(commands).toHaveLength(1);
+      expect(commands[0]!.name).toBe("code-review");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("skips plugins without commands directory", () => {

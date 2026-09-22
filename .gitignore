@@ -25,3 +25,4 @@ coverage/
 # npm pack output
 *.tgz
 .zcode
+.tgrep/

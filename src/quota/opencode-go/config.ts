@@ -1,18 +1,21 @@
 /**
- * Opencode Go credential discovery.
+ * Opencode Go credential discovery — the LEGACY `~/.pi/agent/opencode-go.json`
+ * fallback source.
  *
- * Credentials may come from two sources, merged field-by-field with
- * **environment variables taking precedence** over the config file:
- *   1. `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE` env vars
- *      (best for CI / scripts / temporary overrides).
- *   2. `~/.pi/agent/opencode-go.json` — `{ workspaceId, authCookie }`
- *      (the convention used by the @beyona/pi-zai-usage Pi extension, so users
- *      who already configured it there get reuse for free).
+ * Full precedence (highest first), resolved in ../index.ts:
+ *   1. `quota.opencodeGoWorkspaceId` / `opencodeGoAuthCookie` /
+ *      `opencodeGoSessionToken` in `~/.config/zcode-acp/config.json` (our own
+ *      config).
+ *   2. `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE` /
+ *      `OPENCODE_GO_SESSION_TOKEN` env vars (best for CI / scripts /
+ *      temporary overrides).
+ *   3. `~/.pi/agent/opencode-go.json` —
+ *      `{ workspaceId, authCookie, sessionToken }` (the convention used by
+ *      the @beyona/pi-zai-usage Pi extension, kept so users who already
+ *      configured it there get reuse for free).
  *
- * A field present in env overrides the same field from the file; a field only
- * in the file is still used. This lets a user keep their stable workspaceId in
- * the file while rotating the cookie via env, etc. Both fields must resolve to
- * a valid pair — a missing/invalid one yields `not_configured`.
+ * All three fields must resolve to a valid triple — a missing/invalid one
+ * yields `not_configured`.
  */
 
 import { readFileSync } from "node:fs";
@@ -24,6 +27,7 @@ import { log } from "../../utils.js";
 /** Env var names — documented in the CLI help and README. */
 export const ENV_WORKSPACE_ID = "OPENCODE_GO_WORKSPACE_ID";
 export const ENV_AUTH_COOKIE = "OPENCODE_GO_AUTH_COOKIE";
+export const ENV_SESSION_TOKEN = "OPENCODE_GO_SESSION_TOKEN";
 
 /** Config file path (matches the @beyona/pi-zai-usage convention). */
 export const CONFIG_PATH = path.join(
@@ -37,6 +41,7 @@ export const CONFIG_PATH = path.join(
 interface OpencodeGoConfig {
   workspaceId?: string;
   authCookie?: string;
+  sessionToken?: string;
 }
 
 /**
@@ -59,6 +64,7 @@ export function readConfigFile(filePath: string = CONFIG_PATH): OpencodeGoConfig
     return {
       workspaceId: typeof cfg.workspaceId === "string" ? cfg.workspaceId : undefined,
       authCookie: typeof cfg.authCookie === "string" ? cfg.authCookie : undefined,
+      sessionToken: typeof cfg.sessionToken === "string" ? cfg.sessionToken : undefined,
     };
   } catch (e) {
     // ENOENT (most common — user hasn't created the file) is silent; other

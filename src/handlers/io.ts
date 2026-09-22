@@ -12,6 +12,7 @@ import { randomUUID } from "node:crypto";
 import type * as acp from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
 
+import type { ClientRegistry } from "../remote/broadcast.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { warn } from "../utils.js";
 
@@ -126,23 +127,77 @@ export function echoUserPromptToOthers(
     .trim();
   if (!text) return;
   const messageId = `uprompt_${randomUUID()}`;
-  void enqueueSessionSend(params.sessionId, () =>
-    server.clients
-      .notifyOthers(prompter, "session/update", {
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "user_message_chunk",
-          content: { type: "text", text },
-          messageId,
-        },
-      })
-      .catch((e: unknown) => {
+  void enqueueSessionSend(params.sessionId, async () => {
+    // Emit once per attached alias (server.sessionAliases): clients route
+    // session/update by payload sessionId, so the prompter's id alone never
+    // reaches a client holding this conversation under a different id.
+    const results = await Promise.allSettled(
+      server.sessionAliases(params.sessionId).map((sid) =>
+        server.clients.notifyOthers(prompter, "session/update", {
+          sessionId: sid,
+          update: {
+            sessionUpdate: "user_message_chunk",
+            content: { type: "text", text },
+            messageId,
+          },
+        }),
+      ),
+    );
+    for (const r of results) {
+      if (r.status === "rejected") {
         warn(
           `user-prompt echo failed (sid=${params.sessionId}): ` +
-            `${e instanceof Error ? e.message : String(e)}`,
+            `${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
         );
-      }),
-  );
+      }
+    }
+  });
+}
+
+/**
+ * Does this cx already reach every client by itself? The broadcast proxy
+ * (ClientRegistry.broadcast()) has no `connectionContext` — exactly the field
+ * `notifyOthers` filters on — so for a proxy source the "others" fan-out would
+ * duplicate the base send on every client. Handlers registered with the proxy
+ * (extension methods, slash interception, the prompt turn loop) must pair
+ * `sendSessionUpdate` with `sendSessionUpdateToOthers` ONLY for real
+ * per-connection contexts.
+ */
+export function isBroadcastSource(cx: acp.AgentContext): boolean {
+  return (cx as { connectionContext?: unknown }).connectionContext === undefined;
+}
+
+/**
+ * Push a `session/update` to every OTHER attached client (the prompter's
+ * connection excluded). Session settings are per-SESSION, not per-connection:
+ * a model/mode switch made from the phone must reach the CLI window and vice
+ * versa — a cx-addressed send alone leaves every other view stale. Same
+ * alias fan-out as the prompt echo (clients may hold the conversation under
+ * different ids). Fire-and-forget; failures warn, never throw.
+ */
+export function sendSessionUpdateToOthers(
+  server: ZcodeAcpServer,
+  source: acp.AgentContext,
+  sessionId: string,
+  update: acp.SessionUpdate,
+): void {
+  void enqueueSessionSend(sessionId, async () => {
+    const results = await Promise.allSettled(
+      server
+        .sessionAliases(sessionId)
+        .map((sid) =>
+          server.clients.notifyOthers(source, "session/update", { sessionId: sid, update }),
+        ),
+    );
+    for (const r of results) {
+      if (r.status === "rejected") {
+        warn(
+          `update broadcast failed (sid=${sessionId}): ` +
+            `${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
+        );
+      }
+    }
+  });
 }
 
 /** Shape of a slash command entry (matches ACP's AvailableCommand). */
@@ -172,6 +227,48 @@ export function sendAvailableCommands(
 }
 
 /**
+ * Does this client see the `$` skill-name grouping? The prefix is a DISPLAY
+ * convention for editors (Zed groups skills visually under `$`); martty and
+ * unnamed clients (the remote App sends no clientInfo) surface commands by
+ * typing `/` — a `$`-prefixed name never matches there, hiding every skill.
+ * Both spellings route identically (slash.ts accepts bare and `$`-prefixed
+ * skill names), so per-client display is safe.
+ */
+export function skillPrefixForClient(name: string | null): string {
+  if (name === null || name.toLowerCase().includes("martty")) return "";
+  return "$";
+}
+
+/**
+ * Send `available_commands_update` with a PER-CLIENT command list: skill names
+ * keep their `$` prefix for grouping-capable editors and lose it for martty /
+ * unnamed clients (see `skillPrefixForClient`).
+ */
+export function sendAvailableCommandsPerClient(
+  registry: ClientRegistry,
+  sessionId: string,
+  commands: ReadonlyArray<SlashCommandEntry>,
+): Promise<void> {
+  return registry.notifyEach("session/update", (name) => {
+    const prefix = skillPrefixForClient(name);
+    return {
+      sessionId,
+      update: {
+        sessionUpdate: "available_commands_update",
+        availableCommands: commands.map((c) => {
+          const out: { name: string; description: string; input?: { hint: string } } = {
+            name: prefix === "" && c.name.startsWith("$") ? c.name.slice(1) : c.name,
+            description: c.description,
+          };
+          if (c.input) out.input = c.input;
+          return out;
+        }),
+      },
+    };
+  });
+}
+
+/**
  * Per-session pending deferred-notification timeouts. Tracks the timers from
  * repeated `sendAvailableCommandsDeferred` calls so a newer call can cancel
  * the older call's still-pending timers. Without this, a slow timer (e.g.
@@ -197,7 +294,7 @@ const activeDeferredTimeouts = new Map<string, Set<ReturnType<typeof setTimeout>
  * timer overwrite the newest command list.
  */
 export function sendAvailableCommandsDeferred(
-  cx: acp.AgentContext,
+  registry: ClientRegistry,
   sessionId: string,
   commands: ReadonlyArray<SlashCommandEntry>,
 ): void {
@@ -213,7 +310,7 @@ export function sendAvailableCommandsDeferred(
 
   for (const delay of [50, 300, 1000]) {
     const t = setTimeout(() => {
-      sendAvailableCommands(cx, sessionId, commands)
+      sendAvailableCommandsPerClient(registry, sessionId, commands)
         .catch((e) => {
           warn(
             `available_commands_update failed (sid=${sessionId}, delay=${delay}): ` +

@@ -1,0 +1,51 @@
+# Release automation: release-please turns Conventional Commits into a
+# release PR (version bump + CHANGELOG); merging it tags the release and
+# publishes to npm via trusted publishing (OIDC — no NPM_TOKEN secret).
+# One-time manual step: add this repo + this workflow filename as a trusted
+# publisher on npmjs.com for the zcode-acp-server package.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  release-please:
+    if: github.repository == 'william0wang/zcode-acp'
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+
+  publish:
+    needs: release-please
+    # workflow_dispatch is the manual escape hatch: when release-please cannot
+    # cut a release itself (e.g. its release PR was closed unmerged and the
+    # version bump already sits on main), a dispatch publishes main's
+    # package.json version — the tag/release must exist by then.
+    if: github.repository == 'william0wang/zcode-acp' && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # npm >= 11.5 for OIDC trusted publishing
+          registry-url: https://registry.npmjs.org
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      # npm >= 11.5 is required for OIDC trusted publishing; Node 24 bundles 11.3.
+      - run: npm install -g npm@latest
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm test
+      # Scripts are skipped because build+test already ran above.
+      - run: npm publish --ignore-scripts

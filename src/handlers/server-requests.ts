@@ -33,18 +33,23 @@ import {
   acpPermissionResponseToZcode,
   buildAskUserAcpParams,
   buildAskUserElicitationForm,
+  buildPlanApprovalElicitationForm,
   exitPlanModeToAcpPermission,
   isAskUserQuestion,
   isExitPlanMode,
   isPermissionRequest,
   parseAskUserElicitationResponse,
   parseAskUserResponse,
+  parsePlanApprovalElicitationResponse,
   splitAskUserQuestions,
   zcodePermissionToAcp,
 } from "../interaction/adapter.js";
+import { codingPlanRequestAuthFor } from "../config/account-provider.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
+import { interactionTimeoutMs } from "../config/settings.js";
+import { messages } from "../i18n.js";
 import type { ClientLike } from "../remote/broadcast.js";
-import { log, warn } from "../utils.js";
+import { clientConnectionRoot, log, warn } from "../utils.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { sendSessionUpdate } from "./io.js";
 
@@ -80,7 +85,7 @@ async function emitModeViaConfigOption(
   try {
     const modes = await buildModes(server, zcodeSid);
     server.lastMode.set(acpSid, modes.currentModeId);
-    const options = await buildConfigOptions(server, zcodeSid);
+    const options = await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx));
     const modeOpt = options.find((o) => o.id === "mode");
     if (modeOpt) modeOpt.currentValue = modes.currentModeId;
     await sendSessionUpdate(cx, acpSid, {
@@ -111,8 +116,8 @@ export function getPendingInteractions(server: ZcodeAcpServer): Map<string, Dedu
  * broadcast race snapshots its client list once — a client attaching mid-wait
  * is invisible to it. Tracking each wait here lets `resendPendingInteractions`
  * fire a targeted re-send at a client that just (re)connected; the re-send
- * joins this race (first response wins, losing clients get `$/cancel_request`
- * so their dialogs dismiss).
+ * joins this race (first response wins; losing clients' dialogs drop via
+ * `$/zcode/ask_settled` — see emitAskSettled).
  */
 interface ActiveInteraction {
   readonly method: string;
@@ -290,10 +295,15 @@ export async function handleServerRequests(
       for (const req of drained) {
         const sid = (req.params as { sessionId?: string }).sessionId;
         if (sid === undefined || sid === mySid) {
-          sendZcodeReply(backend, req.id, {
-            action: "decline",
-            reason: "turn cancelled",
-          });
+          // The captcha-session request must keep its result shape even when
+          // cancelled, or the backend's response validation rejects it.
+          sendZcodeReply(
+            backend,
+            req.id,
+            isProviderRuntimeHeadersRequest(req.method)
+              ? { headersApplied: false, errorMessage: "turn cancelled" }
+              : { action: "decline", reason: "turn cancelled" },
+          );
           declined = true;
         } else {
           backend.requeueServerRequests([req]); // not ours — leave for owner
@@ -349,6 +359,11 @@ async function handleOne(
   const ask = isAskUserQuestion(method, params);
   const perm = isPermissionRequest(method);
   const epm = isExitPlanMode(params);
+
+  if (isProviderRuntimeHeadersRequest(method)) {
+    answerProviderRuntimeHeaders(backend, zcodeReqId, method, params as Record<string, unknown>);
+    return;
+  }
 
   if (!perm && !(isUserInputRequestUnchecked(method) && (epm || ask))) {
     warn(`  ⚠ unhandled server→client request: ${method} (id=${zcodeReqId})`);
@@ -436,11 +451,12 @@ async function handleSinglePermission(
   // to have been emitted before request_permission).
   const toolCallId = p.toolCallId ?? "";
   const rawInput = p.input;
+  const m = messages();
   const tcTitle = epm
-    ? "Ready to code?"
+    ? m.popupTitleExitPlan
     : perm
-      ? `tool permission (${p.toolName ?? "?"})`
-      : "interaction";
+      ? m.popupTitleToolPermission(p.toolName ?? "?")
+      : m.popupTitleInteraction;
   const tcKind = epm ? "switch_mode" : "other";
   const toolName = epm ? "ExitPlanMode" : (p.toolName ?? "");
   const tcUpdate: acp.SessionUpdate = {
@@ -460,13 +476,34 @@ async function handleSinglePermission(
   }
   await sendSessionUpdate(cx, acpSid, tcUpdate);
 
-  // ExitPlanMode and tool auth both go through session/request_permission.
-  // ExitPlanMode intentionally does NOT use elicitation/create even when the
-  // client supports forms — matching claude-agent-acp's reference behaviour:
-  // plan approval is a permission decision (approve/reject), not a structured
-  // input, and rendering it through the elicitation channel surfaces a generic
-  // "input request" shell that reads wrong for this flow. AskUserQuestion is
-  // the right place for elicitation; plan approval is not.
+  // ExitPlanMode routing splits by client KIND, not by form capability:
+  //   - martty gets an elicitation FORM: its request_permission overlay draws
+  //     only the title — a one-line popup can never show a plan, while the
+  //     form renders the plan markdown in a scrollable detail pane.
+  //   - Every other client (Zed, remote apps) keeps session/request_permission:
+  //     editors render toolCall.content as full markdown (Zed: MarkdownElement,
+  //     code blocks and links included), while elicitation form descriptions
+  //     are plain Labels there (verified against Zed v1.19.2 sources) — the
+  //     form would DOWNGRADE the plan display. Zed ≥1.12 declares
+  //     elicitation.form, so a capability gate cannot tell the two apart;
+  //     only martty actually needs the form.
+  // Both converge on the same zcode accept/decline response shape, and the
+  // form path still falls back to request_permission if the form channel
+  // fails (see handlePlanApprovalViaElicitation).
+  if (epm && server.hasMarttyClient()) {
+    const elicited = await handlePlanApprovalViaElicitation(
+      server,
+      cx,
+      acpSid,
+      p as ZcodeInteractionUserInputParams,
+      turn,
+    );
+    // null = the form channel failed (capability flags are OR-merged across
+    // clients at initialize and survive detach, so the flag can outlive the
+    // form-capable client). Fall through to request_permission below — every
+    // client can answer that popup — instead of silently declining the plan.
+    if (elicited !== null) return elicited;
+  }
   const acpParams = perm
     ? zcodePermissionToAcp(p as ZcodeInteractionPermissionParams, acpSid)!
     : exitPlanModeToAcpPermission(p as ZcodeInteractionUserInputParams, acpSid);
@@ -491,7 +528,7 @@ async function handleSinglePermission(
     return { action: "decline", reason: "declined or cancelled" };
   }
   return perm
-    ? acpPermissionResponseToZcode(acpResp)
+    ? acpPermissionResponseToZcode(acpResp, (p as ZcodeInteractionPermissionParams).options)
     : acpPermissionResponseToExitPlanMode(acpResp);
 }
 
@@ -529,7 +566,7 @@ export async function handleAskUserQuestion(
     if (!q.multiSelect) {
       // Single-select: one popup.
       await emitAskToolCall(cx, acpSid, toolCallId, idx, q.question, rawInput);
-      const acpParams = buildAskUserAcpParams(params, acpSid, q.options);
+      const acpParams = buildAskUserAcpParams(params, acpSid, q.options, q.question);
       acpParams.toolCall.toolCallId = `${toolCallId}_${idx}`;
       const resp = await askOnce(server, cx, acpParams, idx + 1, qs.length, q.question, turn);
       if (turn?.cancelled) {
@@ -557,7 +594,7 @@ export async function handleAskUserQuestion(
         const { label, pair } = pairs[sub]!;
         const promptText = `${q.question}\n— include "${label}"?`;
         await emitAskToolCall(cx, acpSid, toolCallId, `${idx}_${sub}`, promptText, rawInput);
-        const acpParams = buildAskUserAcpParams(params, acpSid, pair);
+        const acpParams = buildAskUserAcpParams(params, acpSid, pair, promptText);
         acpParams.toolCall.toolCallId = `${toolCallId}_${idx}_${sub}`;
         const resp = await askOnce(server, cx, acpParams, idx + 1, qs.length, label, turn);
         // Abort the whole multi-select if the turn was cancelled (user sent a
@@ -603,7 +640,7 @@ async function handleAskUserViaElicitation(
   await sendSessionUpdate(cx, acpSid, {
     sessionUpdate: "tool_call",
     toolCallId,
-    title: "questions",
+    title: messages().askQuestionsTitle,
     kind: "other",
     status: "pending",
     rawInput,
@@ -637,6 +674,46 @@ async function handleAskUserViaElicitation(
   return { action: "accept", content: { answers } };
 }
 
+/**
+ * ExitPlanMode via elicitation form — the plan-review surface for
+ * form-capable clients. The form's field description carries the complete
+ * plan markdown (martty renders it scrollable in a detail pane); the decision
+ * is a required approve/reject enum. Cancelled/declined forms map to decline.
+ * Returns null when the form channel itself failed (timeout, or no client that
+ * can answer elicitation any more) so the caller can fall back to
+ * request_permission.
+ */
+async function handlePlanApprovalViaElicitation(
+  server: ZcodeAcpServer,
+  cx: acp.AgentContext,
+  acpSid: string,
+  params: ZcodeInteractionUserInputParams,
+  turn?: PendingTurn,
+): Promise<ZcodeInteractionResponse | null> {
+  const toolCallId = params.toolCallId ?? "";
+  const formParams = buildPlanApprovalElicitationForm(params, acpSid, toolCallId || undefined);
+  log("  ⟳ ExitPlanMode forwarding elicitation/create (form, plan review)");
+  const acpResp = await requestWithTimeout(
+    server,
+    cx,
+    "elicitation/create",
+    formParams,
+    "plan approval (elicitation)",
+    undefined,
+    turn,
+  );
+  if (acpResp === INTERRUPTED) {
+    return onInteractionInterrupted(cx, acpSid, toolCallId, turn);
+  }
+  if (acpResp === null) {
+    warn("plan approval elicitation got no form response; falling back to request_permission");
+    return null;
+  }
+  const resp = parsePlanApprovalElicitationResponse(acpResp);
+  log(`  ✓ plan approval: ${resp.action}`);
+  return resp;
+}
+
 /** Emit the prerequisite tool_call for an AskUserQuestion popup. */
 async function emitAskToolCall(
   cx: acp.AgentContext,
@@ -656,6 +733,83 @@ async function emitAskToolCall(
     _meta: { claudeCode: { toolName: "AskUserQuestion" } },
     content: [{ type: "content", content: { type: "text", text: qText } }],
   });
+}
+
+/**
+ * One candidate row for the `/resume` session picker.
+ */
+export interface SessionPickItem {
+  /** Backend (zcode) session id — the value returned on selection. */
+  sessionId: string;
+  /** Human label (title + date) shown in the dropdown / popup. */
+  label: string;
+}
+
+/**
+ * `/resume` session picker: ask the user to choose a past session via the
+ * editor's interaction UI — an `elicitation/create` enum dropdown when the
+ * client supports forms, else `session/request_permission` option buttons.
+ * Returns the chosen backend session id, or null when declined/cancelled or
+ * the request failed (no turn context — the slash path has no PendingTurn).
+ */
+export async function askSessionPick(
+  server: ZcodeAcpServer,
+  cx: acp.AgentContext,
+  acpSid: string,
+  items: SessionPickItem[],
+): Promise<string | null> {
+  if (items.length === 0) return null;
+  if (server.supportsElicitationForm()) {
+    const resp = await requestWithTimeout(
+      server,
+      cx,
+      "elicitation/create",
+      {
+        mode: "form",
+        // Session scope is mandatory: schema-strict clients (Zed 1.18+) fail
+        // the whole request with -32602 when neither sessionId nor requestId
+        // is present, which surfaced as a silent "resume cancelled".
+        sessionId: acpSid,
+        message: messages().slashResumePickTitle,
+        requestedSchema: {
+          type: "object",
+          properties: {
+            session: {
+              type: "string",
+              title: messages().slashResumePickTitle,
+              // oneOf (const+title) renders a titled dropdown in Zed — the
+              // raw session ids stay values, the labels stay visible.
+              oneOf: items.map((i) => ({ const: i.sessionId, title: i.label })),
+            },
+          },
+          required: ["session"],
+        },
+      },
+      "session pick (elicitation)",
+    );
+    if (resp === null || resp === INTERRUPTED) return null;
+    const picked = (resp as { content?: { session?: unknown } }).content?.session;
+    // Only accept a value we offered — a free-form answer can't name a row.
+    if (typeof picked === "string" && items.some((i) => i.sessionId === picked)) return picked;
+    return null;
+  }
+  const options = items.map((i) => ({
+    kind: "allow_once" as const,
+    name: i.label,
+    optionId: i.sessionId,
+  }));
+  const resp = await requestWithTimeout(
+    server,
+    cx,
+    "session/request_permission",
+    { options, sessionId: acpSid, toolCall: { toolCallId: "resume_pick", rawInput: {} } },
+    "session pick (permission)",
+  );
+  if (resp === null || resp === INTERRUPTED) return null;
+  const optionId = (resp as { outcome?: { outcome?: string; optionId?: string } }).outcome
+    ?.optionId;
+  if (optionId && items.some((i) => i.sessionId === optionId)) return optionId;
+  return null;
 }
 
 /** Send one requestPermission and await the response. */
@@ -712,20 +866,14 @@ async function askOnce(
  *   2. Connection close (`cx.signal` abort / `cx.closed` resolves) — the editor
  *      went away. This is the real crash signal and replaces the old timeout.
  *
- * An explicit timeout is kept as an opt-in escape hatch via the
+ * An explicit timeout is kept as an opt-in escape hatch via
+ * `interaction.timeoutMs` (~/.config/zcode-acp/config.json) or the
  * `ZCODE_ACP_INTERACTION_TIMEOUT_MS` env var (milliseconds; 0/unset = wait
- * forever). On any of these interrupts the caller replies `decline` to unlock
- * the backend AND flips `turn.cancelled` so the turn loop stops the backend
- * turn instead of auto-continuing.
+ * forever) — resolved once at bridge start. On any of these interrupts the
+ * caller replies `decline` to unlock the backend AND flips `turn.cancelled`
+ * so the turn loop stops the backend turn instead of auto-continuing.
  */
-const INTERACTION_TIMEOUT_MS = parseInteractionTimeout();
-
-function parseInteractionTimeout(): number {
-  const raw = process.env.ZCODE_ACP_INTERACTION_TIMEOUT_MS;
-  if (!raw) return 0; // 0 = wait indefinitely
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
-}
+const INTERACTION_TIMEOUT_MS = interactionTimeoutMs();
 
 /**
  * Marker returned when a wait was interrupted (connection close, env timeout,
@@ -746,8 +894,11 @@ type InteractionResult = unknown | typeof INTERRUPTED;
  * {@link ActiveInteraction}): the broadcast proxy races the clients connected
  * at fire time, and `resendPendingInteractions` can add targeted attempts at
  * clients that attach mid-wait. After the wait settles (answered OR
- * interrupted — the caller replies decline), the entry is dropped and every
- * still-open attempt is aborted, dismissing the leftover dialogs.
+ * interrupted — the caller replies decline), the entry is dropped, every
+ * still-open attempt is aborted (best-effort only — see below), and
+ * `$/zcode/ask_settled` tells the clients whose dialogs are still open to
+ * dismiss them (the SDK ignores cancellationSignal, so the abort alone never
+ * reaches the wire).
  */
 async function requestWithTimeout(
   server: ZcodeAcpServer,
@@ -852,15 +1003,54 @@ async function requestWithTimeout(
     }
   }
   // The interaction is decided either way (answered, or interrupted — the
-  // caller replies decline): unregister it and dismiss dialogs still open on
-  // clients that never answered (abort → `$/cancel_request`).
+  // caller replies decline): unregister it. Aborting the losing attempts is
+  // best-effort only — the SDK's request() IGNORES cancellationSignal (no
+  // `$/cancel_request` ever reaches the wire), so the visible dismissal of
+  // the losers' stale dialogs is emitAskSettled below.
   active.delete(entry);
   if (!entry.settled) {
     entry.settled = true;
     for (const ctrl of entry.controllers) ctrl.abort();
     entry.controllers.clear();
   }
+  emitAskSettled(server, method, params);
   return winner;
+}
+
+/**
+ * Tell every attached client that an interaction ask was decided (another
+ * client answered, or the wait broke) so a still-open copy of that dialog on
+ * another client dismisses. This is the ONLY working cross-client dismissal:
+ * the Node SDK never sends `$/cancel_request` (it ignores cancellationSignal),
+ * so the losing client's popup would otherwise hang forever — the observed
+ * "CLI keeps showing the confirmation after the phone answered" bug.
+ * Fire-and-forget; the client that answered no-ops on it. One copy per
+ * session alias (clients route by payload sessionId).
+ */
+function emitAskSettled(server: ZcodeAcpServer, method: string, params: unknown): void {
+  try {
+    const p = params as { sessionId?: string; toolCall?: { toolCallId?: string } };
+    const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+    if (!sessionId || server.clients.size === 0) return;
+    const payload = {
+      kind: method === "session/request_permission" ? "permission" : "elicitation",
+      ...(method === "session/request_permission" && typeof p.toolCall?.toolCallId === "string"
+        ? { toolCallId: p.toolCall.toolCallId }
+        : {}),
+    };
+    void Promise.all(
+      server
+        .sessionAliases(sessionId)
+        .map((sid) =>
+          server.clients.notifyEach("$/zcode/ask_settled", () => ({ sessionId: sid, ...payload })),
+        ),
+    ).catch(() => {
+      /* best-effort dismissal hint only */
+    });
+  } catch {
+    // Never let the hint break the interaction flow (stub servers in tests
+    // may lack the registry entirely).
+  }
 }
 
 /**
@@ -885,7 +1075,7 @@ async function onInteractionInterrupted(
       content: [
         {
           type: "content",
-          content: { type: "text", text: "交互中断：连接关闭或超时，请重新发起对话。" },
+          content: { type: "text", text: messages().interactionInterrupted },
         },
       ],
     }).catch(() => {
@@ -921,11 +1111,7 @@ function sendInteractionReply(
 }
 
 /** Send a zcode response (result) for a server→client request id. */
-function sendZcodeReply(
-  backend: ZcodeBackend,
-  zcodeId: number | string,
-  result: ZcodeInteractionResponse,
-): void {
+function sendZcodeReply(backend: ZcodeBackend, zcodeId: number | string, result: unknown): void {
   // zcode expects {id, result} — but our backend.notify sends {method, params}. Use a raw write.
   // The backend's notify is for notifications; replies need the id. We route via a private seam.
   (backend as unknown as { sendReply: (id: number | string, result: unknown) => void }).sendReply(
@@ -946,3 +1132,72 @@ function sendZcodeError(backend: ZcodeBackend, zcodeId: number | string, message
 function isUserInputRequestUnchecked(method: string): boolean {
   return method === "interaction/requestUserInput";
 }
+
+/** @see handleOne — the Start Plan captcha-session request (issue #123). */
+function isProviderRuntimeHeadersRequest(method: string): boolean {
+  return method === "interaction/requestProviderRuntimeHeaders";
+}
+
+/**
+ * Answer an `interaction/requestProviderRuntimeHeaders` request; returns false
+ * when `method` is not that request (caller keeps its own handling).
+ *
+ * Shared by the turn-loop queue path (handleOne) and the ARRIVAL-TIME
+ * responder wired onto the backend (ZcodeBackend.providerRuntimeHeadersResponder):
+ * the backend asks before EVERY model request on a zhipu-account provider, and
+ * a request that lands while no turn loop is polling the queue — compact's
+ * internal turn, session/goal set, any backend-owned generation — timed out at
+ * the backend's 180s cap as "Captcha verification request timed out" and the
+ * compaction silently failed while the bridge still reported "✓ compressed"
+ * (observed 2026-09-19, backend log `querySource: "compact"`).
+ */
+export function answerProviderRuntimeHeaders(
+  backend: ZcodeBackend,
+  reqId: number | string,
+  method: string,
+  params: Record<string, unknown>,
+): boolean {
+  if (!isProviderRuntimeHeadersRequest(method)) return false;
+  // Individual coding-plan models: serve the plan's API key straight from
+  // config.json (the same key the pre-3.12 builtin: provider used). The
+  // backend asks before EVERY model request on a zhipu-account provider —
+  // declining here turns into a -32031 retry loop on every GLM turn
+  // (observed 2026-09-17: switch stuck, every send died with "unknown").
+  const sel = (params as { modelSelection?: { providerId?: string }; providerId?: string })
+    .modelSelection?.providerId;
+  const requestAuth = codingPlanRequestAuthFor(
+    sel ?? (params as { providerId?: string }).providerId,
+  );
+  if (requestAuth) {
+    log("  provider runtime headers: serving the coding-plan API key (config.json)");
+    sendZcodeReply(backend, reqId, { headersApplied: true, requestAuth });
+    return true;
+  }
+  // Start Plan providers (zcode-plan endpoints) ask their host to solve an
+  // Aliyun captcha and inject X-Aliyun-Captcha-Verify-* headers before every
+  // model request; the desktop renderer does this from a browser environment.
+  // The headless bridge has neither a browser nor the captcha credential, so
+  // the only honest answer is headersApplied:false — the backend then fails
+  // with its -32031 error carrying our message. Without this, the request
+  // fell through to the generic unsupported-request error and the backend
+  // fell back to client signing with the provider's OAuth JWT, dying with the
+  // misleading "must contain one separator" invalid-config error (#123).
+  warn(
+    "  ⚠ provider runtime headers requested (Start Plan captcha session); " +
+      "the headless bridge cannot provide it — declining",
+  );
+  sendZcodeReply(backend, reqId, {
+    headersApplied: false,
+    errorMessage: PROVIDER_RUNTIME_HEADERS_UNAVAILABLE,
+  });
+  return true;
+}
+
+/**
+ * Reason surfaced through the backend's -32031 error when it asks for a
+ * provider runtime headers (Aliyun captcha) refresh we cannot serve.
+ */
+const PROVIDER_RUNTIME_HEADERS_UNAVAILABLE =
+  "Start Plan providers require an Aliyun captcha session that only the " +
+  "ZCode desktop app can provide. Use a GLM Coding Plan provider for " +
+  "headless/editor sessions (see docs/TROUBLESHOOTING.md).";

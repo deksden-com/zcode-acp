@@ -16,12 +16,20 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeEvent } from "../src/backend/types.js";
-import { ensureRealSession, loadSession, prompt } from "../src/handlers/session.js";
+import {
+  ensureRealSession,
+  loadSession,
+  prompt,
+  reloadBackendSession,
+} from "../src/handlers/session.js";
 import { BACKEND_RESIDENT_TTL_MS, ZcodeAcpServer } from "../src/server.js";
+import { ZCODE_CREDS_PATH } from "../src/utils.js";
 
 vi.mock("../src/tasks-index.js", () => ({
   upsertSessionTask: async () => true,
@@ -210,6 +218,138 @@ describe("ensureRealSession() eviction guard", () => {
 
     expect(sid).toBe("zs_ts");
     expect(calls.some((c) => c.method === "session/resume")).toBe(true);
+  });
+
+  it("throws the evicted-session error when the backend no longer stores the session", async () => {
+    const { backend, calls } = fakeBackend({
+      resumeError: { code: -32004, message: "Session not found: zs_ts" },
+    });
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    server.registerSession("sess_ts", "zs_ts");
+
+    // Continuing with the dead mapping defers the failure to the next RPC
+    // with the misleading "Session is not active" wording (observed
+    // 2026-09-18: every model/thought switch on a deleted thread).
+    await expect(ensureRealSession(server, "sess_ts")).rejects.toThrow("sess_ts");
+    // No overlay retry — no overlay can resurrect a deleted session.
+    expect(calls.filter((c) => c.method === "session/resume")).toHaveLength(1);
+  });
+});
+
+describe("resume repair fallback (3.12+ schema drift)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Minimal config.json in the hermetic HOME so buildResumeRuntimeModel can
+   * build the overlay (an absent config makes it return null, skipping the
+   * retry — that hole is exactly how the 3.12 drift stayed invisible).
+   */
+  beforeEach(() => {
+    mkdirSync(dirname(ZCODE_CREDS_PATH), { recursive: true });
+    writeFileSync(
+      ZCODE_CREDS_PATH,
+      JSON.stringify({
+        provider: {
+          "builtin:bigmodel-coding-plan": {
+            name: "BigModel",
+            kind: "anthropic",
+            enabled: true,
+            options: { apiKey: "test-key" },
+            models: { "GLM-5.3": {} },
+          },
+        },
+      }),
+      "utf8",
+    );
+  });
+
+  afterEach(() => {
+    rmSync(ZCODE_CREDS_PATH, { force: true });
+  });
+
+  /**
+   * Backend whose consecutive session/resume calls answer from a scripted
+   * list (last entry repeats); everything else succeeds vacuously.
+   */
+  function scriptedResumeBackend(
+    results: Array<{ error: { code: number; message: string } } | { result?: unknown }>,
+  ): { backend: ZcodeBackend; calls: Call[] } {
+    const calls: Call[] = [];
+    let n = 0;
+    const backend = {
+      isDead: false,
+      request: async (_id: number, method: string, params: Record<string, unknown>) => {
+        calls.push({ method, params });
+        if (method === "session/resume") {
+          const r = results[Math.min(n, results.length - 1)]!;
+          n += 1;
+          if ("error" in r) return { error: r.error };
+          return { result: r.result ?? {} };
+        }
+        return { result: {} };
+      },
+      send: () => {},
+      pollServerRequests: () => [],
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    return { backend, calls };
+  }
+
+  it("rethrows a not-found resume without the overlay retry", async () => {
+    const { backend, calls } = scriptedResumeBackend([
+      { error: { code: -32004, message: "Session not found: zs_ts" } },
+    ]);
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    server.registerSession("sess_ts", "zs_ts");
+
+    await expect(reloadBackendSession(server, "sess_ts", "zs_ts")).rejects.toThrow(/not found/i);
+    expect(calls.filter((c) => c.method === "session/resume")).toHaveLength(1);
+  });
+
+  it("surfaces the ORIGINAL failure when the overlay retry hits the 3.12+ schema rejection", async () => {
+    // Probed 2026-09-18 against the bare app-server: session/resume rejects
+    // BOTH `runtimeModel` and `model` keys with "Unrecognized key" — the
+    // overlay fallback is dead on that build and must not mask the cause.
+    const { backend, calls } = scriptedResumeBackend([
+      { error: { code: -32031, message: "history model unavailable" } },
+      {
+        error: {
+          code: -32602,
+          message: 'Invalid params — (root): Unrecognized key: "runtimeModel"',
+        },
+      },
+    ]);
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    server.registerSession("sess_ts", "zs_ts");
+
+    await expect(reloadBackendSession(server, "sess_ts", "zs_ts")).rejects.toThrow(
+      "history model unavailable",
+    );
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(2);
+    expect(resumes[1]?.params).toHaveProperty("runtimeModel");
+  });
+
+  it("still repairs via the overlay on backends that accept it", async () => {
+    const { backend, calls } = scriptedResumeBackend([
+      { error: { code: -32031, message: "history model unavailable" } },
+      { result: {} },
+    ]);
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    server.registerSession("sess_ts", "zs_ts");
+
+    await expect(reloadBackendSession(server, "sess_ts", "zs_ts")).resolves.toBeUndefined();
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(2);
+    expect(resumes[1]?.params).toHaveProperty("runtimeModel");
+    expect(server.isBackendSessionLive("sess_ts")).toBe(true);
   });
 });
 

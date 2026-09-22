@@ -4,7 +4,7 @@
  * lock (live sends queue behind an in-flight batch for the same session).
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeMessage } from "../src/backend/types.js";
 import { enqueueSessionSend, sendSessionUpdate, withReplayBatch } from "../src/handlers/io.js";
@@ -16,6 +16,15 @@ import {
   sliceBefore,
   sliceTail,
 } from "../src/handlers/replay.js";
+
+// Asserts English collapsed titles; pin the language regardless of host env.
+beforeEach(() => {
+  vi.stubEnv("ZCODE_ACP_LANG", "en");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 function msg(id: string, role: "user" | "assistant" | "system", text: string): ZcodeMessage {
   return { info: { id, role }, parts: [{ type: "text", text }] };
@@ -83,6 +92,43 @@ describe("sliceTail", () => {
     const s = sliceTail([], 30);
     expect(s.batch).toEqual([]);
     expect(s.meta).toMatchObject({ hasMore: false, totalMessages: 0, totalTurns: 0 });
+  });
+
+  it("hidden tool-result user messages are not turn anchors (cursor must survive replay)", () => {
+    // The backend stores tool results as user-role messages with
+    // transcriptVisibility "hidden"; replay skips them, so a slice aligned on
+    // one would mint a cursor anchored at a message the client never sees.
+    const hidden = (id: string, text: string): ZcodeMessage => ({
+      info: { id, role: "user", semantics: { transcriptVisibility: "hidden" } },
+      parts: [{ type: "text", text }],
+    });
+    const msgs: ZcodeMessage[] = [
+      msg("u1", "user", "one"),
+      msg("a1", "assistant", "A1"),
+      hidden("tr1", '{"ok":true}'),
+      msg("a2", "assistant", "A2"),
+      msg("u2", "user", "two"),
+      msg("a3", "assistant", "A3"),
+    ];
+
+    const s = sliceTail(msgs, 1);
+    // Aligns to u2 (the visible turn start), never to hidden tr1.
+    expect(ids(s.batch)).toEqual(["u2", "a3"]);
+    expect(s.meta.totalTurns).toBe(2);
+    // Cursor anchor is the message at the slice start — a replayed one.
+    const anchorId = JSON.parse(Buffer.from(s.meta.cursor, "base64url").toString("utf8")) as {
+      id?: string;
+    };
+    expect(anchorId.id).toBe("u2");
+
+    // The discriminating cut: pos 3 falls inside the FIRST turn, whose next
+    // turn start below u2 is hidden tr1 (old code) vs u1 (fixed code).
+    const wide = sliceTail(msgs, 3);
+    expect(ids(wide.batch)).toEqual(["u1", "a1", "tr1", "a2", "u2", "a3"]);
+    const wideAnchor = JSON.parse(Buffer.from(wide.meta.cursor, "base64url").toString("utf8")) as {
+      id?: string;
+    };
+    expect(wideAnchor.id).toBe("u1");
   });
 });
 
@@ -514,5 +560,72 @@ describe("replayMessages tool history parts", () => {
     const u = updates[0]!.update as Record<string, unknown>;
     expect(u.content).toBeUndefined();
     expect(u.title).toBe("TodoWrite");
+  });
+});
+
+describe("replayMessages toolTurnWindow (TUI condensation)", () => {
+  function collectCx() {
+    const updates: Array<Record<string, unknown>> = [];
+    return {
+      cx: {
+        notify: async (_m: string, params: unknown) => {
+          updates.push(params as Record<string, unknown>);
+        },
+      },
+      updates,
+    };
+  }
+  const toolMsg = (id: string): ZcodeMessage => ({
+    info: { id, role: "assistant" },
+    parts: [
+      {
+        type: "tool",
+        id: `tool_${id}`,
+        tool: "Bash",
+        state: { title: `Run ${id}`, status: "completed", input: "ls", output: "file" },
+      },
+    ],
+  });
+  const READ_TEXT =
+    'Called the Read tool with the following input: {"file_path":"/tmp/a"}\nResult…';
+  const batch = [
+    msg("u1", "user", "one"),
+    toolMsg("t1"),
+    msg("a1", "assistant", "A1"),
+    msg("u2", "user", "two"),
+    toolMsg("t2"),
+    msg("a2", "assistant", "A2"),
+    msg("u3", "user", READ_TEXT), // tool-transcript in the LAST turn stays
+    msg("a3", "assistant", "A3"),
+  ];
+
+  it("keeps tool records only in the most recent turns; chat text always replays", async () => {
+    const { cx, updates } = collectCx();
+    await replayMessages(cx, "s", batch, { toolTurnWindow: 1 });
+    const shapes = updates.map((p) => {
+      const u = p.update as Record<string, unknown>;
+      return u.sessionUpdate === "tool_call" ? (u.title as string) : "text";
+    });
+    // Turn 1 (u1..a1): tool dropped. Turn 2 (u2..a2): still outside the
+    // 1-turn window → dropped. Last turn: the tool-transcript stays.
+    expect(shapes).toEqual(["text", "text", "text", "text", "Read · /tmp/a", "text"]);
+  });
+
+  it("window of 2 keeps the second-to-last turn's tools too", async () => {
+    const { cx, updates } = collectCx();
+    await replayMessages(cx, "s", batch, { toolTurnWindow: 2 });
+    const toolTitles = updates
+      .map((p) => (p.update as Record<string, unknown>).title)
+      .filter((t): t is string => typeof t === "string");
+    expect(toolTitles).toEqual(["Run t2", "Read · /tmp/a"]);
+  });
+
+  it("without the option every tool record replays (editor fidelity)", async () => {
+    const { cx, updates } = collectCx();
+    await replayMessages(cx, "s", batch);
+    const toolTitles = updates
+      .map((p) => (p.update as Record<string, unknown>).title)
+      .filter((t): t is string => typeof t === "string");
+    expect(toolTitles).toEqual(["Run t1", "Run t2", "Read · /tmp/a"]);
   });
 });

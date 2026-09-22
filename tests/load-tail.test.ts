@@ -10,12 +10,12 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeMessage } from "../src/backend/types.js";
 import { loadSession } from "../src/handlers/session.js";
-import { loadEarlier } from "../src/handlers/replay.js";
+import { fetchMessages, loadEarlier, TURN_READ } from "../src/handlers/replay.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
 vi.mock("../src/tasks-index.js", () => ({
@@ -101,6 +101,12 @@ function loadParams(extra: Record<string, unknown> = {}): acp.LoadSessionRequest
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Asserts English replay titles; pin the language regardless of host env.
+  vi.stubEnv("ZCODE_ACP_LANG", "en");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe("session/load tail limit", () => {
@@ -463,6 +469,41 @@ describe("session/load_earlier", () => {
       loadEarlier(server, { sessionId: "sess_tail", limit: 2 } as never, cx),
     ).rejects.toThrow("before");
   });
+
+  it("marks every load_earlier update _meta.zcode.earlierPage; the load tail stays unmarked", async () => {
+    const server = new ZcodeAcpServer();
+    server.backend = fakeBackend(hist());
+    const { cx: loadCx, updates: loadUpdates } = collectCx();
+    const result = (await loadSession(
+      server,
+      loadParams({ _meta: { zcode: { limit: 2 } } }),
+      loadCx,
+    )) as { replayMeta: { cursor: string } };
+
+    // Tail replay (session/load) carries NO page marker — clients treat these
+    // as the normal attach transcript.
+    expect(loadUpdates.length).toBeGreaterThan(0);
+    for (const u of loadUpdates) {
+      expect(
+        (u as { _meta?: { zcode?: { earlierPage?: unknown } } })._meta?.zcode?.earlierPage,
+      ).toBeUndefined();
+    }
+
+    const { cx, updates } = collectCx();
+    await loadEarlier(
+      server,
+      { sessionId: "sess_tail", before: result.replayMeta.cursor, limit: 2 },
+      cx,
+    );
+    // Every paged update is marked so remote clients can route it into the
+    // older-page buffer instead of the live transcript.
+    expect(updates.length).toBeGreaterThan(0);
+    for (const u of updates) {
+      expect(
+        (u as { _meta?: { zcode?: { earlierPage?: unknown } } })._meta?.zcode?.earlierPage,
+      ).toBe(true);
+    }
+  });
 });
 
 describe("replayMeta.turnActive", () => {
@@ -501,5 +542,116 @@ describe("replayMeta.turnActive", () => {
     expect((result as { replayMeta?: { turnActive?: boolean } }).replayMeta?.turnActive).toBe(
       false,
     );
+  });
+});
+
+describe("fetchMessages (P1: slow reads must not read as empty)", () => {
+  it("retries once on an RPC failure and returns the real history", async () => {
+    const history = hist();
+    let read = 0;
+    const backend = {
+      isDead: false,
+      request: async (_id: number, method: string) => {
+        if (method === "session/messages") {
+          read++;
+          // A transient timeout (big session, cold backend) — the next read
+          // succeeds. Before the retry, this degraded to [] and the caller
+          // replayed an EMPTY conversation.
+          if (read === 1) return { error: { message: "timeout" } };
+          return { result: { messages: history } };
+        }
+        return { result: {} };
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+
+    const out = await fetchMessages(server, "sess_tail");
+    expect(out).toHaveLength(history.length);
+    expect(read).toBe(2);
+  });
+
+  it("degrades to [] only when the retry fails too", async () => {
+    const backend = {
+      isDead: false,
+      request: async (_id: number, method: string) =>
+        method === "session/messages"
+          ? { error: { message: "zcode backend reader exited (backend dead)" } }
+          : { result: {} },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+
+    const out = await fetchMessages(server, "sess_tail");
+    expect(out).toEqual([]);
+  });
+
+  it("defaults to the generous 45s hydration timeout", async () => {
+    const timeouts: number[] = [];
+    const backend = {
+      isDead: false,
+      request: async (_id: number, method: string, _params: unknown, timeout?: number) => {
+        if (method === "session/messages") {
+          timeouts.push(timeout ?? -1);
+          return { result: { messages: hist() } };
+        }
+        return { result: {} };
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+
+    await fetchMessages(server, "sess_tail");
+    expect(timeouts).toEqual([45_000]);
+  });
+
+  it("passes opts through: custom timeout honored, retry:false fails in ONE read", async () => {
+    const timeouts: number[] = [];
+    const backend = {
+      isDead: false,
+      request: async (_id: number, method: string, _params: unknown, timeout?: number) => {
+        if (method === "session/messages") {
+          timeouts.push(timeout ?? -1);
+          return { error: { message: "timeout" } };
+        }
+        return { result: {} };
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+
+    const out = await fetchMessages(server, "sess_tail", TURN_READ);
+    // One bounded read, no retry, no 45s hang — the turn-internal contract.
+    expect(timeouts).toEqual([8000]);
+    expect(out).toEqual([]);
+  });
+
+  it("passes a custom timeoutMs through even with retry on", async () => {
+    const timeouts: number[] = [];
+    const backend = {
+      isDead: false,
+      request: async (_id: number, method: string, _params: unknown, timeout?: number) => {
+        if (method === "session/messages") {
+          timeouts.push(timeout ?? -1);
+          return { result: { messages: hist() } };
+        }
+        return { result: {} };
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+
+    await fetchMessages(server, "sess_tail", { timeoutMs: 12_345 });
+    expect(timeouts).toEqual([12_345]);
   });
 });

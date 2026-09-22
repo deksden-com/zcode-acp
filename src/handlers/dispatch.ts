@@ -23,10 +23,40 @@ import {
   parseSubagentMetadata,
   TOOL_KIND_MAP,
 } from "../translators/tool-helpers.js";
+import { messages } from "../i18n.js";
 import type { InternalEvent } from "../translators/types.js";
 import type { ZcodeAcpServer } from "../server.js";
-import { warn } from "../utils.js";
-import { sendSessionUpdate } from "./io.js";
+import { clientConnectionRoot, warn } from "../utils.js";
+import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "./io.js";
+
+/** True once the EPERM hint fired for this process — throttled to one shot. */
+let sandboxEpermHinted = false;
+
+/**
+ * Sandbox observability (#127): a syscall-level Seatbelt denial surfaces in
+ * the child as a bare `Operation not permitted` — no ask path (that flow is
+ * write-path only), no attribution, and tools misreport it as their own bug.
+ * When the backend runs sandboxed, tag the first EPERM-class tool output so
+ * diagnostics have a signal pointing at the sandbox instead.
+ */
+function hintSandboxEperm(server: ZcodeAcpServer, ev: InternalEvent): void {
+  if (sandboxEpermHinted || !server.backendSandboxed || ev.kind !== "ToolCallUpdate") return;
+  // Failed outputs only: successful tools routinely ECHO the phrase (cat-ing
+  // this repo's own docs, grep hits) and would false-positive the hint.
+  if (ev.status !== "failed") return;
+  if (!`${ev.output ?? ""}`.includes("Operation not permitted")) return;
+  sandboxEpermHinted = true;
+  warn(
+    "  ⚠ tool output contained 'Operation not permitted' with the Seatbelt sandbox armed — " +
+      "likely a sandbox denial, not a tool bug (docs/TROUBLESHOOTING.md; path grants go in " +
+      ".zcode/acp/sandbox.json)",
+  );
+}
+
+/** Test hook: re-arm the one-shot EPERM hint. */
+export function resetSandboxEpermHintForTest(): void {
+  sandboxEpermHinted = false;
+}
 
 /** Dispatch one internal event to the ACP client as a session/update. */
 export async function dispatchEvent(
@@ -36,42 +66,52 @@ export async function dispatchEvent(
   ev: InternalEvent,
   chunkMsgId: string,
 ): Promise<void> {
-  switch (ev.kind) {
-    case "ToolCallNew":
-      await dispatchToolCallNew(server, cx, acpSid, ev);
-      break;
-    case "ToolCallUpdate":
-      await dispatchToolCallUpdate(server, cx, acpSid, ev);
-      break;
-    case "UsageDelta":
-      await dispatchUsageDelta(server, cx, acpSid, ev);
-      break;
-    case "TextDelta":
-      await sendSessionUpdate(cx, acpSid, {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: ev.text },
-        messageId: chunkMsgId,
-      });
-      break;
-    case "ReasoningDelta":
-      await sendSessionUpdate(cx, acpSid, {
-        sessionUpdate: "agent_thought_chunk",
-        content: { type: "text", text: ev.text },
-        messageId: `thought_${chunkMsgId}`,
-      });
-      break;
-    case "PlanUpdate":
-      await sendSessionUpdate(cx, acpSid, {
-        sessionUpdate: "plan",
-        entries: ev.entries,
-      });
-      break;
-    case "FilesChanged":
-      await dispatchFilesChanged(cx, acpSid, ev);
-      break;
-    case "ConfigChanged":
-      await dispatchConfigChanged(server, cx, acpSid, ev);
-      break;
+  hintSandboxEperm(server, ev);
+  // One conversation can be attached under several ACP ids (see
+  // server.sessionAliases): emit once per alias with that alias as the
+  // payload sessionId, or every client but the prompter starves silently.
+  const targets = server.sessionAliases(acpSid);
+  for (const sid of targets) {
+    switch (ev.kind) {
+      case "ToolCallNew":
+        await dispatchToolCallNew(server, cx, sid, ev);
+        break;
+      case "ToolCallUpdate":
+        await dispatchToolCallUpdate(server, cx, sid, ev);
+        break;
+      case "UsageDelta":
+        await dispatchUsageDelta(server, cx, sid, ev);
+        break;
+      case "TurnInfo":
+        await dispatchTurnInfo(cx, sid, ev, chunkMsgId);
+        break;
+      case "TextDelta":
+        await sendSessionUpdate(cx, sid, {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: ev.text },
+          messageId: ev.messageId ?? chunkMsgId,
+        });
+        break;
+      case "ReasoningDelta":
+        await sendSessionUpdate(cx, sid, {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: ev.text },
+          messageId: `thought_${ev.messageId ?? chunkMsgId}`,
+        });
+        break;
+      case "PlanUpdate":
+        await sendSessionUpdate(cx, sid, {
+          sessionUpdate: "plan",
+          entries: ev.entries,
+        });
+        break;
+      case "FilesChanged":
+        await dispatchFilesChanged(cx, sid, ev);
+        break;
+      case "ConfigChanged":
+        await dispatchConfigChanged(server, cx, sid, ev);
+        break;
+    }
   }
 }
 
@@ -98,7 +138,7 @@ async function dispatchConfigChanged(
     // Fall back to null (defaults) only if the session mapping isn't live yet —
     // events routed through a registered turn loop always have it.
     const zcodeSid = server.resolveSid(acpSid) ?? null;
-    const options = await buildConfigOptions(server, zcodeSid);
+    const options = await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx));
     // Find by id — the array order buildConfigOptions returns is not a
     // contract; index-based writes would silently hit the wrong option if
     // that order ever changed (emitModeViaConfigOption already does this).
@@ -111,18 +151,26 @@ async function dispatchConfigChanged(
     }
     if (ev.mode !== undefined) setById("mode", ev.mode);
     if (ev.thought !== undefined) setById("thought", ev.thought);
-    await sendSessionUpdate(cx, acpSid, {
+    const configUpdate: acp.SessionUpdate = {
       sessionUpdate: "config_option_update",
       configOptions: options,
-    });
+    };
+    await sendSessionUpdate(cx, acpSid, configUpdate);
+    // Settings are per-session: the CLI's /model or the phone's dropdown must
+    // reach every OTHER attached client too. The broadcast proxy already
+    // reached everyone with the send above — an "others" leg on it would
+    // double-deliver (it has no connectionContext to exclude anyone by).
+    if (!isBroadcastSource(cx)) sendSessionUpdateToOthers(server, cx, acpSid, configUpdate);
     if (ev.mode !== undefined) {
       // Mirror the advertised mode so turn-completion reconciliation
       // (emitModeIfChanged) doesn't re-emit the same value.
       server.lastMode.set(acpSid, ev.mode);
-      await sendSessionUpdate(cx, acpSid, {
+      const modeUpdate: acp.SessionUpdate = {
         sessionUpdate: "current_mode_update",
         currentModeId: ev.mode,
-      });
+      };
+      await sendSessionUpdate(cx, acpSid, modeUpdate);
+      if (!isBroadcastSource(cx)) sendSessionUpdateToOthers(server, cx, acpSid, modeUpdate);
     }
   } catch (e) {
     warn(`dispatch: ConfigChanged failed (${e instanceof Error ? e.message : String(e)})`);
@@ -313,23 +361,66 @@ async function dispatchTerminalUpdate(
   }
 }
 
+/**
+ * Turn-end status line from `turn.completed` (resultType + cacheStats):
+ * success renders the prompt-cache stats (or a bare "completed" when the
+ * backend sent no cacheStats); any non-success resultType is surfaced
+ * verbatim as a warning-flavored line. Distinct messageId (chunkMsgId
+ * prefix) so editors keep it a separate message from the reply text.
+ */
+async function dispatchTurnInfo(
+  cx: acp.AgentContext,
+  acpSid: string,
+  ev: Extract<InternalEvent, { kind: "TurnInfo" }>,
+  chunkMsgId: string,
+): Promise<void> {
+  const m = messages();
+  let line: string;
+  if (ev.resultType === "success") {
+    line = ev.cacheStats
+      ? m.turnCompletedCache(
+          ev.cacheStats.cachedMessages,
+          ev.cacheStats.totalMessages,
+          ev.cacheStats.cacheReadTokens !== undefined
+            ? formatTokenCount(ev.cacheStats.cacheReadTokens)
+            : undefined,
+        )
+      : m.turnCompleted;
+  } else {
+    line = m.turnStoppedEarly(ev.resultType);
+  }
+  await sendSessionUpdate(cx, acpSid, {
+    sessionUpdate: "agent_message_chunk",
+    content: { type: "text", text: line },
+    messageId: `turninfo_${chunkMsgId}`,
+  });
+}
+
+/** Compact token-count rendering for status lines: 12300 → "12.3k", 999 → "999". */
+function formatTokenCount(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+}
+
 async function dispatchUsageDelta(
   server: ZcodeAcpServer,
   cx: acp.AgentContext,
   acpSid: string,
   ev: Extract<InternalEvent, { kind: "UsageDelta" }>,
 ): Promise<void> {
-  // The backend often returns contextWindow=0; fill from the model's
-  // config.json limit.context so the editor can render the context bar.
-  let size = ev.size;
-  if (!size) {
-    // Resolve to the real backend session id — `acpSid` may be a lazy
-    // session/new placeholder that the backend rejects with "Session is not
-    // active", wasting a 5s request timeout on every usage_update.
-    const zcodeSid = server.resolveSid(acpSid) ?? acpSid;
-    const { providerId, modelId } = parseModelValue(await currentModelCached(server, zcodeSid));
-    size = modelContextWindow(providerId, modelId);
-  }
+  // `size` precedence: the user's explicit config.json `limit.context` for the
+  // session's model FIRST, the backend event's contextWindow as fallback. The
+  // CLI's projection seeds contextWindow with a hardcoded 200K default and
+  // account-provider models carry no registry metadata (our account snapshot
+  // pushes model ids only), so the event value can be a placeholder — while
+  // config.json is the explicit per-model truth, and it is already what the
+  // boot/switch-time emissions use. Config-first keeps the gauge from
+  // flip-flopping between the two values across a session.
+  // Resolve to the real backend session id — `acpSid` may be a lazy
+  // session/new placeholder that the backend rejects with "Session is not
+  // active", wasting a 5s request timeout on every usage_update.
+  const zcodeSid = server.resolveSid(acpSid) ?? acpSid;
+  const { providerId, modelId } = parseModelValue(await currentModelCached(server, zcodeSid));
+  const size = modelContextWindow(providerId, modelId) || ev.size;
   await sendSessionUpdate(cx, acpSid, {
     sessionUpdate: "usage_update",
     used: ev.used,
@@ -345,14 +436,13 @@ function dispatchFilesChanged(
   const files = ev.files;
   const preview = files.slice(0, 3).join(", ");
   const ellipsis = files.length > 3 ? "..." : "";
+  const m = messages();
   return sendSessionUpdate(cx, acpSid, {
     sessionUpdate: "tool_call",
     toolCallId: `files_${randomUUID().slice(0, 8)}`,
-    title: `changed files (${files.length}): ${preview}${ellipsis}`,
+    title: m.changedFilesTitle(files.length, preview) + ellipsis,
     kind: "edit",
     status: "completed",
-    content: [
-      { type: "content", content: { type: "text", text: "affected files:\n" + files.join("\n") } },
-    ],
+    content: [{ type: "content", content: { type: "text", text: m.affectedFilesList(files) } }],
   });
 }

@@ -35,6 +35,7 @@ import { randomUUID } from "node:crypto";
 
 import type { EventListener } from "../backend/client.js";
 import type { ZcodeEvent } from "../backend/types.js";
+import { messages } from "../i18n.js";
 import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 
@@ -107,8 +108,7 @@ function toAcpStatus(status: string | undefined): "in_progress" | "completed" | 
 
 /** Build the card title for a background task. */
 function cardTitle(description: string | undefined): string {
-  const d = (description ?? "").trim();
-  return d ? `[background] ${d}` : "[background] task";
+  return messages().backgroundTaskTitle((description ?? "").trim());
 }
 
 export class BackgroundTaskListener implements EventListener {
@@ -141,10 +141,18 @@ export class BackgroundTaskListener implements EventListener {
       }
       if (event.type === "turn.started") {
         const inputSource = event.payload?.["inputSource"];
-        const turnId = (event.payload?.["turnId"] as string | undefined) ?? "";
+        // Envelope-first (0.16.9); the payload spelling is the legacy fallback.
+        const turnId =
+          (event.turnId as string | undefined) ??
+          (event.payload?.["turnId"] as string | undefined) ??
+          "";
         if (inputSource === "background_task") {
           this.activeNotifyTurnId = turnId || null;
+          // Publish the window: the prompt path extends its send busy-retry
+          // budget while a notification turn (a real model turn) holds the
+          // prompt lock (server.notifyTurnActiveSince, see session.ts).
           if (this.activeNotifyTurnId) {
+            this.server.notifyTurnActiveSince.set(this.zcodeSid, Date.now());
             log(`  [bg] background notification turn started (${turnId.slice(-8)})`);
           }
         }
@@ -163,6 +171,7 @@ export class BackgroundTaskListener implements EventListener {
         if (event.type === "turn.completed" || event.type === "turn.failed") {
           log(`  [bg] background notification turn ended (${event.type})`);
           this.activeNotifyTurnId = null;
+          this.server.notifyTurnActiveSince.delete(this.zcodeSid);
           // Reset the result messageId so the NEXT background task in this
           // session gets its own — otherwise the editor would merge/overwrite
           // distinct tasks' outputs under one shared messageId.
@@ -414,5 +423,46 @@ export class BackgroundTaskListener implements EventListener {
     }
     this.tasks.delete(taskId);
     log(`  [bg] task cancelled: ${taskId.slice(-12)}`);
+  }
+
+  /**
+   * Terminal record for tasks still in flight when the bridge (or its backend
+   * subprocess) shuts down. The CLI runtime keeps its task registry in memory
+   * and aborts silently on adapter close — no completion/termination event is
+   * ever emitted, so the client's card would stay in_progress forever. Emit a
+   * `failed` update with `shutdown: true` metadata instead (#194). Best-effort;
+   * called from the bridge shutdown paths before the backend pipe closes.
+   */
+  async emitShutdownRecords(): Promise<void> {
+    for (const [taskId, task] of [...this.tasks]) {
+      if (task.lastStatus === "completed" || task.lastStatus === "failed") continue;
+      if (task.reusesLaunchCard && task.sourceToolCallId) {
+        await this.server.notifyByZcodeSid(this.zcodeSid, {
+          sessionUpdate: "tool_call_update",
+          toolCallId: task.sourceToolCallId,
+          status: "failed",
+          content: [{ type: "terminal", terminalId: task.sourceToolCallId }],
+          _meta: {
+            backgroundTask: { taskId, shutdown: true },
+            claudeCode: { toolName: "Bash" },
+            terminal_exit: {
+              terminal_id: task.sourceToolCallId,
+              exit_code: 1,
+              signal: null,
+            },
+          },
+        });
+        this.server.terminalSentData.delete(task.sourceToolCallId);
+      } else {
+        await this.server.notifyByZcodeSid(this.zcodeSid, {
+          sessionUpdate: "tool_call_update",
+          toolCallId: task.acpCallId,
+          status: "failed",
+          _meta: { backgroundTask: { taskId, shutdown: true } },
+        });
+      }
+      task.lastStatus = "failed";
+      log(`  [bg] shutdown record emitted for task ${taskId.slice(-12)}`);
+    }
   }
 }

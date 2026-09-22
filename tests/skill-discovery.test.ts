@@ -274,4 +274,23 @@ describe("loadSkillCommands", () => {
     expect(skills).toHaveLength(1);
     expect(skills[0]!.input).toEqual({ hint: "What is the next session for?" });
   });
+
+  it("reads user skills and the CLI config from ZCODE_HOME when set", () => {
+    resetMocks();
+
+    // Skills under an isolated data root must be honored; the real ~/.zcode
+    // must be ignored entirely.
+    const altRoot = path.join(HOME, "zcode-alt-home");
+    setSkill(`${altRoot}/skills`, "alt-skill", "Lives in the alternate data root.");
+    setSkill(`${HOME}/.zcode/skills`, "real-home-skill", "Lives in the real home.");
+
+    vi.stubEnv("ZCODE_HOME", altRoot);
+    try {
+      const skills = loadSkillCommands();
+      expect(skills).toHaveLength(1);
+      expect(skills[0]!.name).toBe("$alt-skill");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });

@@ -16,6 +16,9 @@
  */
 
 import { pickOverlay, renderColorBar } from "./color.js";
+import type { OcQueryResult } from "./ollama-cloud/types.js";
+import type { GoQueryResult } from "./opencode-go/types.js";
+import { roundTenth } from "./rounding.js";
 import type { QuotaItem, QuotaResult } from "./types.js";
 
 /**
@@ -281,4 +284,113 @@ export function formatQuota(result: QuotaResult, opts?: FormatOptions): string {
 export function formatQuotaPlain(result: QuotaResult, opts?: FormatOptions): string {
   const card = formatQuota(result, opts);
   return result.kind === "success" ? card.replace(/^```text\n/, "").replace(/\n```$/, "") : card;
+}
+
+// ---------- quota dock (ADR-0021) ----------
+
+/**
+ * Format a compact one-line quota string for the Martty TUI's resident dock
+ * (ADR-0021): `45% 14:23 · 12% 10-18 · go 8% 10-11` — each window's used
+ * percent with its reset moment inline (clock time for the 5h window, date for
+ * weekly/monthly). MCP quota
+ * is deliberately omitted (the dock line must stay short).
+ *
+ * Returns `null` when there is nothing to show (non-success result, or a
+ * success with no 5h/weekly windows) so the caller hides the dock instead of
+ * rendering a placeholder.
+ */
+export function formatQuotaDock(result: QuotaResult): string | null {
+  if (result.kind !== "success") return null;
+  const byKey = new Map(result.items.map((item) => [item.key, item]));
+  const fiveHour = byKey.get("token_5h");
+  const weekly = byKey.get("token_week");
+  if (!fiveHour) return null;
+
+  const reset = formatResetClock(fiveHour.nextResetTime);
+  const parts: string[] = [
+    reset ? `${fiveHour.usedPercent}% ${reset}` : `${fiveHour.usedPercent}%`,
+  ];
+  if (weekly) {
+    const wkDate = formatResetDate(weekly.nextResetTime);
+    parts.push(wkDate ? `${weekly.usedPercent}% ${wkDate}` : `${weekly.usedPercent}%`);
+  }
+  return parts.join(" · ");
+}
+
+/**
+ * Compact Opencode Go segment for the dock: monthly window only, as
+ * `go 8% 10-11` — percent plus the reset DATE (the monthly window resets in
+ * ~30d, so a clock time is meaningless; the date is computed from the fetch
+ * time + relative countdown). `null` when Go is not usable (not configured,
+ * auth error, unavailable, or no monthly window exposed by the dashboard).
+ */
+export function formatGoDockSegment(go: GoQueryResult): string | null {
+  if (go.kind !== "success" || !go.monthly) return null;
+  // The console API gives raw micro-cents ratios — round to one decimal like
+  // the oc segment (the legacy dashboard used to pre-round server-side).
+  const pct = roundTenth(Math.max(0, Math.min(100, go.monthly.usagePercent)));
+  const label = Number.isInteger(pct) ? String(pct) : pct.toFixed(1);
+  const d = new Date(go.fetchedAt + go.monthly.resetInSec * 1000);
+  if (Number.isNaN(d.getTime())) return `go ${label}%`;
+  const date = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  return `go ${label}% ${date}`;
+}
+
+/**
+ * Compact Ollama Cloud segment for the dock, showing ONLY the largest window
+ * the plan exposes — monthly for credit plans, else weekly, else the 5h
+ * session — as `oc 60.3% 10-11`: percent at one-decimal precision plus the
+ * derived reset stamp (clock time for 5h, date for weekly/monthly; omitted
+ * when the monthly /api/me lookup failed). The window label is deliberately
+ * omitted: it is constant per plan and the reset stamp already tells the
+ * windows apart. `null` when Ollama is not usable (not configured, auth
+ * error, unavailable, or no windows).
+ */
+export function formatOcDockSegment(oc: OcQueryResult): string | null {
+  if (oc.kind !== "success") return null;
+  const pct = (f: number): string => {
+    const v = roundTenth(Math.max(0, Math.min(100, f * 100)));
+    return Number.isInteger(v) ? String(v) : v.toFixed(1);
+  };
+  if (typeof oc.monthly === "number") {
+    const date = formatResetDate(oc.monthlyResetAt);
+    return `oc ${pct(oc.monthly)}%${date ? ` ${date}` : ""}`;
+  }
+  if (typeof oc.weekly === "number") {
+    const date = formatResetDate(oc.weeklyResetAt);
+    return `oc ${pct(oc.weekly)}%${date ? ` ${date}` : ""}`;
+  }
+  if (typeof oc.session === "number") {
+    const clock = formatResetClock(oc.sessionResetAt);
+    return `oc ${pct(oc.session)}%${clock ? ` ${clock}` : ""}`;
+  }
+  return null;
+}
+
+/** Join the dock segments; `null` when all are absent. */
+export function composeQuotaDock(...segments: (string | null)[]): string | null {
+  const parts = segments.filter((s): s is string => s !== null);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/**
+ * Absolute-time rendering for the dock: the reset moment as a local `HH:MM`
+ * clock time (the 5h window resets within hours, so no date component).
+ */
+function formatResetClock(nextResetTime: number | undefined): string | null {
+  if (nextResetTime === undefined || !Number.isFinite(nextResetTime)) return null;
+  const d = new Date(nextResetTime);
+  if (Number.isNaN(d.getTime())) return null;
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/**
+ * Date rendering for windows that reset in days (weekly/monthly): the reset
+ * moment as a local `MM-DD` date.
+ */
+function formatResetDate(nextResetTime: number | undefined): string | null {
+  if (nextResetTime === undefined || !Number.isFinite(nextResetTime)) return null;
+  const d = new Date(nextResetTime);
+  if (Number.isNaN(d.getTime())) return null;
+  return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }

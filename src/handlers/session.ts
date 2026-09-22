@@ -12,40 +12,83 @@
  */
 
 import process from "node:process";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import type * as acp from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
 
+import type { ZcodeBackend } from "../backend/client.js";
 import { EventStreamListener, TurnMonitor } from "../backend/listener.js";
-import type { ZcodeCreateResult, ZcodeListResult, ZcodeSnapshot } from "../backend/types.js";
+import { resolveReal } from "../backend/sandbox.js";
+import type {
+  ZcodeCreateResult,
+  ZcodeListResult,
+  ZcodeMessage,
+  ZcodeProjection,
+  ZcodeSnapshot,
+} from "../backend/types.js";
 import {
   buildModes,
   buildConfigOptions,
+  DEFAULT_MODEL_ID,
+  DEFAULT_PROVIDER_ID,
   formatModelValue,
   loadAllModels,
+  modelContextWindow,
+  parseModelValue,
 } from "../config/options.js";
-import { emitInitialUsage } from "../config/model-cache.js";
+import { currentModelCached, emitInitialUsage } from "../config/model-cache.js";
+import {
+  forceRefreshQuota,
+  scheduleQuotaDockBackstop,
+  startQuotaRefresher,
+} from "../quota/live.js";
 import { buildProviderRegistry } from "../config/provider-registry.js";
-import { buildResumeRuntimeModel } from "../config/runtime-model.js";
+import { pushAccountProviderConfig } from "../config/account-provider.js";
+import { initialSessionMode } from "../config/settings.js";
+import { applyModelSwitch, buildResumeRuntimeModel } from "../config/runtime-model.js";
+import { messages } from "../i18n.js";
 import {
   lookupLazySession,
+  lookupModelChoiceByZcodeSid,
   recordMaterializedSession,
   rememberLazySession,
 } from "../lazy-sessions.js";
+import { refreshTerminalTabTitle } from "../terminal-title.js";
 import {
   buildDiffContent,
   EventTranslator,
   extractLocations,
   formatTurnError,
+  isBackendLostError,
   isTransientTurnError,
   ProjectionDiffer,
 } from "../translators/index.js";
 import type { InternalEvent } from "../translators/index.js";
-import { log, warn } from "../utils.js";
+import { clientConnectionRoot, log, warn } from "../utils.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { dispatchEvent } from "./dispatch.js";
 import { sendSessionUpdate, sendTextChunk, withReplayBatch } from "./io.js";
-import { fetchMessages, fullSlice, readTailLimit, replayMessages, sliceTail } from "./replay.js";
+import type { FetchMessagesOptions, ReplaySlice } from "./replay.js";
+import {
+  EDIT_DIFF_READ_LIMIT,
+  fetchMessages,
+  fetchMessagesSinceAnchor,
+  fullSlice,
+  readTailLimit,
+  REPLY_READ_LIMIT,
+  replayMessages,
+  sliceTail,
+  TURN_READ,
+} from "./replay.js";
+import {
+  extractPermDeniedPath,
+  extractSandboxDenial,
+  GENERIC_HINT_KEY,
+  handleSandboxDenial,
+  READ_ONLY_TOOLS,
+} from "./sandbox-allow.js";
 import { handleServerRequests } from "./server-requests.js";
 
 /** Workspace descriptor used in session create/resume calls. */
@@ -65,6 +108,20 @@ function sanitizeClientCwd(client: string | undefined): string | null {
 }
 
 /**
+ * Same-directory check tolerant of spelling: a workspace can be recorded or
+ * reported under a symlinked / non-canonical spelling while the serve bridge
+ * holds the resolved process cwd. Compare realpaths; a vanished path falls
+ * back to raw equality (both sides unchanged → still equal).
+ */
+function sameProjectDir(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return a === b;
+  }
+}
+
+/**
  * The authoritative Session Root for an EXISTING session: what the bridge
  * already recorded (set at creation, or refreshed from the backend's resume
  * result). Client cwds are NOT consulted — a remote client must not be able
@@ -75,6 +132,24 @@ function sanitizeClientCwd(client: string | undefined): string | null {
 function authoritativeSessionCwd(server: ZcodeAcpServer, acpSid: string): string {
   const existing = server.sessionCwds.get(acpSid);
   return existing && existing !== "/" ? existing : process.cwd();
+}
+
+/**
+ * Record a session's client-provided MCP servers as session-lifetime state.
+ * The backend does not persist mcpServers with the session record, so the
+ * bridge must remember them and re-send on every backend load (#193). An
+ * empty/absent array is ignored, NOT a clear: the SDK makes `mcpServers: []`
+ * mandatory on session/load, and wiping on it would drop a set declared at
+ * session/new.
+ */
+function rememberSessionMcpServers(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  mcpServers?: acp.McpServer[],
+): void {
+  if (mcpServers && mcpServers.length > 0) {
+    server.sessionMcpServers.set(acpSid, mcpServers);
+  }
 }
 
 /**
@@ -98,7 +173,24 @@ function workspaceFromResumeResult(result: unknown): string | null {
  */
 async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promise<void> {
   try {
+    // Account-plan providers first: 3.12+ app-servers build their registry from
+    // the bundled table + personal config + an ACCOUNT snapshot the desktop
+    // host pushes (`provider/updateAccountConfig`). Headless launches have no
+    // host, so every `account:*` provider stays entitled:false and the GLM
+    // models the user's config selects never reach `settings.model.available`
+    // (verified 2026-09 — switches then fail with "Provider Registry 中不存在
+    // Model"). Pushing the snapshot restores desktop parity. Best-effort.
+    await pushAccountProviderConfig(server.ensureBackend(), () => server.nextId());
     const registry = buildProviderRegistry();
+    if (registry.providers.length === 0) {
+      // Every configured provider lacks models (or none are configured). The
+      // empty payload is schema-valid, but the backend applies registries
+      // replace-style — pushing it would CLEAR providers synced earlier. Most
+      // users configure no third-party provider at all, so this is the common
+      // path, not an error.
+      log("provider-registry: no usable providers — skipping sync");
+      return;
+    }
     const resp = await server
       .ensureBackend()
       .request(
@@ -108,7 +200,13 @@ async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promis
         10000,
       );
     if (resp.error) {
-      warn(`provider-registry: sync failed: ${resp.error.message}`);
+      // 3.12+ removed the method (the registry is built from the bundled table,
+      // personal config, and the account snapshot) — a no-op, not a failure.
+      if (resp.error.code === -32601) {
+        log("provider-registry: backend has no workspace/updateProviderRegistry (3.12+)");
+      } else {
+        warn(`provider-registry: sync failed: ${resp.error.message}`);
+      }
       return;
     }
     log("provider-registry: synced to backend");
@@ -123,19 +221,193 @@ function toIso(ms: number | undefined): string | undefined {
   return new Date(ms).toISOString();
 }
 
+/** Env carrying the hub's boot-resume target (ADR-0017). */
+const BOOT_RESUME_ENV = "ZCODE_ACP_RESUME_SESSION";
+
+/**
+ * Read and consume the boot-resume session id: the first `session/new` after
+ * process start claims it, the env is deleted so later `session/new` calls
+ * (the TUI's /new) create fresh sessions. Whitespace-only counts as unset.
+ */
+export function consumeBootResumeTarget(): string | null {
+  const target = (process.env[BOOT_RESUME_ENV] ?? "").trim();
+  delete process.env[BOOT_RESUME_ENV];
+  return target || null;
+}
+
+/** Env marking a hub-incubated create TUI's pre-generated session bind. */
+const BOOT_CREATE_BIND_ENV = "ZCODE_ACP_BOOT_CREATE_SESSION";
+
+/**
+ * Read and consume the hub's session-create binding: when the create flag is
+ * set, the RESUME-env value is a hub-PRE-GENERATED placeholder id (not an
+ * existing conversation) that the boot path MINTS lazily instead of loading.
+ * Consumes both envs together (the resume path must not see them); returns
+ * null unless the create flag is set.
+ */
+function consumeBootCreateBind(): string | null {
+  const flag = process.env[BOOT_CREATE_BIND_ENV] ?? "";
+  delete process.env[BOOT_CREATE_BIND_ENV];
+  if (flag !== "1") return null;
+  const target = (process.env[BOOT_RESUME_ENV] ?? "").trim();
+  delete process.env[BOOT_RESUME_ENV];
+  return target || null;
+}
+
+/**
+ * Banner-handshake trigger for a boot-resumed TUI (ADR-0017 follow-up).
+ * Martty's welcome banner paints INSTEAD of the transcript and only dives
+ * when text is submitted — so a boot-resumed TUI showed its replayed history
+ * only after the user's first message. The hub therefore also incubates the
+ * resume TUI with `DSH_TUI_AUTOPROMPT=<this string>`: martty auto-submits it
+ * at boot (banner dives immediately, the text queues until the boot bind),
+ * and the prompt path answers it with a one-line ack instead of a model
+ * turn — scoped to the booting connection (see bootResumeTriggerConnection).
+ * Plain text on purpose: a leading `/` would route through martty's
+ * slash dispatch (whose gates run before agent capabilities are known) and
+ * `!` would run a local shell command.
+ */
+export const BOOT_RESUME_TRIGGER = "resume session";
+
 /**
  * `session/new` → local placeholder id. The real zcode `session/create` is
  * deferred to first use (`ensureRealSession`) so an editor startup that never
  * sends a message leaves no empty session in the backend or the App's task
  * index. The created session uses mode yolo (hardcoded).
+ *
+ * Exception — boot-resume interception (ADR-0017, amended by ADR-0020): when
+ * the hub incubated this bridge for a specific conversation
+ * (ZCODE_ACP_RESUME_SESSION), the TUI client's opening `session/new` is
+ * served as a `session/load` of that id instead. The client adopts the
+ * resumed conversation with zero client-side support. A failed load falls
+ * back to a fresh session so the window still lands on a usable prompt
+ * (the retired in-house REPL had the same fallback).
  */
 export async function newSession(
   server: ZcodeAcpServer,
   params: acp.NewSessionRequest,
+  client?: acp.AgentContext,
 ): Promise<acp.NewSessionResponse> {
+  // Martty bookkeeping (ADR-0021): start the lazy refresher when THIS
+  // connection is martty. Identity is per-connection — recorded at the
+  // connection's own initialize (server.ts), never the sticky process flag,
+  // so a phone app's session/new must not become a quota-dock target.
+  if (server.marttyConnectionRoots.has(clientConnectionRoot(client))) {
+    startQuotaRefresher(server);
+  }
+  // Hub session-create binding (remote create, ADR-0016): adopt the hub's
+  // pre-generated session id (see server.bootCreateBindSession) so the TUI
+  // window and the attaching phone share ONE session. Unlike the one-shot
+  // resume env below, the bind persists — each connection claims it on its
+  // FIRST session/new only (a later session/new, e.g. the TUI's /new, mints
+  // a fresh placeholder as usual).
+  if (server.bootCreateBindSession === null) {
+    const bound = consumeBootCreateBind();
+    if (bound) server.bootCreateBindSession = bound;
+  }
+  const bindRoot = clientConnectionRoot(client);
+  if (server.bootCreateBindSession !== null && !server.bootCreateBindClaimed.has(bindRoot)) {
+    server.bootCreateBindClaimed.add(bindRoot);
+    const bindSid = server.bootCreateBindSession;
+    // First claim MINTS the shared LAZY placeholder (no backend session until
+    // first use — an abandoned create window leaves nothing behind); later
+    // claims (the phone, sibling windows) adopt it as-is.
+    if (!server.pendingSessions.has(bindSid) && !server.resolveSid(bindSid)) {
+      const cwd = server.serveMode
+        ? process.cwd()
+        : (sanitizeClientCwd(params.cwd) ?? process.cwd());
+      server.pendingSessions.set(bindSid, { cwd, mcpServers: params.mcpServers });
+      server.sessionCwds.set(bindSid, cwd);
+      rememberSessionMcpServers(server, bindSid, params.mcpServers);
+      // Remote-created: discovery must advertise it in the ACTIVE list for
+      // as long as this bridge lives (a phone has no editor-side session
+      // storage of its own; the window closing ends the listing).
+      server.remoteCreatedSessions.add(bindSid);
+      rememberLazySession(bindSid, cwd);
+      server.titleEligibleSessions.add(bindSid);
+      refreshTerminalTabTitle(server, bindSid);
+      log(`session/new (create-bind) → ${bindSid} cwd=${cwd}`);
+    }
+    // Same banner handshake as boot-resume: the TUI's auto-submitted trigger
+    // (DSH_TUI_AUTOPROMPT) drops martty's welcome banner so the window shows
+    // the shared conversation instead of waiting for local input.
+    if (isMarttyClient(server)) {
+      server.bootResumeTriggerConnection = bindRoot;
+    }
+    const modes = await buildModes(server, null);
+    server.lastMode.set(bindSid, modes.currentModeId);
+    emitBootUsageUpdate(server, bindSid);
+    scheduleQuotaDockBackstop(server);
+    return {
+      sessionId: bindSid,
+      modes,
+      configOptions: await buildConfigOptions(server, null, bindRoot),
+    };
+  }
+  const bootResume = consumeBootResumeTarget();
+  if (bootResume) {
+    try {
+      // replayHistory:false — a PRE-response replay would arrive for a session
+      // id the client has not adopted yet and be dropped; the tail replay is
+      // deferred past the response instead (below).
+      const loaded = await loadSession(
+        server,
+        { sessionId: bootResume } as acp.LoadSessionRequest,
+        // Targeted (per-connection) delivery — a replay is the requesting
+        // client's rendering state; broadcast() would append the whole
+        // history to every OTHER attached client's transcript (the
+        // "replay disorder" bug). broadcast only as a fallback for a
+        // client-less hub bind.
+        client ?? server.clients.broadcast(),
+        { replayHistory: false },
+      );
+      log(`session/new: boot-resume → ${bootResume}`);
+      refreshTerminalTabTitle(server, bootResume);
+      // Deferred tail replay, same as the TUI's /resume (see resumeSession):
+      // once the session/new response is written the booting martty has
+      // adopted the returned session id, so post-response chunks can fold
+      // into its transcript. The chunks sit BEHIND martty's welcome banner
+      // until text is submitted — the DSH_TUI_AUTOPROMPT handshake armed
+      // below drops the banner for the user.
+      if (isMarttyClient(server)) {
+        // Scope the handshake to THIS connection: a phone app attached to the
+        // same bridge may prompt during the boot window and must not disarm it.
+        server.bootResumeTriggerConnection = clientConnectionRoot(client);
+        // Targeted replay — the booting TUI's own connection, never broadcast
+        // (see the loadSession comment above).
+        const cx = client ?? server.clients.broadcast();
+        const zcodeSid = server.resolveSid(bootResume);
+        if (zcodeSid) {
+          setImmediate(() => {
+            replayResumeHistory(server, cx, bootResume, zcodeSid).catch((e) => {
+              warn(
+                `session/new boot-resume: TUI history replay failed (non-fatal): ` +
+                  `${e instanceof Error ? e.message : String(e)}`,
+              );
+            });
+          });
+        }
+      }
+      emitBootUsageUpdate(server, bootResume);
+      scheduleQuotaDockBackstop(server);
+      return {
+        sessionId: bootResume,
+        modes: loaded.modes,
+        configOptions: loaded.configOptions,
+      };
+    } catch (e) {
+      warn(
+        `session/new: boot-resume of ${bootResume} failed (` +
+          `${e instanceof Error ? e.message : String(e)}) — starting a fresh session`,
+      );
+    }
+  }
   // Creation is the one moment a client's cwd is trusted (the editor
   // declaring its worktree); "/" is still rejected as a degenerate root.
-  const cwd = sanitizeClientCwd(params.cwd) ?? process.cwd();
+  // Serve mode (ADR-0014) is the exception: a headless bridge exists for ONE
+  // hub-chosen project — the process cwd wins and client-supplied values are
+  // ignored, so the remote create-whitelist cannot be bypassed via session/new.
+  const cwd = server.serveMode ? process.cwd() : (sanitizeClientCwd(params.cwd) ?? process.cwd());
   // Placeholder id — the client addresses this session with it until the
   // backend session materializes; never shown in session/list.
   const acpSid = randomUUID();
@@ -143,24 +415,115 @@ export async function newSession(
   // Persists past materialization (pendingSessions is cleared on first use) so
   // the remote discovery payload can still label the workspace.
   server.sessionCwds.set(acpSid, cwd);
+  rememberSessionMcpServers(server, acpSid, params.mcpServers);
   // Durable alias so the placeholder survives a bridge restart and session/
   // resume can still resolve it (best-effort; failures are swallowed inside
-  // the store).
+  // the store). Serve-mode mints are remote-driven — advertise them.
+  if (server.serveMode) server.remoteCreatedSessions.add(acpSid);
   rememberLazySession(acpSid, cwd);
   // Only freshly-created sessions are eligible for auto-title on first
   // end_turn; resumed/loaded sessions already have a title and must keep it.
   server.titleEligibleSessions.add(acpSid);
+  refreshTerminalTabTitle(server, acpSid);
   log(`session/new (lazy) → ${acpSid} cwd=${cwd}`);
 
   // No backend RPC yet: modes/configOptions are built from defaults (the
   // pending session's real values arrive via updates once materialized).
   const modes = await buildModes(server, null);
   server.lastMode.set(acpSid, modes.currentModeId);
+  emitBootUsageUpdate(server, acpSid);
+  scheduleQuotaDockBackstop(server);
   return {
     sessionId: acpSid,
     modes,
-    configOptions: await buildConfigOptions(server, null),
+    configOptions: await buildConfigOptions(server, null, clientConnectionRoot(client)),
   };
+}
+
+/**
+ * Initial usage_update after a session/new binding (ADR-0021): martty only —
+ * unlike emitInitialUsage this does NOT skip used=0, so the TUI's context
+ * window (size at least) shows from the very first screen. Deferred past the
+ * session/new response via setImmediate: a pre-response notification carries
+ * a session id the client has not adopted yet and would be dropped.
+ */
+function emitBootUsageUpdate(server: ZcodeAcpServer, acpSid: string): void {
+  if (!isMarttyClient(server)) return;
+  const cx = server.clients.broadcast();
+  setImmediate(() => {
+    void (async () => {
+      try {
+        const zcodeSid = server.resolveSid(acpSid);
+        let used = 0;
+        if (zcodeSid) {
+          const backend = server.ensureBackend();
+          const resp = await backend.request(
+            server.nextId(),
+            "session/read",
+            // messageLimit: only the projection is read; the cap keeps the
+            // backend from serializing the whole message array for it.
+            { sessionId: zcodeSid, messageLimit: 1 },
+            5000,
+          );
+          const proj = ((resp.result ?? {}) as { projection?: ZcodeProjection }).projection;
+          used = proj?.contextUsed || proj?.totalTokenCount || 0;
+        }
+        let providerId = loadAllModels()[0]?.providerId ?? DEFAULT_PROVIDER_ID;
+        let modelId = loadAllModels()[0]?.modelId ?? DEFAULT_MODEL_ID;
+        if (zcodeSid) {
+          ({ providerId, modelId } = parseModelValue(await currentModelCached(server, zcodeSid)));
+        }
+        await sendSessionUpdate(cx, acpSid, {
+          sessionUpdate: "usage_update",
+          used,
+          size: modelContextWindow(providerId, modelId),
+        });
+      } catch (e) {
+        log(
+          `session/new: boot usage_update failed (non-fatal): ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    })();
+  });
+}
+
+/**
+ * Reload the session into the backend when the resident verification went
+ * stale — the backend evicts idle resident runtimes (~10min idle + LRU), and
+ * every session-scoped RPC on a non-resident session fails with "Session is
+ * not active". Skipped while a turn is in flight (a running turn proves the
+ * resident is live).
+ *
+ * Fail-safe on ordinary reload failures (the caller surfaces the backend's
+ * own error downstream, as before) — but a session the backend no longer
+ * STORES throws the actionable evicted-session error: continuing with the
+ * dead mapping would defer the failure to the next RPC with the misleading
+ * "Session is not active" wording (observed 2026-09-18: every model/thought
+ * switch on a deleted thread failed that way instead of saying the session
+ * was gone).
+ */
+async function ensureBackendResident(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  zcodeSid: string,
+): Promise<void> {
+  if (server.isBackendSessionLive(acpSid)) return;
+  const turnInFlight = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
+  if (turnInFlight) return;
+  try {
+    log(`ensureRealSession: ${acpSid} possibly evicted from backend — reloading`);
+    await reloadBackendSession(server, acpSid, zcodeSid);
+  } catch (e) {
+    if (isSessionGoneError(e)) {
+      warn(`ensureRealSession: ${acpSid} → backend session ${zcodeSid} no longer exists`);
+      throw new Error(messages().sessionEvicted(acpSid));
+    }
+    log(
+      `ensureRealSession: reload failed, continuing with existing mapping ` +
+        `(${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
 }
 
 /**
@@ -169,30 +532,24 @@ export async function newSession(
  * returns the existing mapping for already-created sessions, and concurrent
  * first-uses share a single `session/create` via the pending entry's `creating`
  * promise. Unknown ids throw.
+ *
+ * `{ensureResident:false}` (resolveResumeTarget only) skips the eviction
+ * guard for store-recovered mappings — that caller resumes the session itself
+ * immediately after, and its resume must be the one carrying the client's
+ * freshly declared mcpServers (#193).
  */
-export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string): Promise<string> {
+export async function ensureRealSession(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  opts: { ensureResident?: boolean } = {},
+): Promise<string> {
   const existing = server.resolveSid(acpSid);
   if (existing) {
     // The mapping exists, but the backend may have evicted the resident
     // runtime since it was loaded (~10min idle timeout + LRU cap): every
     // session-scoped RPC would then fail with "Session is not active"
-    // (-32004). Reload via session/resume when the verification went stale
-    // and no turn is in flight (a running turn proves the resident is live).
-    // Fail-safe: a failed reload just returns the mapping — the subsequent
-    // RPC surfaces the backend's real error, same as before this guard.
-    if (server.isBackendSessionLive(acpSid)) return existing;
-    const turnInFlight = [...server.pendingTurns.values()].some((t) => t.zcodeSid === existing);
-    if (!turnInFlight) {
-      try {
-        log(`ensureRealSession: ${acpSid} possibly evicted from backend — reloading`);
-        await reloadBackendSession(server, acpSid, existing);
-      } catch (e) {
-        log(
-          `ensureRealSession: reload failed, continuing with existing mapping ` +
-            `(${e instanceof Error ? e.message : String(e)})`,
-        );
-      }
-    }
+    // (-32004). Reload via session/resume when the verification went stale.
+    await ensureBackendResident(server, acpSid, existing);
     return existing;
   }
   let pending = server.pendingSessions.get(acpSid);
@@ -202,15 +559,58 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
     // (the backend session still exists — re-register the alias); one without
     // re-hydrates the pending entry so the create path below runs.
     const record = lookupLazySession(acpSid);
+    // Serve mode (ADR-0014) honors durable records for ITS OWN project only.
+    // Aliases are minted by editor bridges, which trust their local client's
+    // session/new cwd — a remote client can mint {sid → arbitrary cwd} there
+    // and then resume it here to drag this bridge into a foreign workspace.
+    // Records from another cwd read as unknown ids. The comparison tolerates
+    // spelling differences (symlinked record cwd vs the resolved process cwd)
+    // — same project under another spelling stays resumable.
+    if (server.serveMode && record && !sameProjectDir(record.cwd, process.cwd())) {
+      log(`ensureRealSession: serve mode ignores a foreign lazy record (${acpSid})`);
+      throw new Error(`session ${acpSid} not found`);
+    }
     if (record?.zcodeSid) {
       server.registerSession(acpSid, record.zcodeSid);
-      if (record.cwd !== "/") server.sessionCwds.set(acpSid, record.cwd);
+      // Recover the remembered model/thought choice (bridge restart): the
+      // post-resume re-assert needs it to undo the backend's silent revert
+      // to the workspace default (see reassertModelChoice).
+      // Newer-wins (strictly) across EVERY alias of this backend session:
+      // another acpSid (editor + TUI/phone attach, or an adopted
+      // conversation) may hold a fresher choice, and a stale record must
+      // not overwrite what this process already recovered or a live switch
+      // recorded.
+      const choice = lookupModelChoiceByZcodeSid(record.zcodeSid);
+      if (choice) {
+        const existing = server.sessionModelChoices.get(record.zcodeSid);
+        if (!existing || (choice.at ?? 0) > (existing.at ?? 0)) {
+          server.sessionModelChoices.set(record.zcodeSid, choice);
+        }
+      }
+      // Seed the cwd the reload's resume needs — this process never saw the
+      // session/new that recorded it, and the resume workspace would
+      // otherwise fall back to the bridge's own process cwd.
+      const recordCwd = server.serveMode ? process.cwd() : record.cwd;
+      if (recordCwd && recordCwd !== "/" && !server.sessionCwds.has(acpSid)) {
+        server.sessionCwds.set(acpSid, recordCwd);
+      }
+      // Same eviction guard as in-memory mappings: a store-recovered session
+      // is NOT resident in this backend until resumed — the first switch or
+      // prompt on it would fail with "Session is not active" (observed
+      // 2026-09-18: the first model switch after a bridge restart).
+      if (opts.ensureResident !== false) {
+        await ensureBackendResident(server, acpSid, record.zcodeSid);
+      }
       return record.zcodeSid;
     }
     if (record) {
-      pending = { cwd: record.cwd };
+      // Serve mode pins to its process cwd even here (belt and suspenders —
+      // the guard above already proved the record's cwd matches).
+      const cwd = server.serveMode ? process.cwd() : record.cwd;
+      const mcpServers = server.sessionMcpServers.get(acpSid);
+      pending = { cwd, mcpServers };
       server.pendingSessions.set(acpSid, pending);
-      if (record.cwd !== "/") server.sessionCwds.set(acpSid, record.cwd);
+      if (cwd !== "/") server.sessionCwds.set(acpSid, cwd);
     }
   }
   if (!pending) throw new Error(`session ${acpSid} not found`);
@@ -235,11 +635,22 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
     // clash behaviour is the backend's own and unasserted here.
     const createParams: Record<string, unknown> = {
       workspace: workspaceFor(pending.cwd),
-      mode: "yolo",
+      // The initial mode comes from the user config (session.mode) or
+      // ZCODE_ACP_MODE; the default stays "yolo" (unrestricted), which is
+      // what the bridge always used.
+      mode: initialSessionMode(),
     };
     if (pending.mcpServers && pending.mcpServers.length > 0) {
       createParams.mcpServers = pending.mcpServers;
       log(`session/create carrying ${pending.mcpServers.length} client MCP server(s)`);
+    } else {
+      // Materialization after lazy recovery: the pending entry may lack the
+      // servers while the session-lifetime map still has them.
+      const remembered = server.sessionMcpServers.get(acpSid);
+      if (remembered) {
+        createParams.mcpServers = remembered;
+        log(`session/create carrying ${remembered.length} remembered client MCP server(s)`);
+      }
     }
     const resp = await backend.request(server.nextId(), "session/create", createParams, 15000);
     if (resp.error) {
@@ -250,8 +661,25 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
     const sid = session.sessionId;
     if (!sid) throw new Error("zcode create returned no sessionId");
 
+    // Cache the FULL model-availability list: create (and every resume/fork)
+    // returns every model with its reasoning metadata. Model switches resolve
+    // a target's default level from here (the object form of session/setModel
+    // rejects level-bearing models without one).
+    cacheModelAvailability(server, sid, result);
+
     server.pendingSessions.delete(acpSid);
     server.registerSession(acpSid, sid);
+    // With both ZCODE_PROVIDER and ZCODE_MODEL set, the session is pinned to
+    // that pair right after create. Fail loudly: a silent fallback would run
+    // the turn on whatever model the backend picked instead.
+    const pinnedProvider = process.env.ZCODE_PROVIDER;
+    const pinnedModel = process.env.ZCODE_MODEL;
+    if (pinnedProvider && pinnedModel) {
+      const selected = formatModelValue(pinnedProvider, pinnedModel);
+      if (!(await applyModelSwitch(server, sid, selected))) {
+        throw new Error(`zcode refused configured model ${selected}`);
+      }
+    }
     // session/create loads the session into this backend process.
     server.markBackendLoaded(acpSid);
     // Keep durable aliases in sync so a later bridge restart can resume this
@@ -291,8 +719,12 @@ export async function listSessions(
 ): Promise<acp.ListSessionsResponse> {
   const backend = server.ensureBackend();
   const zcParams: Record<string, unknown> = {};
-  if (params.cwd) {
-    zcParams.workspace = workspaceFor(params.cwd);
+  // Serve mode (ADR-0014) pins the workspace: a remote client must not use a
+  // client-supplied cwd to enumerate the machine's sessions in OTHER projects
+  // (the backend scopes the listing to the workspace it is given).
+  const listCwd = server.serveMode ? process.cwd() : params.cwd;
+  if (listCwd) {
+    zcParams.workspace = workspaceFor(listCwd);
   }
 
   const resp = await backend.request(server.nextId(), "session/list", zcParams, 15000);
@@ -334,6 +766,7 @@ async function adoptStoredTitle(
     if (hit?.title) {
       server.sessionTitles.set(acpSid, hit.title);
       server.touchSessionSummary(acpSid, hit.title);
+      refreshTerminalTabTitle(server, acpSid);
       log(`adopted stored title for ${acpSid.slice(0, 8)}: ${hit.title}`);
     }
   } catch (e) {
@@ -365,24 +798,115 @@ async function adoptStoredTitle(
 async function resolveResumeTarget(
   server: ZcodeAcpServer,
   acpSid: string,
-): Promise<{ zcodeSid: string; alreadyLive: boolean }> {
+): Promise<{ zcodeSid: string; alreadyLive: boolean; origin: "mapped" | "placeholder" | "raw" }> {
   const mapped = server.resolveSid(acpSid);
   if (mapped) {
-    return { zcodeSid: mapped, alreadyLive: server.isBackendSessionLive(acpSid) };
+    return { zcodeSid: mapped, alreadyLive: server.isBackendSessionLive(acpSid), origin: "mapped" };
   }
   if (server.pendingSessions.has(acpSid)) {
-    return { zcodeSid: await ensureRealSession(server, acpSid), alreadyLive: true };
+    return {
+      zcodeSid: await ensureRealSession(server, acpSid),
+      alreadyLive: true,
+      origin: "placeholder",
+    };
   }
   const record = lookupLazySession(acpSid);
   if (record) {
     // ensureRealSession recovers the record: with a zcodeSid it re-registers
     // the alias (no create), without one it materializes a fresh session.
+    // The eviction guard is SKIPPED here ({ensureResident:false}): this
+    // caller resumes the session itself right below — and its resume is the
+    // one that carries the client's freshly declared mcpServers (#193).
     return {
-      zcodeSid: await ensureRealSession(server, acpSid),
+      zcodeSid: await ensureRealSession(server, acpSid, { ensureResident: false }),
       alreadyLive: !record.zcodeSid,
+      origin: "placeholder",
     };
   }
-  return { zcodeSid: acpSid, alreadyLive: false };
+  // Raw passthrough: the id may be a real backend session id (imported
+  // threads). It may equally be a placeholder whose durable alias was lost —
+  // callers wrap raw-origin resume failures with an actionable message
+  // instead of the backend's cryptic "session not found".
+  return { zcodeSid: acpSid, alreadyLive: false, origin: "raw" };
+}
+
+/**
+ * Tail size for the TUI resume replay. Bounded so a long store session does
+ * not push thousands of chunk notifications into one window; turn-aligned
+ * by sliceTail (a slice can run slightly past the limit to a turn start).
+ */
+const MARTTY_RESUME_TAIL = 200;
+
+/**
+ * How many of the tail's most recent turns keep their tool records in the
+ * TUI replay. Multi-turn sessions hold hundreds of tool rows; even folded
+ * (martty's default) they scroll the conversation out of the terminal —
+ * older turns replay chat text only. Editors are unaffected (session/load
+ * replays full fidelity).
+ */
+const MARTTY_TOOL_TURN_WINDOW = 2;
+
+/** True when the connecting client is Martty, the bundled TUI frontend. */
+function isMarttyClient(server: ZcodeAcpServer): boolean {
+  // Sticky flag first: clientName is last-write-wins and a remote client's
+  // initialize can land between the TUI's initialize and its session/new.
+  return server.marttyClientSeen || (server.clientName ?? "").toLowerCase().includes("martty");
+}
+
+/**
+ * Stream a resumed session's history to the TUI as chunk updates — the same
+ * wire form session/load replays (chunks fold in Martty; complete-form
+ * user/agent messages do not). Editors are unaffected: they replay through
+ * session/load and would double-render a resume replay.
+ */
+async function replayResumeHistory(
+  server: ZcodeAcpServer,
+  cx: acp.AgentContext,
+  acpSid: string,
+  zcodeSid: string,
+): Promise<void> {
+  // Guarded fetch (a resume flight settles the store, but a capped flight
+  // leaves hydration running — fetchMessagesForReplay re-settles then) INSIDE
+  // the batch: the guard must be held across the session/messages RPC.
+  // Fetched outside, a prompt landing in that window dispatches live turn
+  // updates through the lock-free fast path (enqueueSessionSend) and the TUI
+  // renders the new turn ABOVE the history that arrives afterwards.
+  await withReplayBatch(acpSid, async () => {
+    const messages = await fetchMessagesForReplay(server, zcodeSid);
+    if (messages.length === 0) return;
+    const slice = sliceTail(messages, MARTTY_RESUME_TAIL);
+    await replayMessages(cx, acpSid, slice.batch, { toolTurnWindow: MARTTY_TOOL_TURN_WINDOW });
+    log(
+      `session/resume: replayed ${slice.meta.replayedMessages} messages for the TUI` +
+        ` (tail ${MARTTY_RESUME_TAIL} of ${slice.meta.totalMessages} on record)`,
+    );
+  });
+}
+
+/**
+ * Surface a resume failure honestly, keyed on WHY the id is known. Always
+ * throws. Two not-found shapes get an actionable message:
+ * - raw (id unknown to bridge AND alias store): a placeholder whose durable
+ *   alias was lost/expired — or a deleted imported session.
+ * - mapped/placeholder (alias points at a zcodeSid): the backend session
+ *   itself was deleted/evicted — the link is fine, the target is gone.
+ * Any OTHER failure (transient timeout, lock, network) keeps the backend's
+ * own error: guessing a cause for it would misreport it.
+ */
+function translateResumeFailure(
+  methodLabel: "session/resume" | "session/load",
+  acpSid: string,
+  origin: "mapped" | "placeholder" | "raw",
+  e: unknown,
+): never {
+  const raw = e instanceof Error ? e.message : String(e);
+  if (!/不存在|not\s*found/i.test(raw)) throw e;
+  if (origin === "raw") {
+    warn(`${methodLabel}: ${acpSid} unknown to bridge and alias store (backend said: ${raw})`);
+    throw new Error(messages().loadUnknownAlias(acpSid));
+  }
+  warn(`${methodLabel}: ${acpSid} → backend session no longer exists (backend said: ${raw})`);
+  throw new Error(messages().sessionEvicted(acpSid));
 }
 
 /** `session/resume` → zcode `session/resume` (with runtimeModel overlay). */
@@ -396,13 +920,15 @@ export async function resumeSession(
   // The Session Root never comes from the client (params.cwd is ignored):
   // start from what the bridge recorded, then let the backend's own resume
   // result correct it below — a remote client must not move a session's
-  // file scope by sending its own cwd.
-  let cwd = authoritativeSessionCwd(server, acpSid);
+  // file scope by sending its own cwd. Serve mode (ADR-0014) skips both
+  // sources: the bridge exists for ONE hub-chosen project, so the root (and
+  // the workspace sent to the backend's resume) stays the process cwd.
+  let cwd = server.serveMode ? process.cwd() : authoritativeSessionCwd(server, acpSid);
 
   // Lazy placeholders (session/new) resolve to their real backend session
   // here; alreadyLive targets skip the resume RPC because the session is live
   // in this backend subprocess.
-  const { zcodeSid, alreadyLive } = await resolveResumeTarget(server, acpSid);
+  const { zcodeSid, alreadyLive, origin } = await resolveResumeTarget(server, acpSid);
 
   if (!alreadyLive) {
     // No runtimeModel pinning here: the session keeps its own persisted
@@ -416,23 +942,37 @@ export async function resumeSession(
     };
     // ACP session/resume may also carry mcpServers; the backend's resume
     // schema accepts the same array shape (verified: an unknown key would be
-    // rejected before the session lookup).
-    if (params.mcpServers && params.mcpServers.length > 0) {
-      zcParams.mcpServers = params.mcpServers;
-    }
+    // rejected before the session lookup). Remembered as session-lifetime
+    // state so later reloads keep re-sending them (#193).
+    rememberSessionMcpServers(server, acpSid, params.mcpServers);
+    const storedMcp = server.sessionMcpServers.get(acpSid);
+    if (storedMcp) zcParams.mcpServers = storedMcp;
     // Push the provider registry BEFORE resume: a resumed session may carry a
     // third-party model in its history, and the backend needs the provider
     // registered to even process the resume turn.
     await syncProviderRegistry(server, cwd);
-    const resumeResult = await resumePreservingModel(server, zcParams);
+    let resumeResult: unknown;
+    try {
+      const outcome = await resumePreservingModel(server, zcParams);
+      resumeResult = outcome.result;
+    } catch (e) {
+      translateResumeFailure("session/resume", acpSid, origin, e);
+    }
     // The resume RPC succeeded — the session is now loaded in this backend.
     server.markBackendLoaded(acpSid);
     // The session kept its own model — repair it only if it's no longer enabled.
     await repairUnavailableModel(server, zcodeSid);
     // The backend's session record is the root authority: adopt its
     // workspace as the session root (heals any stale/polluted entry).
+    // Serve mode keeps its pinned cwd (see above) — and a session that
+    // genuinely lives in ANOTHER workspace is refused outright: a raw
+    // backend id from session/list elsewhere must not be replayed through
+    // a serve bridge pinned to one project.
     const backendWs = workspaceFromResumeResult(resumeResult);
-    if (backendWs) cwd = backendWs;
+    if (backendWs && !server.serveMode) cwd = backendWs;
+    if (server.serveMode && backendWs && !sameProjectDir(backendWs, process.cwd())) {
+      throw new Error("session belongs to another workspace");
+    }
   }
 
   server.registerSession(acpSid, zcodeSid);
@@ -442,15 +982,167 @@ export async function resumeSession(
   log(`session/resume -> ${zcodeSid}`);
   server.ensureBackgroundListener(zcodeSid);
   await adoptStoredTitle(server, acpSid, zcodeSid);
+  // Martty's /resume rides session/resume (no history by ACP design) and only
+  // folds updates addressed to a session id it has already adopted — i.e.
+  // delivered AFTER the resume response (pre-response updates are dropped;
+  // verified against martty 0.2.35). setImmediate lets the response write
+  // first: microtasks (the SDK's response send) drain before immediates.
+  if (isMarttyClient(server)) {
+    setImmediate(() => {
+      // The replay's fetch is marker-guarded (see fetchMessagesForReplay): a
+      // resume flight settles the store before this session/resume returned,
+      // and a capped flight leaves the marker for the replay to re-settle.
+      replayResumeHistory(server, cx, acpSid, zcodeSid).catch((e) => {
+        warn(
+          `session/resume: TUI history replay failed (non-fatal): ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        );
+      });
+    });
+  }
   // Initial usage_update so the editor shows the context bar immediately for a
   // resumed session (mirrors Python _on_session_resume → _emit_initial_usage).
   await emitInitialUsage(server, cx, acpSid, zcodeSid, getOrCreateDiffer(server, zcodeSid));
   const modes = await buildModes(server, zcodeSid);
   server.lastMode.set(acpSid, modes.currentModeId);
+  scheduleQuotaDockBackstop(server);
   return {
     modes,
-    configOptions: await buildConfigOptions(server, zcodeSid),
+    configOptions: await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx)),
   };
+}
+
+/**
+ * `/resume` slash command: rebind the CURRENT ACP session (an editor thread)
+ * to an existing backend session and replay its history into that thread —
+ * the editor-side path for adopting a conversation started elsewhere (TUI /
+ * App), complementing Zed's Import Threads (which needs a manual import
+ * step). Only an EMPTY thread may adopt: a thread that already has a
+ * conversation can neither merge nor replace history cleanly (the editor has
+ * already rendered its own copy).
+ *
+ * Mirrors the alreadyLive-branch tail of `session/load`: provider registry →
+ * faithful resume → mapping + cwd → title adoption → full-history replay →
+ * differ baseline + plan/usage emission.
+ */
+export async function resumeIntoSession(
+  server: ZcodeAcpServer,
+  cx: acp.AgentContext,
+  acpSid: string,
+  zcodeTarget: string,
+): Promise<{ ok: true; title: string | undefined } | { ok: false; error: string }> {
+  // A turn running on either end of the rebind would race the replay.
+  const busySid = [...server.pendingTurns.values()].some(
+    (t) => t.zcodeSid === zcodeTarget || t.zcodeSid === server.resolveSid(acpSid),
+  );
+  if (busySid) return { ok: false, error: messages().slashResumeBusy };
+
+  if (!server.pendingSessions.has(acpSid)) {
+    const current = server.resolveSid(acpSid);
+    if (current === zcodeTarget) return { ok: true, title: server.sessionTitles.get(acpSid) };
+    if (current) {
+      let existing: Awaited<ReturnType<typeof fetchMessages>>;
+      try {
+        // Only emptiness matters here: one stored message answers it, so the
+        // native tail cap keeps a huge session's /resume cheap.
+        existing = await fetchMessages(server, current, { ...TURN_READ, limit: 1 });
+      } catch {
+        // Cannot prove the thread empty — refuse rather than orphan history.
+        return { ok: false, error: messages().slashResumeNotEmpty };
+      }
+      if (existing.length > 0) return { ok: false, error: messages().slashResumeNotEmpty };
+      // Materialized but empty: discard the orphan backend session and the
+      // stale mappings before adopting the target.
+      try {
+        server.ensureBackend().send("session/close", { sessionId: current });
+      } catch (e) {
+        log(
+          `/resume: closing empty session ${current} failed (ignored): ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      server.sessionMap.delete(acpSid);
+      server.acpSidByZcodeSid.delete(current);
+      server.backendLoadedSessions.delete(acpSid);
+    }
+  } else {
+    // Never-materialized placeholder: the lazy record re-attaches below via
+    // recordMaterializedSession; drop the pending entry so nothing creates a
+    // fresh backend session on a later first-use path.
+    server.pendingSessions.delete(acpSid);
+  }
+  // The adopted session's stored title wins over the placeholder's first-
+  // prompt auto-title.
+  server.titleEligibleSessions.delete(acpSid);
+  // Same for the user-rename pin: it belonged to the discarded placeholder
+  // thread, not the adopted conversation.
+  server.titleUserSetBy.delete(acpSid);
+
+  const cwd = server.serveMode ? process.cwd() : authoritativeSessionCwd(server, acpSid);
+  // Settled history when a resume flight ran (performer OR joiner — the
+  // flight settles hydration before resolving); the read below then uses the
+  // flight's snapshot instead of re-querying mid-hydration.
+  let settledHistory: ZcodeMessage[] | undefined;
+  try {
+    await syncProviderRegistry(server, cwd);
+    const outcome = await resumePreservingModel(server, {
+      sessionId: zcodeTarget,
+      workspace: workspaceFor(cwd),
+      // Session-lifetime MCP set keeps riding every resume (#193).
+      ...(server.sessionMcpServers.get(acpSid)
+        ? { mcpServers: server.sessionMcpServers.get(acpSid) }
+        : {}),
+    });
+    settledHistory = outcome.history;
+    server.markBackendLoaded(acpSid);
+    await repairUnavailableModel(server, zcodeTarget);
+    server.registerSession(acpSid, zcodeTarget);
+    const backendWs = workspaceFromResumeResult(outcome.result);
+    const finalCwd = backendWs && !server.serveMode ? backendWs : cwd;
+    server.sessionCwds.set(acpSid, finalCwd);
+    recordMaterializedSession(acpSid, zcodeTarget, finalCwd);
+    server.ensureBackgroundListener(zcodeTarget);
+    await adoptStoredTitle(server, acpSid, zcodeTarget);
+  } catch (e) {
+    warn(`/resume: adopting ${zcodeTarget} failed (${e instanceof Error ? e.message : String(e)})`);
+    return { ok: false, error: messages().slashResumeFailed };
+  }
+
+  // Fetch inside the batch (see replayResumeHistory): the guard must cover
+  // the history RPC, or a concurrent prompt renders above the replay.
+  await withReplayBatch(acpSid, async () => {
+    const history = settledHistory ?? (await fetchMessagesForReplay(server, zcodeTarget));
+    if (history.length > 0) server.markSessionActive(acpSid);
+    const slice = fullSlice(history);
+    await replayMessages(cx, acpSid, slice.batch, {
+      // TUI condensation (see MARTTY_TOOL_TURN_WINDOW) — an editor typing
+      // /resume keeps full-fidelity replay.
+      toolTurnWindow: isMarttyClient(server) ? MARTTY_TOOL_TURN_WINDOW : undefined,
+    });
+    log(
+      `/resume: replayed ${slice.meta.replayedMessages} messages into ${acpSid.slice(0, 8)}` +
+        ` (total ${slice.meta.totalMessages})`,
+    );
+  });
+
+  // Same baseline dance as session/load: mark history seen so the next turn's
+  // completion diff does not re-emit it, then emit the current todos from a
+  // throwaway differ and the initial context-usage bar.
+  try {
+    const snapshot = await buildSnapshot(server, zcodeTarget);
+    getOrCreateDiffer(server, zcodeTarget).diff(snapshot);
+    const planEvents = new ProjectionDiffer().diffPlan(snapshot.todos ?? []);
+    for (const iev of planEvents) {
+      await dispatchEvent(server, cx, acpSid, iev, `resume_${randomUUID().slice(0, 8)}`);
+    }
+  } catch (e) {
+    log(
+      `/resume: initial plan read failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+  await emitInitialUsage(server, cx, acpSid, zcodeTarget, getOrCreateDiffer(server, zcodeTarget));
+
+  return { ok: true, title: server.sessionTitles.get(acpSid) };
 }
 
 /**
@@ -461,37 +1153,60 @@ export async function loadSession(
   server: ZcodeAcpServer,
   params: acp.LoadSessionRequest,
   cx: acp.AgentContext,
+  opts: { replayHistory?: boolean } = {},
 ): Promise<acp.LoadSessionResponse> {
   const acpSid = params.sessionId;
   if (!acpSid) throw new Error("sessionId required");
   // The Session Root never comes from the client (params.cwd is ignored):
   // start from what the bridge recorded, then let the backend's own resume
   // result correct it below — a remote client must not move a session's
-  // file scope by sending its own cwd.
-  let cwd = authoritativeSessionCwd(server, acpSid);
+  // file scope by sending its own cwd. Serve mode (ADR-0014) pins the root
+  // (and the workspace sent to resume) to the process cwd throughout.
+  let cwd = server.serveMode ? process.cwd() : authoritativeSessionCwd(server, acpSid);
 
   // Same placeholder resolution as resumeSession; alreadyLive targets skip the
   // backend resume RPC (the session is live in this subprocess).
-  const { zcodeSid, alreadyLive } = await resolveResumeTarget(server, acpSid);
+  const { zcodeSid, alreadyLive, origin } = await resolveResumeTarget(server, acpSid);
+  // Settled history from a resume flight THIS call took part in (performer or
+  // joiner — the flight settles hydration before resolving, so using its
+  // snapshot is the mid-hydration-prefix guard; undefined = alreadyLive).
+  let settledHistory: ZcodeMessage[] | undefined;
 
   if (!alreadyLive) {
     const zcParams: Record<string, unknown> = {
       sessionId: zcodeSid,
       workspace: workspaceFor(cwd),
     };
+    // Same mcpServers contract as resume: the client may re-declare them on
+    // load; a stored set keeps riding along when it doesn't (#193).
+    rememberSessionMcpServers(server, acpSid, params.mcpServers);
+    const storedMcp = server.sessionMcpServers.get(acpSid);
+    if (storedMcp) zcParams.mcpServers = storedMcp;
     // Push the provider registry BEFORE resume: a loaded session may carry a
     // third-party model in its history, and the backend needs the provider
     // registered to process it.
     await syncProviderRegistry(server, cwd);
-    const resumeResult = await resumePreservingModel(server, zcParams);
+    let resumeResult: unknown;
+    try {
+      const outcome = await resumePreservingModel(server, zcParams);
+      resumeResult = outcome.result;
+      settledHistory = outcome.history;
+    } catch (e) {
+      translateResumeFailure("session/load", acpSid, origin, e);
+    }
     // The resume RPC succeeded — the session is now loaded in this backend.
     server.markBackendLoaded(acpSid);
     // The session kept its own model — repair it only if it's no longer enabled.
     await repairUnavailableModel(server, zcodeSid);
     // The backend's session record is the root authority: adopt its
     // workspace as the session root (heals any stale/polluted entry).
+    // Serve mode keeps its pinned cwd (see above) — and refuses sessions
+    // from another workspace outright (same rule as resumeSession).
     const backendWs = workspaceFromResumeResult(resumeResult);
-    if (backendWs) cwd = backendWs;
+    if (backendWs && !server.serveMode) cwd = backendWs;
+    if (server.serveMode && backendWs && !sameProjectDir(backendWs, process.cwd())) {
+      throw new Error("session belongs to another workspace");
+    }
   }
   server.registerSession(acpSid, zcodeSid);
   // Same as resumeSession: backend-authoritative session root for file access.
@@ -500,20 +1215,72 @@ export async function loadSession(
   server.ensureBackgroundListener(zcodeSid);
   await adoptStoredTitle(server, acpSid, zcodeSid);
 
-  const messages = await fetchMessages(server, zcodeSid);
-  // History on disk = real interaction (covers untitled sessions resumed from
-  // a previous bridge lifetime) — make the session discoverable remotely.
-  if (messages.length > 0) server.markSessionActive(acpSid);
+  // Goal-loop restart recovery (ADR-0022 §6): surface a recovery hint at most
+  // once per bridge process per session — never auto-resume a spend-incurring
+  // loop the user may have meant to stop. A LIVE driver means a second client
+  // attached mid-loop: no hint at all. Only a persisted "running" status
+  // (running without a driver = the bridge died mid-loop) gets the
+  // interrupted wording; user-visible paused states get a neutral line.
+  {
+    const { GoalLoopDriver } = await import("../goal-loop/driver.js");
+    const { readGoalState } = await import("../goal-loop/state.js");
+    if (!GoalLoopDriver.live(server, zcodeSid) && !server.goalLoopLoadHints.has(zcodeSid)) {
+      const prior = readGoalState(cwd, zcodeSid);
+      const interrupted = prior?.status === "running";
+      if (prior && (interrupted || prior.status.startsWith("paused"))) {
+        server.goalLoopLoadHints.add(zcodeSid);
+        await sendTextChunk(
+          cx,
+          acpSid,
+          interrupted ? messages().goalHintInterrupted(prior.objective) : messages().goalHintPaused,
+          `goalhint_${randomUUID().slice(0, 8)}`,
+        ).catch(() => undefined);
+      }
+    }
+  }
+
   // Tail replay (Proposal 0001): a `_meta.zcode.limit` replays only the last
   // N messages aligned to turn boundaries — the full replay stays the default
   // for editors that send no `_meta` (Zed path unchanged).
   const limit = readTailLimit(params);
-  const slice = limit === null ? fullSlice(messages) : sliceTail(messages, limit);
-  await withReplayBatch(acpSid, () => replayMessages(cx, acpSid, slice.batch));
-  log(
-    `session/load: replayed ${slice.meta.replayedMessages} messages` +
-      `${limit === null ? "" : ` (tail limit ${limit}, total ${slice.meta.totalMessages})`}`,
-  );
+  // Named `history` — a local `messages` would shadow the i18n `messages()`
+  // helper (TDZ crash from a catch block). A resume flight's SETTLED snapshot
+  // is the mid-hydration guard; only an already-live session (no flight) falls
+  // back to a plain read — which fetchMessagesForReplay upgrades to a settle
+  // poll when the last flight capped out mid-hydration.
+  let slice: ReplaySlice;
+  if (opts.replayHistory === false) {
+    // Boot-resume interception (session/new): the terminal TUI client does not
+    // render replayed updates (its transcript lives in its own local store)
+    // and blocks on the response until the replay finishes — so skip the
+    // dispatch. The differ baseline below still runs, so the next turn's
+    // completion diff does not re-emit the historical messages.
+    const history = settledHistory ?? (await fetchMessagesForReplay(server, zcodeSid));
+    // History on disk = real interaction (covers untitled sessions resumed from
+    // a previous bridge lifetime) — make the session discoverable remotely.
+    if (history.length > 0) server.markSessionActive(acpSid);
+    slice = limit === null ? fullSlice(history) : sliceTail(history, limit);
+    log(
+      `session/load: history replay skipped (boot-resume); ${slice.meta.totalMessages} messages on record`,
+    );
+  } else {
+    // The whole fetch+replay runs INSIDE the batch (see replayResumeHistory):
+    // a prompt landing while the history RPC is in flight must queue behind
+    // the batch, not dispatch above the replayed history.
+    slice = await withReplayBatch(acpSid, async () => {
+      const history = settledHistory ?? (await fetchMessagesForReplay(server, zcodeSid));
+      if (history.length > 0) server.markSessionActive(acpSid);
+      const batchSlice = limit === null ? fullSlice(history) : sliceTail(history, limit);
+      await replayMessages(cx, acpSid, batchSlice.batch);
+      // total M always logged: a first-entry total below the session's real size
+      // is the signature of a mid-hydration read (see fetchMessagesSettled).
+      log(
+        `session/load: replayed ${batchSlice.meta.replayedMessages} messages` +
+          ` (total ${batchSlice.meta.totalMessages}${limit === null ? "" : `, tail limit ${limit}`})`,
+      );
+      return batchSlice;
+    });
+  }
 
   // Replay the existing todo list as an initial plan so a loaded session shows
   // its todos immediately.
@@ -549,20 +1316,632 @@ export async function loadSession(
   const turnActive = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
   const result = {
     modes,
-    configOptions: await buildConfigOptions(server, zcodeSid),
+    configOptions: await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx)),
     // Additive replay metadata — the anchor for load_earlier pagination.
     replayMeta: { ...slice.meta, turnActive },
   };
+  scheduleQuotaDockBackstop(server);
   return result as acp.LoadSessionResponse;
 }
 
-/** `session/prompt` → subscribe-before-send, run the event-driven turn loop. */
+/**
+ * `session/prompt` → subscribe-before-send, run the event-driven turn loop.
+ *
+ * Sandbox allow-restart chaining (ADR-0011): when a turn unwinds as cancelled
+ * because the user approved a new writable root (the backend was killed to be
+ * respawned under the widened profile), the continuation prompt runs INSIDE
+ * this same request via runPrompt. The editor's spinner then spans the
+ * respawn+reload window and the resumed work renders as the same turn. A
+ * detached follow-up prompt (the previous design) has no pending editor
+ * request behind it, so the editor showed no running state for it at all —
+ * the window read as "it just stopped", any message typed there preempted
+ * the continuation for real, and only the session/load replay later surfaced
+ * the orphaned continuation bubble.
+ */
 export async function prompt(
   server: ZcodeAcpServer,
   params: acp.PromptRequest,
   cx: acp.AgentContext,
   requestId: number | string,
+  client?: acp.AgentContext,
 ): Promise<acp.PromptResponse> {
+  let result = await runPrompt(server, params, cx, requestId, false, client);
+  // Sandbox-allow continuation chaining, BOUNDED: each batched restart
+  // cancels the in-flight round and queues a continuation for prompt() to
+  // consume. A LATER batch (the user approving a second popup seconds after
+  // the first window flushed) cancels the continuation round itself and
+  // queues its own continuation — with single-shot consumption that entry
+  // would be orphaned and later hijack an UNRELATED cancelled prompt (ESC,
+  // preempt, drain gate). Loop so each cancelled round adopts the newest
+  // continuation; the bound keeps a pathological cycle from chaining
+  // forever.
+  for (let hop = 0; hop < 3; hop++) {
+    const continuation = server.sandboxContinuations.get(params.sessionId);
+    if (!continuation || result.stopReason !== "cancelled") break;
+    server.sandboxContinuations.delete(params.sessionId);
+    // Same request, fresh round: runPrompt re-enters the whole machinery
+    // (ensureBackend respawns; ensureRealSession/subscribe-recovery reloads
+    // the session into it). The user's preempt/ESC during the continuation
+    // still cancels it — the round registers itself in pendingTurns.
+    try {
+      result = await runPrompt(
+        server,
+        { sessionId: params.sessionId, prompt: [{ type: "text", text: continuation }] },
+        cx,
+        `sandbox-cont-${randomUUID()}`,
+        true,
+        client,
+      );
+    } catch (e) {
+      // The chained round runs right after a sandbox-allow respawn, inside
+      // the fresh backend's warm-up window. A failure here used to propagate
+      // as an RPC error and leave the session dead-silent with the
+      // continuation lost — the user had to blindly resend to recover
+      // (observed in production logs: "历史任务使用的模型已不可用" rejected
+      // the automatic send, a manual resend a minute later went through).
+      // Tell the user what happened and how to resume instead.
+      const err = e instanceof Error ? e.message : String(e);
+      warn(`sandbox: continuation prompt failed: ${err}`);
+      await sendTextChunk(
+        cx,
+        params.sessionId,
+        messages().sandboxContinuationFailed(err),
+        randomUUID(),
+      ).catch(() => undefined);
+      // A leftover continuation for THIS cancelled round is now orphaned —
+      // drop it rather than let a later cancelled prompt adopt it.
+      server.sandboxContinuations.delete(params.sessionId);
+      return { stopReason: "cancelled" };
+    }
+  }
+  // prompt() is returning: nothing may consume this session's continuation
+  // afterwards, so unconditionally drop any entry that slipped in late
+  // (e.g. a flush timer firing inside the end_turn epilogue window, before
+  // the finally deletes the pendingTurns entry) — leaving it would let an
+  // unrelated cancelled prompt adopt it later.
+  server.sandboxContinuations.delete(params.sessionId);
+  return result;
+}
+
+/**
+ * Options for {@link runOneTurn}: everything the round machinery needs that
+ * is not derivable from the server/session pair. `turn` MUST already be
+ * registered in `server.pendingTurns` under `requestId` by the caller (the
+ * prompt path does it inside withPreemptLock; the goal-loop driver likewise).
+ */
+export interface RunOneTurnOptions {
+  backend: ZcodeBackend;
+  cx: acp.AgentContext;
+  acpSid: string;
+  zcodeSid: string;
+  requestId: number | string;
+  turn: PendingTurn;
+  /** True when this send cancelled another in-flight prompt (gates attribution). */
+  preempted: boolean;
+  /** Wire text for the backend send (slash-neutralized on the prompt path). */
+  sendText: string;
+  attachments?: unknown[];
+  /** Sandbox allow-restart continuation round (emits the resumed status line). */
+  continuationRound?: boolean;
+  /** Run the env-gated maybeAutoCompact after an end_turn. Default true. */
+  autoCompact?: boolean;
+}
+
+/**
+ * One backend round, shared by the prompt path and the goal-loop driver
+ * (ADR-0022): listener + differ baseline, subscribe with -32004 eviction
+ * recovery, send-busy retry, drain gate after a recent cancel, the
+ * event-driven turn loop with transient-failure retry, and the finally
+ * cleanup (pendingTurns deregistration, discovery/quota refresh, turnState).
+ * Every line here encodes an observed production failure — never reimplement
+ * a second send/subscribe/retry path.
+ */
+export async function runOneTurn(
+  server: ZcodeAcpServer,
+  opts: RunOneTurnOptions,
+): Promise<acp.PromptResponse> {
+  const { cx, acpSid, zcodeSid, requestId, turn, preempted, sendText } = opts;
+  // `backend`/`listener`/`monitor` are reassigned by the backend-lost recovery
+  // below (respawn swaps the process they are bound to).
+  let backend = opts.backend;
+  const attachments = opts.attachments ?? [];
+  // Out-of-band running indicator: emitted per attached alias (see
+  // server.sessionAliases) so a client holding this conversation under a
+  // different ACP id opens its live turn too. Best-effort: a dead client must
+  // not fail the turn.
+  const emitTurnState = async (running: boolean): Promise<void> => {
+    const results = await Promise.allSettled(
+      server
+        .sessionAliases(acpSid)
+        .map((sid) => cx.notify("$/zcode/turnState", { sessionId: sid, running })),
+    );
+    for (const r of results) {
+      if (r.status === "rejected") {
+        log(
+          `turnState notify failed: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
+        );
+      }
+    }
+  };
+
+  let listener = new EventStreamListener(backend, zcodeSid);
+  let monitor = new TurnMonitor(backend, zcodeSid, () => server.nextId());
+  // Per-session ProjectionDiffer (persists across turns). The baseline mark_seen
+  // prevents the differ from re-emitting history at turn completion.
+  const differ = getOrCreateDiffer(server, zcodeSid);
+  // Marker-guarded read: a prefix baseline during armed hydration would make
+  // the completion diff re-emit the messages hydration later appends.
+  const baselineMsgs = await fetchMessagesForReplay(server, zcodeSid);
+  differ.markSeen(baselineMsgs);
+
+  // Subscribe BEFORE send so we don't lose early turn.completed on short turns.
+  // subscribe() throws on failure, surfacing the backend's real error (reader
+  // dead, timeout, pipe broken, method-not-found on old CLI, session error) so
+  // the cause is distinguishable. Clean up the pending turn before propagating.
+  let snapshot: ZcodeSnapshot;
+  try {
+    try {
+      snapshot = await listener.subscribe(() => server.nextId());
+    } catch (e) {
+      // The backend evicts idle resident runtimes (~10min) and can drop them
+      // under its LRU cap even sooner — an evicted session fails every
+      // session-scoped RPC with code -32004 "Session is not active" although
+      // the session file is intact. Recover by reloading it (session/resume
+      // is idempotent) and retrying the subscribe once; any other error, or
+      // a second failure, propagates to the editor.
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/session is not active/i.test(msg)) throw e;
+      log(`turn: session ${zcodeSid} no longer active in backend — reloading via session/resume`);
+      await reloadBackendSession(server, acpSid, zcodeSid);
+      // The pre-subscribe fetchMessages ran against the evicted session and
+      // came back empty — re-baseline the differ so turn completion doesn't
+      // diff-replay the whole history as new output. The reload revives the
+      // same store, so the anchor still points at real history and the read
+      // stays scoped to what arrived since.
+      differ.markSeen(await fetchMessagesSinceAnchor(server, zcodeSid, differ.historyAnchor));
+      snapshot = await listener.subscribe(() => server.nextId());
+    }
+    // A successful subscribe proves the resident runtime is live — refresh
+    // the verification so concurrent/later entry points skip a reload.
+    server.markBackendLoaded(acpSid);
+  } catch (e) {
+    server.pendingTurns.delete(requestId);
+    await emitTurnState(false);
+    throw e;
+  }
+  // subscribe() requests includeSnapshot:false (it only needs the eventSeq
+  // watermark to arm the event stream), so `snapshot` is an empty fallback.
+  // The real projection baseline comes from fetchMessages + differ.markSeen
+  // above. Kept as a binding only so the call fits the Promise-returning shape.
+  void snapshot;
+  backend.registerEventListener(zcodeSid, listener);
+  // Armed (not run) on a successful end_turn — the finally starts the detached
+  // compaction AFTER this turn's cleanup (see runAutoCompactDetached).
+  let autoCompactDue = false;
+
+  try {
+    // Transient turn failures (e.g. provider network blips surfaced as
+    // turn.failed with cause code model_request_failed) are retried by
+    // re-sending the prompt and re-running the event loop, instead of
+    // surfacing a hard error that stops the session. Non-transient failures
+    // (send rejected, non-transient turn error) propagate immediately. After
+    // exhausting retries on a transient error we degrade gracefully: emit a
+    // user-visible message and return end_turn so the session stays usable.
+    // 1 initial attempt + 5 retries. Backoff grows exponentially then caps so
+    // later retries don't keep stretching: 1s, 2s, 4s, 4s, 4s.
+    const MAX_TURN_ATTEMPTS = 6;
+    const MAX_BACKOFF_MS = 4000;
+    const backoffMs = (attempt: number): number =>
+      Math.min(1000 * 2 ** (attempt - 1), MAX_BACKOFF_MS);
+    let lastTurnError: Record<string, unknown> | null = null;
+    // Backend-lost (process died / storage closed mid-turn) gets its own cap:
+    // each recovery respawns the subprocess, so an unbounded retry would churn.
+    const MAX_BACKEND_LOST_RETRIES = 2;
+    let backendLostRetries = 0;
+    let suppressRetryNotice = false;
+
+    for (let attempt = 1; attempt <= MAX_TURN_ATTEMPTS; attempt++) {
+      if (attempt > 1) {
+        // A prior transient turn ended the backend turn; before re-sending,
+        // reconcile the differ baseline so the retried turn's new messages
+        // aren't treated as already-seen, surface a retry hint, then back off.
+        if (turn.cancelled) {
+          stopBackendTurn(server, zcodeSid, turn);
+          return { stopReason: "cancelled" };
+        }
+        differ.markSeen(await fetchMessagesSinceAnchor(server, zcodeSid, differ.historyAnchor));
+        if (!suppressRetryNotice) {
+          await sendTextChunk(
+            cx,
+            acpSid,
+            messages().networkRetry(attempt - 1, MAX_TURN_ATTEMPTS - 1),
+            randomUUID(),
+          );
+        }
+        suppressRetryNotice = false;
+        log(
+          `  [retry] transient turn failed, re-sending (attempt ${attempt}/${MAX_TURN_ATTEMPTS})`,
+        );
+        await sleep(backoffMs(attempt - 1));
+      }
+
+      const chunkMsgId = randomUUID();
+
+      // Drain gate: a recent cancel/preempt means the backend side needs
+      // settling before the send — see drainBackendAfterCancel. EXEMPT while a
+      // detached auto-compact runs: it legitimately holds the prompt lock, and
+      // the gate's close escalation would tear down the resident runtime and
+      // kill the compaction — the busy-reject below rejects the send outright
+      // instead of waiting it out.
+      const cancelledRecently =
+        server.lastCancelledAt.get(zcodeSid) !== undefined &&
+        Date.now() - server.lastCancelledAt.get(zcodeSid)! < DRAIN_WINDOW_MS &&
+        !server.autoCompactInFlight.has(zcodeSid);
+      // Drain gate, behavior-adaptive: on a backend that has REJECTED a send
+      // with the whole-turn busy error (0.16.9 — sendPrompt's
+      // activeAbortController guard spans the entire turn), a mid-turn send
+      // is never accepted as steer, so the send loop's busy-retry below is
+      // the authoritative readiness probe and the pre-send poll (with its
+      // close-escalation) is skipped. Backends that never showed the
+      // rejection (0.16.5: a mid-generation send is accepted as steer and
+      // silently dropped) keep the full gate.
+      const drainRan = cancelledRecently && !server.observedSendBusyReject;
+      if (drainRan) {
+        const drained = await drainBackendAfterCancel(server, {
+          acpSid,
+          zcodeSid,
+          turn,
+          listener,
+          monitor: new TurnMonitor(backend, zcodeSid, () => server.nextId()),
+          differ,
+          cx,
+        });
+        if (drained === "cancelled") return { stopReason: "cancelled" };
+      }
+
+      // Send the prompt, retrying while the backend reports it's still busy.
+      // The backend's prompt lock is the single authoritative readiness signal:
+      // a rejected send (1308 "prompt is running" on 0.16.5; -32010 "A prompt
+      // is already running for this session" spanning the WHOLE turn on
+      // 0.16.9) means a previous turn (cancelled, preempted, or still
+      // finalising) hasn't released the lock yet. Rather than guessing when
+      // the backend is ready — or blocking on a local shadow flag — we retry
+      // with a fixed delay until the backend accepts. This covers the preempt
+      // path (new prompt interrupting an in-flight one) and the
+      // stop-recovery window after a manual cancel.
+      const SEND_RETRY_INTERVAL_MS = 500;
+      const SEND_RETRY_TIMEOUT_MS = 30_000;
+      // Cold-start rejections recover in seconds (observed); a longer budget
+      // would spin pointlessly when the model is PERMANENTLY unavailable.
+      const WARMUP_RETRY_TIMEOUT_MS = 10_000;
+      const sendParams =
+        attachments.length > 0
+          ? { sessionId: zcodeSid, content: sendText, attachments }
+          : { sessionId: zcodeSid, content: sendText };
+      const sendT0 = Date.now();
+      let sendAttempt = 0;
+      let queuedNoticeSent = false;
+      while (true) {
+        if (turn.cancelled) {
+          stopBackendTurn(server, zcodeSid, turn);
+          return { stopReason: "cancelled" };
+        }
+        sendAttempt++;
+        // Wait before sending when a recent cancel/preempt makes a busy reject
+        // likely — right after stop the backend is in its recovery window and
+        // will reject an immediate send. On the first attempt with no recent
+        // cancel, send immediately so normal prompts aren't delayed.
+        const recentCancel = server.lastCancelledAt.get(zcodeSid);
+        // With whole-turn busy semantics a rejection is cheap and retried —
+        // no need to pre-sleep after a cancel on such backends.
+        const expectBusy =
+          sendAttempt > 1 ||
+          (!server.observedSendBusyReject &&
+            recentCancel !== undefined &&
+            Date.now() - recentCancel < SEND_RETRY_TIMEOUT_MS);
+        if (expectBusy) {
+          await sleep(SEND_RETRY_INTERVAL_MS);
+          if (turn.cancelled) {
+            stopBackendTurn(server, zcodeSid, turn);
+            return { stopReason: "cancelled" };
+          }
+        }
+        const sendResp = await backend.request(server.nextId(), "session/send", sendParams, 15000);
+        if (!sendResp.error) {
+          const accepted = (sendResp.result ?? {}) as { accepted?: boolean };
+          if (accepted.accepted) {
+            // A retried send means another turn (typically the cancelled
+            // one) was still unwinding during our attempts and commits its
+            // residue AFTER this turn's pre-send baseline. The drain gate
+            // re-baselines after its wait; the fast path has no wait, so
+            // re-baseline here or the completion diff replays that residue
+            // as this turn's output. Same for a recent cancel whose drain
+            // gate was skipped (busy-reject backend): the cancelled turn's
+            // finalization can still land inside the subscribe round-trip.
+            // The residue is appended after the anchor, so the native
+            // cursor scopes the read to exactly what must be marked seen.
+            if (sendAttempt > 1 || (cancelledRecently && !drainRan)) {
+              differ.markSeen(
+                await fetchMessagesSinceAnchor(server, zcodeSid, differ.historyAnchor),
+              );
+            }
+            // From this moment the turn may own a running generation —
+            // stopBackendTurn's compaction guard no longer spares it.
+            turn.sendAccepted = true;
+            break; // backend took it → turn starts
+          }
+          throw new Error("zcode send not accepted");
+        }
+        const sendErrCode = sendResp.error.code;
+        const sendErrMsg = (sendResp.error.message ?? "").toLowerCase();
+        const isBusy =
+          sendErrCode === 1308 ||
+          sendErrMsg.includes("prompt is running") ||
+          sendErrMsg.includes("already running");
+        // Whole-turn busy rejection observed (code AND message: -32010 is
+        // shared by unrelated errors, e.g. "Subagent sessions are read-only")
+        // — this backend never accepts a mid-turn send as steer. Disarm the
+        // drain gate's pre-send poll for the rest of this backend process.
+        if (
+          isBusy &&
+          sendErrCode === -32010 &&
+          sendErrMsg.includes("already running") &&
+          !server.observedSendBusyReject
+        ) {
+          server.observedSendBusyReject = true;
+          log("  [send] whole-turn busy rejection observed — drain gate disarmed for this backend");
+        }
+        const isWarming = isTransientSendError(sendResp.error.message ?? "");
+        if (!isBusy && !isWarming) {
+          // Permanent error (auth, malformed, a truly removed model, …) —
+          // don't retry, surface it. The stale-history-model case is
+          // repaired before the send (repairUnavailableModel on every
+          // resume path); the cold-start form is transient and retries below.
+          throw new Error(`zcode send failed: ${sendResp.error.message ?? ""}`);
+        }
+        // A background NOTIFICATION turn (the model summarising a finished
+        // background task) holds the prompt lock and easily outlives the normal
+        // busy budget — it is a real model turn, and the send WILL be accepted
+        // once it drains (observed live 2026-09-18: -32010 "A prompt is already
+        // running for this session" while the notify turn ran). Extend the
+        // budget instead of failing the user's prompt. The window is bounded by
+        // freshness: if the listener never saw the notification turn's terminal
+        // event (dropped stream), the stale marker must not extend busy waits
+        // forever — a marker older than 10 minutes is ignored.
+        const NOTIFY_TURN_BUSY_TIMEOUT_MS = 180_000;
+        const NOTIFY_TURN_STALE_MS = 600_000;
+        const notifySince = server.notifyTurnActiveSince.get(zcodeSid);
+        const notifyActive =
+          notifySince !== undefined && Date.now() - notifySince < NOTIFY_TURN_STALE_MS;
+        // A detached auto-compact is the opposite case: REJECT instead of
+        // waiting. This turn's listener is already subscribed, so the
+        // compaction's internal AI turn is streaming its residue into our
+        // queue right now; queueing behind the lock until it releases would
+        // dispatch that residue as THIS prompt's output (its turn.completed
+        // ends the turn before the real reply even starts). Reject at once:
+        // the notice asks the user to resend, the queued residue dies with
+        // this turn's listener unregister in the finally, and
+        // turn.compactRejected lets the goal-loop driver (no user to resend)
+        // wait the compaction out and retry the round.
+        if (isBusy && server.autoCompactInFlight.has(zcodeSid)) {
+          // Goal rounds get no user-directed notice: the driver retries them
+          // automatically — a "resend" instruction would point at an internal
+          // dispatch prompt the user never typed (the driver announces its
+          // own wait note instead).
+          if (!turn.goalLoop) {
+            await sendTextChunk(cx, acpSid, messages().autoCompactBusy, randomUUID());
+          }
+          turn.compactRejected = true;
+          return { stopReason: "max_turn_requests" };
+        }
+        const busyBudget = Math.max(
+          notifyActive ? NOTIFY_TURN_BUSY_TIMEOUT_MS : 0,
+          SEND_RETRY_TIMEOUT_MS,
+        );
+        const budget = isBusy ? busyBudget : WARMUP_RETRY_TIMEOUT_MS;
+        if (Date.now() - sendT0 > budget) {
+          throw new Error(
+            `zcode send failed: ${isBusy ? "backend still busy" : "send keeps being rejected"} after ${Math.round(budget / 1000)}s (${sendResp.error.message ?? ""})`,
+          );
+        }
+        // Fast-path parity with the drain gate's wait note: the pre-send
+        // poll was skipped (whole-turn busy semantics), so this busy wait is
+        // the first thing telling the user their prompt queues behind a
+        // turn. Legacy backends got the note from the drain itself.
+        if (isBusy && !drainRan && !queuedNoticeSent && !turn.goalLoop) {
+          queuedNoticeSent = true;
+          await sendTextChunk(cx, acpSid, messages().promptQueuedBehindTurn, randomUUID());
+        }
+        log(
+          `  [send] backend ${isBusy ? "busy" : "cold-start reject"} (${sendResp.error.message ?? ""}), retrying in ${SEND_RETRY_INTERVAL_MS}ms`,
+        );
+      }
+
+      // Continuation round status line: the respawn+reload window (~seconds)
+      // shows only the editor spinner before the model's first output — a
+      // bare thinking block with no context. Announce the resumed turn at
+      // send-accept so every phase of the allow→restart→continue flow is
+      // visibly accounted for (the allow-time hint covers the restart start).
+      if (opts.continuationRound) {
+        await sendTextChunk(cx, acpSid, messages().sandboxResumedStatus, randomUUID());
+      }
+
+      try {
+        // Event-driven turn loop: translate events via EventTranslator + dispatch.
+        // Arm the attribution gate also on a recent cancel: the abandoned turn
+        // is still finalising in the backend (stops are honored on 0.16.9 but
+        // finalisation still trails the stop), and its leftover deltas stream
+        // past the subscribe of this new prompt (see the gate comment in
+        // runEventTurn).
+        const gateArmed =
+          preempted ||
+          Date.now() - (server.lastCancelledAt.get(zcodeSid) ?? 0) < CANCEL_RESIDUE_WINDOW_MS;
+        const result = await runEventTurn(
+          server,
+          listener,
+          monitor,
+          differ,
+          cx,
+          acpSid,
+          chunkMsgId,
+          turn,
+          gateArmed,
+        );
+
+        // Auto-compact: if context usage exceeds the threshold, compact before
+        // the NEXT prompt needs the room. Configured via
+        // ZCODE_ACP_AUTO_COMPACT_THRESHOLD (absolute token count; 0/unset =
+        // disabled). Only on end_turn — cancelled/max_turn_requests skips
+        // compaction, as does a stall-recovered end_turn (the completion was
+        // inferred by the stall heuristic, not confirmed by turn.completed —
+        // compressing an in-flight task's would destroy the work).
+        // ARMED here, RUN detached from the finally: awaiting it inside the
+        // turn kept the finished turn in pendingTurns for the whole
+        // compaction, so any cancel/follow-up preempt killed the compaction's
+        // internal turn (stop + drain close-escalation) while waitForTurnIdle
+        // still reported a false "✓ compressed". Detached, the response
+        // returns at once and the running indicator settles before the
+        // compaction too.
+        autoCompactDue =
+          opts.autoCompact !== false && result.stopReason === "end_turn" && !turn.stallRecovered;
+
+        return result;
+      } catch (e) {
+        // Backend lost (process died / storage closed mid-turn): recover by
+        // respawning the backend and reloading the session, then retry the
+        // turn. The session file is intact — only the process is gone.
+        if (e instanceof TurnFailedError && !turn.cancelled && isBackendLostError(e.turnError)) {
+          if (backendLostRetries >= MAX_BACKEND_LOST_RETRIES) throw turnFailureRequestError(e);
+          backendLostRetries++;
+          const lostDetail = formatTurnError(e.turnError);
+          log(
+            `  [recover] backend lost (${lostDetail}) — respawning and reloading session ${zcodeSid} (recovery ${backendLostRetries}/${MAX_BACKEND_LOST_RETRIES})`,
+          );
+          // The backend is process-wide: every other session's in-flight turn
+          // on it is dead too — cancel them so their loops unwind instead of
+          // hanging on the dead reader. goalLoop turns are skipped: they have
+          // their OWN backend-lost recovery (driver-level respawn + reload);
+          // marking them cancelled here would end their loop as "paused" and
+          // defeat the recovery this commit exists for. Skipped loops hit the
+          // dead-reader fast-fail below and recover on their own. This turn
+          // may still be marked (non-goal-loop caller); restore its flags so
+          // the retry below is not mistaken for a user cancel.
+          server.cancelAllPendingTurns(true);
+          turn.cancelled = false;
+          turn.stopSent = false;
+          // Kill the broken instance unless it already died — and only null
+          // the server's reference when it still points at OUR instance, so a
+          // concurrent respawn by someone else is never murdered.
+          if (!backend.isDead) {
+            if (server.backend === backend) server.backend = null;
+            void backend
+              .close()
+              .catch((err: unknown) =>
+                warn(
+                  `recover: backend kill failed: ${err instanceof Error ? err.message : String(err)}`,
+                ),
+              );
+          }
+          try {
+            backend = server.ensureBackend();
+            listener = new EventStreamListener(backend, zcodeSid);
+            monitor = new TurnMonitor(backend, zcodeSid, () => server.nextId());
+            await reloadBackendSession(server, acpSid, zcodeSid);
+            await listener.subscribe(() => server.nextId());
+            backend.registerEventListener(zcodeSid, listener);
+          } catch (recoverErr) {
+            warn(
+              `recover: backend respawn/reload failed: ${recoverErr instanceof Error ? recoverErr.message : String(recoverErr)}`,
+            );
+            throw turnFailureRequestError(e);
+          }
+          differ.markSeen(await fetchMessagesSinceAnchor(server, zcodeSid, differ.historyAnchor));
+          await sendTextChunk(
+            cx,
+            acpSid,
+            messages().backendRecovered(backendLostRetries, MAX_BACKEND_LOST_RETRIES),
+            randomUUID(),
+          );
+          // The retry notice at the top of the next attempt would duplicate
+          // the recovery announcement above.
+          suppressRetryNotice = true;
+          continue;
+        }
+        // Only a transient TurnFailedError is retryable; everything else (send
+        // failures, non-transient turn errors, exhausted retries, cancellation)
+        // propagates to the caller.
+        if (e instanceof TurnFailedError) {
+          const transient = isTransientTurnError(e.turnError);
+          if (attempt < MAX_TURN_ATTEMPTS && !turn.cancelled && transient) {
+            lastTurnError = e.turnError;
+            continue;
+          }
+          if (!transient) throw turnFailureRequestError(e);
+        }
+        throw e;
+      }
+    }
+
+    // All retries exhausted on a transient error → degrade gracefully. Keep the
+    // session usable so the user can resend the message instead of the editor
+    // surfacing a hard error and stopping. Skip auto-compact here: compaction
+    // after a failed turn is more likely to confuse state than help.
+    // Goal-loop turns are the exception: returning end_turn here would let the
+    // driver parse the PREVIOUS round's assistant text as this round's verdict
+    // and mis-mark the ticket done — throw so the loop pauses cleanly instead.
+    if (turn.goalLoop) {
+      throw turnFailureRequestError(new TurnFailedError(lastTurnError ?? {}));
+    }
+    const errMsg = formatTurnError(lastTurnError) || "turn failed after retries";
+    await sendTextChunk(cx, acpSid, messages().requestFailed(errMsg), randomUUID());
+    return { stopReason: "end_turn" };
+  } finally {
+    backend.unregisterEventListener(zcodeSid, listener);
+    server.pendingTurns.delete(requestId);
+    // Turn end = session activity — refresh the discovery summary and mark the
+    // session discoverable regardless of outcome (end_turn, cancelled, retries
+    // exhausted). Also refresh the backend-loaded verification: the resident
+    // runtime was demonstrably live through this turn.
+    server.markSessionActive(acpSid);
+    server.markBackendLoaded(acpSid);
+    // Turn end = quota refresh point (ADR-0021): usage moved, the dock should
+    // catch up immediately instead of waiting for the 60s interval.
+    void forceRefreshQuota();
+    // Report "running" only while no other turn for the session took over
+    // (preempt): the preempting turn's own running:true must survive.
+    const stillBusy = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
+    await emitTurnState(stillBusy);
+    // Start the armed auto-compact ONLY now, after deregistration and the
+    // running:false turnState: from here on a cancel or follow-up prompt finds
+    // no turn to preempt (the compaction is untouchable housekeeping), and a
+    // prompt racing it is rejected outright instead of killing it.
+    if (autoCompactDue) {
+      try {
+        const { runAutoCompactDetached } = await import("../config/auto-compact.js");
+        runAutoCompactDetached(server, cx, acpSid, zcodeSid);
+      } catch (e) {
+        // Never let the arming failure mask the completed turn's result.
+        warn(`auto-compact arming failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+}
+
+/** One prompt round: subscribe-before-send, run the event-driven turn loop. */
+async function runPrompt(
+  server: ZcodeAcpServer,
+  params: acp.PromptRequest,
+  cx: acp.AgentContext,
+  requestId: number | string,
+  continuationRound = false,
+  client?: acp.AgentContext,
+): Promise<acp.PromptResponse> {
+  // Project-level sandbox flip (ADR-0011): a .zcode/acp/sandbox.json created
+  // after the backend spawned unsandboxed must arm on THIS prompt, not on the
+  // next bridge restart — kill the old process; the ensureBackend() below
+  // respawns under the profile and the subscribe-recovery path reloads the
+  // session. No-op unless the config appeared mid-run.
+  await server.applySandboxFlip();
   const backend = server.ensureBackend();
 
   // Extract prompt text + image attachments from ACP ContentBlock[].
@@ -572,15 +1951,52 @@ export async function prompt(
   // may drag in an image with no accompanying text).
   if (!text && attachments.length === 0) throw new Error("empty prompt");
 
+  // Boot-resume banner handshake (see BOOT_RESUME_TRIGGER): martty queues the
+  // auto-submitted trigger until its boot bind, so it arrives as the FIRST
+  // prompt OF THAT CONNECTION — ack with one chunk and end the turn without
+  // touching the backend. Scoped to the arming connection's identity: a
+  // phone app attached to the same bridge may prompt inside the boot window
+  // and must neither spend nor disarm the handshake (observed live: its
+  // prompt raced ahead and the trigger leaked to the model). The same
+  // connection submitting anything else first means the auto-submit was
+  // lost — disarm so the trigger text typed manually later stays a normal
+  // prompt.
+  if (
+    server.bootResumeTriggerConnection !== null &&
+    clientConnectionRoot(client) === server.bootResumeTriggerConnection
+  ) {
+    server.bootResumeTriggerConnection = null;
+    if (text === BOOT_RESUME_TRIGGER) {
+      await sendTextChunk(cx, params.sessionId, messages().bootResumeAck, randomUUID());
+      log("session/prompt: boot-resume banner handshake acknowledged");
+      return { stopReason: "end_turn" };
+    }
+  }
+
   // Materialize a lazy session/new placeholder on first use. Placed after the
   // empty-prompt check so an invalid request doesn't create a backend session.
   const zcodeSid = await ensureRealSession(server, params.sessionId);
+  // Re-arm the session's out-of-band listeners (background tasks, backend
+  // titles): a mid-session backend respawn (sandbox flip, dynamic allow
+  // batches, dead-reader recovery) replaces the instance the listeners were
+  // registered on — ensureBackgroundListener re-registers on the current one.
+  server.ensureBackgroundListener(zcodeSid);
 
   // Slash-command interception: dispatches directly to ZCode methods and
   // returns end_turn without entering the turn loop. Known passthrough
   // commands and unknown /x both return null for the normal turn loop.
   const { handleSlashCommand, neutralizeSlashText } = await import("./slash.js");
-  const intercepted = await handleSlashCommand(server, cx, params.sessionId, zcodeSid, text);
+  // `client` (the requesting connection) rides along so replay-shaped slash
+  // dispatch — /resume's history replay above all — targets that connection
+  // instead of the broadcast cx (see resumeIntoSession).
+  const intercepted = await handleSlashCommand(
+    server,
+    cx,
+    params.sessionId,
+    zcodeSid,
+    text,
+    client,
+  );
   if (intercepted) return intercepted;
 
   // Wire text for the backend: unknown `/x` prompts (not advertised commands)
@@ -605,10 +2021,52 @@ export async function prompt(
   // events before this turn's turn.started belong to a backend-owned turn
   // (e.g. auto-resumed after compaction) that this send was steered into.
   let preempted = false;
+  // Goal-loop parking (ADR-0022 §3): a live loop owns this session's turn
+  // cadence. Park the prompt on the driver — its text merges into the next
+  // round, and the parked request resolves when that round completes —
+  // instead of preempting and cancelling the in-flight goal turn. Checked
+  // INSIDE the preempt lock: the check and the registration are one critical
+  // section, so an /auto start racing this prompt can't register its round
+  // after the check yet before the park (the driver registers through the
+  // same lock). Slash commands /auto pause|resume|stop|status were
+  // intercepted above, so anything reaching here is conversational input.
+  let parked: Promise<acp.PromptResponse> | undefined;
+  // Set when the compaction gate below rejected this prompt.
+  let compactBusy = false;
+  // A sandbox continuation has no user watching to resend it: wait the
+  // compaction out instead of hitting the rejection gate. The wait happens
+  // BEFORE any subscribe, so it is residue-free by construction.
+  if (continuationRound && server.autoCompactInFlight.has(zcodeSid)) {
+    const { waitForAutoCompactIdle } = await import("../config/auto-compact.js");
+    await waitForAutoCompactIdle(server, zcodeSid);
+  }
   await withPreemptLock(server, zcodeSid, async () => {
+    const goalLoop = server.goalLoops?.get(zcodeSid);
+    if (goalLoop) {
+      parked = goalLoop.parkPrompt(sendText);
+      return;
+    }
+    // Compaction gate: a detached auto-compact holds the backend prompt lock
+    // for minutes. NEVER queue behind it — this prompt's listener subscribes
+    // before the send, so waiting out the compaction would accumulate its
+    // whole internal-turn stream in our queue and dispatch it as THIS
+    // prompt's output once the lock releases (its turn.completed even ends
+    // the turn before the real reply starts). Reject with a resend notice;
+    // runOneTurn's busy-reject fallback covers the arm race between this
+    // check and the send.
+    if (server.autoCompactInFlight.has(zcodeSid)) {
+      compactBusy = true;
+      return;
+    }
     server.pendingTurns.set(requestId, turn);
     preempted = preemptInFlightTurn(server, zcodeSid, requestId);
   });
+  if (parked) return parked;
+  if (compactBusy) {
+    await sendTextChunk(cx, params.sessionId, messages().autoCompactBusy, randomUUID());
+    log("session/prompt: rejected — a detached auto-compact is in flight");
+    return { stopReason: "max_turn_requests" };
+  }
   // Discovery: the session is live the moment its turn STARTS — mark it active
   // here instead of only at turn end, so a freshly created conversation shows
   // up in remote lists within one heartbeat even while its first (possibly
@@ -639,6 +2097,7 @@ export async function prompt(
         ?.slice(0, 80) ?? text.slice(0, 80);
     server.sessionTitles.set(params.sessionId, title);
     server.touchSessionSummary(params.sessionId, title);
+    refreshTerminalTabTitle(server, params.sessionId);
     const { updateSessionTitle } = await import("../tasks-index.js");
     void updateSessionTitle(zcodeSid, title, text);
     void sendSessionUpdate(cx, params.sessionId, {
@@ -649,233 +2108,48 @@ export async function prompt(
   }
   // Out-of-band running indicator: clients that did not send this prompt
   // (re-attached mobile, second editor) learn the turn started here — the
-  // session/load replayMeta only snapshots attach time. Best-effort: a dead
+  // session/load replayMeta only snapshots attach time. Emitted per attached
+  // alias (see server.sessionAliases) so a client holding this conversation
+  // under a different ACP id opens its live turn too. Best-effort: a dead
   // client must not fail the turn.
-  const emitTurnState = (running: boolean): Promise<void> =>
-    cx
-      .notify("$/zcode/turnState", { sessionId: params.sessionId, running })
-      .catch((e) => log(`turnState notify failed: ${e instanceof Error ? e.message : String(e)}`));
+  const emitTurnState = async (running: boolean): Promise<void> => {
+    const results = await Promise.allSettled(
+      server
+        .sessionAliases(params.sessionId)
+        .map((sid) => cx.notify("$/zcode/turnState", { sessionId: sid, running })),
+    );
+    for (const r of results) {
+      if (r.status === "rejected") {
+        log(
+          `turnState notify failed: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
+        );
+      }
+    }
+  };
   await emitTurnState(true);
 
-  const listener = new EventStreamListener(backend, zcodeSid);
-  const monitor = new TurnMonitor(backend, zcodeSid, () => server.nextId());
-
-  // Per-session ProjectionDiffer (persists across turns). The baseline mark_seen
-  // prevents the differ from re-emitting history at turn completion.
-  const differ = getOrCreateDiffer(server, zcodeSid);
-  const baselineMsgs = await fetchMessages(server, zcodeSid);
-  differ.markSeen(baselineMsgs);
-
-  // Subscribe BEFORE send so we don't lose early turn.completed on short turns.
-  // subscribe() throws on failure, surfacing the backend's real error (reader
-  // dead, timeout, pipe broken, method-not-found on old CLI, session error) so
-  // the cause is distinguishable. Clean up the pending turn before propagating
-  // — this call site is outside the try/finally below.
-  let snapshot: ZcodeSnapshot;
-  try {
-    try {
-      snapshot = await listener.subscribe(() => server.nextId());
-    } catch (e) {
-      // The backend evicts idle resident runtimes (~10min) and can drop them
-      // under its LRU cap even sooner — an evicted session fails every
-      // session-scoped RPC with code -32004 "Session is not active" although
-      // the session file is intact. Recover by reloading it (session/resume
-      // is idempotent) and retrying the subscribe once; any other error, or
-      // a second failure, propagates to the editor.
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!/session is not active/i.test(msg)) throw e;
-      log(`prompt: session ${zcodeSid} no longer active in backend — reloading via session/resume`);
-      await reloadBackendSession(server, params.sessionId, zcodeSid);
-      // The pre-subscribe fetchMessages ran against the evicted session and
-      // came back empty — re-baseline the differ so turn completion doesn't
-      // diff-replay the whole history as new output.
-      differ.markSeen(await fetchMessages(server, zcodeSid));
-      snapshot = await listener.subscribe(() => server.nextId());
-    }
-    // A successful subscribe proves the resident runtime is live — refresh
-    // the verification so concurrent/later entry points skip a reload.
-    server.markBackendLoaded(params.sessionId);
-  } catch (e) {
-    server.pendingTurns.delete(requestId);
-    await emitTurnState(false);
-    throw e;
-  }
-  // subscribe() requests includeSnapshot:false (it only needs the eventSeq
-  // watermark to arm the event stream), so `snapshot` is an empty fallback.
-  // The real projection baseline comes from fetchMessages + differ.markSeen
-  // above. Kept as a binding only so the call fits the Promise-returning shape.
-  void snapshot;
-  backend.registerEventListener(zcodeSid, listener);
-
-  try {
-    // Transient turn failures (e.g. provider network blips surfaced as
-    // turn.failed with cause code model_request_failed) are retried by
-    // re-sending the prompt and re-running the event loop, instead of
-    // surfacing a hard error that stops the session. Non-transient failures
-    // (send rejected, non-transient turn error) propagate immediately. After
-    // exhausting retries on a transient error we degrade gracefully: emit a
-    // user-visible message and return end_turn so the session stays usable.
-    // 1 initial attempt + 5 retries. Backoff grows exponentially then caps so
-    // later retries don't keep stretching: 1s, 2s, 4s, 4s, 4s.
-    const MAX_TURN_ATTEMPTS = 6;
-    const MAX_BACKOFF_MS = 4000;
-    const backoffMs = (attempt: number): number =>
-      Math.min(1000 * 2 ** (attempt - 1), MAX_BACKOFF_MS);
-    let lastTurnError: Record<string, unknown> | null = null;
-
-    for (let attempt = 1; attempt <= MAX_TURN_ATTEMPTS; attempt++) {
-      if (attempt > 1) {
-        // A prior transient turn ended the backend turn; before re-sending,
-        // reconcile the differ baseline so the retried turn's new messages
-        // aren't treated as already-seen, surface a retry hint, then back off.
-        if (turn.cancelled) {
-          stopBackendTurn(server, zcodeSid);
-          return { stopReason: "cancelled" };
-        }
-        differ.markSeen(await fetchMessages(server, zcodeSid));
-        await sendTextChunk(
-          cx,
-          params.sessionId,
-          `[网络异常，正在重试 (${attempt - 1}/${MAX_TURN_ATTEMPTS - 1})…]`,
-          randomUUID(),
-        );
-        log(
-          `  [retry] transient turn failed, re-sending (attempt ${attempt}/${MAX_TURN_ATTEMPTS})`,
-        );
-        await sleep(backoffMs(attempt - 1));
-      }
-
-      const chunkMsgId = randomUUID();
-
-      // Send the prompt, retrying while the backend reports it's still busy.
-      // The backend's prompt lock is the single authoritative readiness signal:
-      // a rejected send (code 1308 "prompt is running") means a previous turn
-      // (cancelled, preempted, or still finalising) hasn't released the lock
-      // yet. Rather than guessing when the backend is ready — or blocking on a
-      // local shadow flag — we retry with a fixed delay until the backend
-      // accepts. This covers the preempt path (new prompt interrupting an
-      // in-flight one) and the stop-recovery window after a manual cancel.
-      const SEND_RETRY_INTERVAL_MS = 500;
-      const SEND_RETRY_TIMEOUT_MS = 30_000;
-      const sendParams =
-        attachments.length > 0
-          ? { sessionId: zcodeSid, content: sendText, attachments }
-          : { sessionId: zcodeSid, content: sendText };
-      const sendT0 = Date.now();
-      let sendAttempt = 0;
-      while (true) {
-        if (turn.cancelled) {
-          stopBackendTurn(server, zcodeSid);
-          return { stopReason: "cancelled" };
-        }
-        sendAttempt++;
-        // Wait before sending when a recent cancel/preempt makes a busy reject
-        // likely — right after stop the backend is in its recovery window and
-        // will reject an immediate send. On the first attempt with no recent
-        // cancel, send immediately so normal prompts aren't delayed.
-        const recentCancel = server.lastCancelledAt.get(zcodeSid);
-        const expectBusy =
-          sendAttempt > 1 ||
-          (recentCancel !== undefined && Date.now() - recentCancel < SEND_RETRY_TIMEOUT_MS);
-        if (expectBusy) {
-          await sleep(SEND_RETRY_INTERVAL_MS);
-          if (turn.cancelled) {
-            stopBackendTurn(server, zcodeSid);
-            return { stopReason: "cancelled" };
-          }
-        }
-        const sendResp = await backend.request(server.nextId(), "session/send", sendParams, 15000);
-        if (!sendResp.error) {
-          const accepted = (sendResp.result ?? {}) as { accepted?: boolean };
-          if (accepted.accepted) break; // backend took it → turn starts
-          throw new Error("zcode send not accepted");
-        }
-        const sendErrCode = sendResp.error.code;
-        const sendErrMsg = (sendResp.error.message ?? "").toLowerCase();
-        const isBusy =
-          sendErrCode === 1308 ||
-          sendErrMsg.includes("prompt is running") ||
-          sendErrMsg.includes("already running");
-        if (!isBusy) {
-          // Non-busy error (auth, malformed, etc.) — don't retry, surface it.
-          throw new Error(`zcode send failed: ${sendResp.error.message ?? ""}`);
-        }
-        if (Date.now() - sendT0 > SEND_RETRY_TIMEOUT_MS) {
-          throw new Error(
-            `zcode send failed: backend still busy after ${Math.round(SEND_RETRY_TIMEOUT_MS / 1000)}s (${sendResp.error.message ?? ""})`,
-          );
-        }
-        log(
-          `  [send] backend busy (${sendResp.error.message ?? ""}), retrying in ${SEND_RETRY_INTERVAL_MS}ms`,
-        );
-      }
-
-      try {
-        // Event-driven turn loop: translate events via EventTranslator + dispatch.
-        const result = await runEventTurn(
-          server,
-          listener,
-          monitor,
-          differ,
-          cx,
-          params.sessionId,
-          chunkMsgId,
-          turn,
-          preempted,
-        );
-
-        // (Session title: already set once at the FIRST prompt, before the
-        // turn loop — nothing here may change it again.)
-
-        // Auto-compact: if context usage exceeds the threshold, compact before
-        // returning so the next prompt has room. Configured via
-        // ZCODE_ACP_AUTO_COMPACT_THRESHOLD (absolute token count; 0/unset =
-        // disabled). Only on end_turn — cancelled/max_turn_requests skips
-        // compaction, as does a stall-recovered end_turn (the completion was
-        // inferred by the stall heuristic, not confirmed by turn.completed —
-        // compressing an in-flight task's context would destroy the work).
-        // Best-effort: failures are logged inside maybeAutoCompact, never thrown.
-        if (result.stopReason === "end_turn" && !turn.stallRecovered) {
-          const { maybeAutoCompact } = await import("../config/auto-compact.js");
-          await maybeAutoCompact(server, cx, params.sessionId, zcodeSid);
-        }
-
-        return result;
-      } catch (e) {
-        // Only a transient TurnFailedError is retryable; everything else (send
-        // failures, non-transient turn errors, exhausted retries, cancellation)
-        // propagates to the caller.
-        if (
-          e instanceof TurnFailedError &&
-          attempt < MAX_TURN_ATTEMPTS &&
-          !turn.cancelled &&
-          isTransientTurnError(e.turnError)
-        ) {
-          lastTurnError = e.turnError;
-          continue;
-        }
-        throw e;
-      }
-    }
-
-    // A retry budget is not successful completion. The native adapter must
-    // inspect/settle the same session before anybody can send another turn.
-    throw new TurnFailedError(lastTurnError ?? { message: "turn failed after retries" });
-  } finally {
-    backend.unregisterEventListener(zcodeSid, listener);
-    server.pendingTurns.delete(requestId);
-    // Turn end = session activity — refresh the discovery summary and mark the
-    // session discoverable regardless of outcome (end_turn, cancelled, retries
-    // exhausted). Also refresh the backend-loaded verification: the resident
-    // runtime was demonstrably live through this turn.
-    server.markSessionActive(params.sessionId);
-    server.markBackendLoaded(params.sessionId);
-    // Report "running" only while no other turn for the session took over
-    // (preempt): the preempting turn's own running:true must survive.
-    const stillBusy = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
-    await emitTurnState(stillBusy);
-  }
+  return runOneTurn(server, {
+    backend,
+    cx,
+    acpSid: params.sessionId,
+    zcodeSid,
+    requestId,
+    turn,
+    preempted,
+    sendText,
+    attachments,
+    continuationRound,
+  });
 }
+
+/** How long after a cancel a new prompt's attribution gate stays armed (the
+ *  abandoned turn may still be streaming its finalisation into the backend). */
+const CANCEL_RESIDUE_WINDOW_MS = 120_000;
+
+/** How long after a cancel/preempt a new prompt still runs the drain gate
+ *  (drainBackendAfterCancel) before sending — same bound as the drain wait
+ *  itself, so the gate never waits twice its window. */
+const DRAIN_WINDOW_MS = 90_000;
 
 /**
  * `session/set_config_option` → dispatch model/mode/thought and emit the
@@ -889,14 +2163,37 @@ export async function setConfigOptionHandler(
   if (typeof params.value !== "string") {
     throw new Error(`unsupported config value type: ${String(params.value)}`);
   }
+  // The `quota` option (ADR-0021) is a read-only display channel for the TUI
+  // dock — setting it is a no-op that returns the current options unchanged.
+  if (params.configId === "quota") {
+    return {
+      configOptions: await buildConfigOptions(
+        server,
+        server.resolveSid(params.sessionId) ?? null,
+        clientConnectionRoot(cx),
+      ),
+    };
+  }
   // Materialize a lazy session/new placeholder on first use.
   const zcodeSid = await ensureRealSession(server, params.sessionId);
   const { setConfigOption, emitConfigOptionUpdate } = await import("../config/options.js");
-  const result = await setConfigOption(server, zcodeSid, params.configId, params.value);
+  const result = await setConfigOption(
+    server,
+    zcodeSid,
+    params.configId,
+    params.value,
+    params.sessionId,
+  );
   if (!result) {
     throw new Error(`unsupported config option or switch failed: ${params.configId}`);
   }
-  const options = await emitConfigOptionUpdate(server, cx, params.sessionId, zcodeSid, result.kind);
+  const { options } = await emitConfigOptionUpdate(
+    server,
+    cx,
+    params.sessionId,
+    zcodeSid,
+    result.kind,
+  );
   return { configOptions: options };
 }
 
@@ -916,9 +2213,11 @@ export async function setConfigOptionHandler(
  * on a session with no active turn, and on a turn already aborted), so firing
  * it eagerly is safe; the loop's `stopSent` guard prevents a second send.
  *
- * `turn.cancelled` is still set so the turn loop switches to its silent-drain
- * path (translate to detect turnDone, but discard every internal event — no
- * text/tool/usage is pushed after the user stopped).
+ * `turn.cancelled` is still set so the turn loop returns at once (the backend
+ * ignores session/stop — verified 0.16.5, the model stream runs to its natural
+ * end — so waiting for a terminal event would hang the stop for the whole
+ * remaining generation). The loop's return resolves session/prompt with
+ * stopReason "cancelled" immediately.
  */
 export async function cancel(
   server: ZcodeAcpServer,
@@ -930,28 +2229,32 @@ export async function cancel(
   // prior turn is still finalising, pendingTurns holds both it and any newer
   // prompt waiting on the backend's prompt lock; breaking on the first match
   // could leave the live one running. Each turn guards its own stopSent, so
-  // multiple matching turns may each fire session/stop once — the backend
-  // treats stop as idempotent, so the duplicate is harmless.
-  let stopSent = false;
+  // multiple matching turns may each fire the stop pair once — the backend
+  // treats both as idempotent, so the duplicate is harmless.
+  let matched = false;
   for (const [, turn] of server.pendingTurns) {
     if (turn.zcodeSid === zcodeSid) {
+      matched = true;
       turn.cancelled = true;
       if (!turn.stopSent) {
-        stopBackendTurn(server, zcodeSid);
-        turn.stopSent = true; stopSent = true;
+        stopBackendTurn(server, zcodeSid, turn);
+        turn.stopSent = true;
       }
       // Record cancel time so a prompt arriving in the backend's ~20s
       // model-connection recovery window can fast-fail instead of hanging.
       server.lastCancelledAt.set(zcodeSid, Date.now());
     }
   }
-  // Background-task completion can start a backend turn after the ACP prompt
-  // request has already returned. Such a turn has no pendingTurns entry, but
-  // the app-server still reports the root Session as running. Stop it eagerly;
-  // session/stop is idempotent when there is no active backend turn.
-  if (!stopSent) {
-    stopBackendTurn(server, zcodeSid);
-    server.lastCancelledAt.set(zcodeSid, Date.now());
+  // ESC during a goal loop's quiet windows (compact()'s internal wait, the
+  // judge/announce awaits) has no pendingTurns entry to flag — park the pause
+  // on the driver instead; it takes effect at the next round boundary.
+  // Best-effort: never break cancel for non-goal sessions.
+  if (!matched) {
+    try {
+      server.goalLoops?.get(zcodeSid)?.requestPause();
+    } catch (e) {
+      log(`goal-loop pause request failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   log(`session/cancel → ${zcodeSid}`);
 }
@@ -971,6 +2274,81 @@ class TurnFailedError extends Error {
   }
 }
 
+interface AcpTurnFailureData {
+  type: "zcode_turn_failed";
+  code?: string;
+  reason?: string;
+  statusCode?: number;
+  providerCode?: string;
+  retryable?: boolean;
+  retryAfterMs?: number;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/** Build a small, safe ACP error payload from a backend turn failure. */
+function acpTurnFailureData(turnError: Record<string, unknown>): AcpTurnFailureData {
+  const cause = asRecord(turnError["cause"]) ?? turnError;
+  const context = asRecord(cause["context"]);
+  const summary = asRecord(context?.["responseBodySummary"]);
+  const headers = asRecord(summary?.["responseHeaders"]);
+  const retryAfterMs =
+    finiteNumber(context?.["retryAfterMs"]) ??
+    (() => {
+      const seconds = finiteNumber(headers?.["retry-after"]);
+      return seconds === undefined ? undefined : seconds * 1000;
+    })();
+
+  const data: AcpTurnFailureData = { type: "zcode_turn_failed" };
+  const code = cause["code"] ?? cause["type"];
+  if (typeof code === "string" && code.trim()) data.code = code;
+  const reason = context?.["reason"];
+  if (typeof reason === "string" && reason.trim()) data.reason = reason;
+  const statusCode = finiteNumber(context?.["statusCode"] ?? context?.["responseStatus"]);
+  if (statusCode !== undefined) data.statusCode = statusCode;
+  const providerCode = context?.["providerCode"];
+  if (typeof providerCode === "string" && providerCode.trim()) data.providerCode = providerCode;
+  const retryable = context?.["retryable"];
+  if (typeof retryable === "boolean") data.retryable = retryable;
+  if (retryAfterMs !== undefined) data.retryAfterMs = retryAfterMs;
+  return data;
+}
+
+function turnFailureRequestError(error: TurnFailedError): RequestError {
+  const cause = asRecord(error.turnError["cause"]);
+  const detail = formatTurnError(cause ?? error.turnError) || error.message;
+  return new RequestError(
+    -32603,
+    `ZCode turn failed: ${detail}`,
+    acpTurnFailureData(error.turnError),
+  );
+}
+
+/**
+ * Whether a thrown error is the RequestError form of a backend-lost turn
+ * failure (as produced by turnFailureRequestError). The goal-loop uses this
+ * to choose between respawn-and-continue and a hard pause.
+ */
+export function isBackendLostRequestError(e: unknown): boolean {
+  if (!(e instanceof RequestError)) return false;
+  const data = (e.data ?? {}) as { code?: unknown; reason?: unknown };
+  return (
+    isBackendLostError({ cause: { code: data.code, message: e.message } }) ||
+    isBackendLostError({ cause: { message: data.reason } })
+  );
+}
+
 /**
  * Fire-and-forget `session/stop` to the backend. Mirrors Python's
  * `_cancel_backend_turn`: send stop with an id (some backends route by id
@@ -981,7 +2359,22 @@ class TurnFailedError extends Error {
  * backend's prompt lock releases when ITS finalisation completes — that,
  * not any bridge-side signal, is what the next prompt's send-retry waits on.
  */
-function stopBackendTurn(server: ZcodeAcpServer, zcodeSid: string): void {
+function stopBackendTurn(server: ZcodeAcpServer, zcodeSid: string, turn: PendingTurn): void {
+  const foregroundExecutionId = turn.foregroundExecutionId;
+  // A turn whose send was NEVER accepted owns no generation of its own; while
+  // our detached compaction runs, the only thing foreground on this session
+  // is the compaction's internal turn — an unguarded stop here (ESPECIALLY
+  // the v4 stop, which "targets whatever is currently foreground") would
+  // kill it. ESC on a prompt parked in the compaction wait is exactly how
+  // that happens. Once the send WAS accepted the turn may own a generation
+  // (turn.started — and with it the execution id — can lag, or never arrive
+  // on a deaf stream), so the stop pair always fires for accepted turns.
+  if (!foregroundExecutionId && !turn.sendAccepted && server.autoCompactInFlight.has(zcodeSid)) {
+    log(
+      `  [stop] turn never started and a detached compaction is running for ${zcodeSid} — skipping the stop pair`,
+    );
+    return;
+  }
   try {
     server.ensureBackend().send("session/stop", { sessionId: zcodeSid });
   } catch (e) {
@@ -989,6 +2382,145 @@ function stopBackendTurn(server: ZcodeAcpServer, zcodeSid: string): void {
       `  [stop] session/stop send failed (ignored): ${e instanceof Error ? e.message : String(e)}`,
     );
   }
+  // The official stop path (the desktop app's stop button sends exactly this):
+  // a v4 command that asks the runtime to stop the active foreground
+  // execution — it also holds the queue and pauses the active goal, reaching
+  // runtime-owned executions the bootstrap abort controller can miss. On
+  // 0.16.9 session/stop alone also works (the abort controller is registered
+  // at send-accept now — source: server-operations.ts sendPrompt), but the
+  // pair stays: belt and braces, and 0.16.5 builds need the v4 leg.
+  // expectedForegroundExecutionId is passed when known — it is captured from
+  // the turn's own turn.started, so it names the execution that is foreground
+  // at cancel time, letting the backend guard against stopping a newer one.
+  // Omitted when unknown, targeting whatever is currently foreground.
+  try {
+    server.ensureBackend().send("v4/command", {
+      commandId: randomUUID(),
+      clientId: "zcode-acp-server",
+      sessionId: zcodeSid,
+      type: "stop",
+      payload: foregroundExecutionId
+        ? { expectedForegroundExecutionId: foregroundExecutionId }
+        : {},
+      issuedAt: Date.now(),
+    });
+    log(`  [stop] v4/command stop sent for ${zcodeSid}`);
+  } catch (e) {
+    log(
+      `  [stop] v4/command stop send failed (ignored): ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+}
+
+/**
+ * Last-resort stop: tear down the session's resident runtime, killing any
+ * generation that survived the stop pair (session/stop + v4/command stop).
+ *
+ * The primary path is stopBackendTurn's v4/command stop — the official one —
+ * which kills the generation instantly. This close is the escalation when
+ * both stops are ignored (drain gate, 5s grace): `session/close` closes the
+ * runtime itself, which kills the generation immediately; the conversation
+ * is persisted in the backend's session store, so `session/resume` restores
+ * it (verified live: resume succeeds and the partial reply is in the
+ * history). Callers reload the session on next use — prompt()'s subscribe
+ * recovery and the drain gate's reload both handle the closed window.
+ */
+function closeBackendSession(server: ZcodeAcpServer, zcodeSid: string): void {
+  try {
+    server.ensureBackend().send("session/close", { sessionId: zcodeSid });
+    log(`  [stop] session/close fired for ${zcodeSid} (backend ignores session/stop)`);
+  } catch (e) {
+    log(
+      `  [stop] session/close send failed (ignored): ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+}
+
+/** Dependencies of drainBackendAfterCancel, injectable for tests. */
+interface DrainDeps {
+  acpSid: string;
+  zcodeSid: string;
+  turn: PendingTurn;
+  listener: EventStreamListener;
+  monitor: TurnMonitor;
+  differ: ProjectionDiffer;
+  cx: acp.AgentContext;
+  /** Test hook: override the close-escalation grace (default 5s). */
+  escalateAfterMs?: number;
+}
+
+/**
+ * Drain gate: a recent cancel/preempt means the backend side needs settling
+ * before the next send. Primary path: stopBackendTurn's v4/command stop kills
+ * the generation at once, so the first probe here already sees idle.
+ * Fallbacks: on a backend that honours session/stop we poll the projection
+ * until idle (a send that lands mid-generation is accepted as a steer whose
+ * input the backend silently DROPS when the old turn finishes); if the
+ * generation is STILL running after a grace period — both stops ignored —
+ * escalate to session/close, which tears down the runtime and kills it
+ * outright (the probe then fails into the reload branch). A visible chunk
+ * tells the user why the send waits. Bounded: on timeout send anyway — the
+ * steer-drop risk returns (the turn.steerQueued guard in runEventTurn reports
+ * it), but blocking the prompt forever is worse.
+ *
+ * Two post-drain repairs, both mirroring established patterns (prompt's
+ * eviction recovery / transient-retry re-baseline):
+ * - resubscribe: session/close killed the runtime this prompt subscribed to;
+ *   the reload revives the session but not the event push, so re-arm it —
+ *   without resubscribe the next turn runs deaf (no events at all, and stall
+ *   recovery can't engage because it needs turn.started).
+ * - re-baseline: the abandoned turn committed messages to the session history
+ *   while we waited (and close persisted its partial output); without markSeen
+ *   the completion diff replays that residue as this turn's output.
+ *
+ * Returns "cancelled" when the turn was flagged cancelled during the drain
+ * (stop pair fired; caller resolves session/prompt at once).
+ */
+export async function drainBackendAfterCancel(
+  server: ZcodeAcpServer,
+  deps: DrainDeps,
+): Promise<"cancelled" | "drained"> {
+  const { acpSid, zcodeSid, turn, listener, monitor, differ, cx } = deps;
+  const DRAIN_TIMEOUT_MS = 90_000;
+  const DRAIN_POLL_MS = 1000;
+  const escalateAfterMs = deps.escalateAfterMs ?? 5_000;
+  const drainT0 = Date.now();
+  let noticed = false;
+  let escalated = false;
+  while (Date.now() - drainT0 < DRAIN_TIMEOUT_MS) {
+    if (turn.cancelled) {
+      stopBackendTurn(server, zcodeSid, turn);
+      return "cancelled";
+    }
+    const proj = await monitor.pollOnce();
+    if (!proj) {
+      // Probe failed — most likely the session was just closed by the
+      // escalation (close tears down the runtime). Reload it so the send
+      // below doesn't die on "session is not active", then re-arm the event
+      // push (see docstring).
+      try {
+        await reloadBackendSession(server, acpSid, zcodeSid);
+        await listener.resubscribe(() => server.nextId());
+      } catch (e) {
+        warn(
+          `drain gate: reload after close failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      break;
+    }
+    if (proj.status === "idle") break;
+    if (proj.status === "running" && !escalated && Date.now() - drainT0 > escalateAfterMs) {
+      escalated = true;
+      closeBackendSession(server, zcodeSid);
+    }
+    if (!noticed) {
+      noticed = true;
+      await sendTextChunk(cx, acpSid, messages().promptQueuedBehindTurn, randomUUID());
+    }
+    await sleep(DRAIN_POLL_MS);
+  }
+  differ.markSeen(await fetchMessagesSinceAnchor(server, zcodeSid, differ.historyAnchor));
+  return "drained";
 }
 
 /**
@@ -1005,7 +2537,7 @@ function stopBackendTurn(server: ZcodeAcpServer, zcodeSid: string): void {
  * synchronous; preempt no longer waits). The turn loop itself runs OUTSIDE
  * this lock — only registration + preempt are serialized.
  */
-function withPreemptLock(
+export function withPreemptLock(
   server: ZcodeAcpServer,
   zcodeSid: string,
   body: () => Promise<void>,
@@ -1065,9 +2597,14 @@ export function preemptInFlightTurn(
   let found = false;
   for (const [reqId, turn] of server.pendingTurns) {
     if (turn.zcodeSid !== zcodeSid || reqId === selfRequestId) continue;
+    // Goal-loop rounds (ADR-0022): user prompts PARK on the driver (see the
+    // parking hook in runPrompt) instead of preempting — a goalLoop turn in
+    // this scan means a path that bypassed the hook (defensive); never
+    // cancel it here. ESC/cancel() still cancels it like any pending turn.
+    if (turn.goalLoop) continue;
     turn.cancelled = true; // signal the old turn to stop its retry loops
     if (!turn.stopSent) {
-      stopBackendTurn(server, zcodeSid);
+      stopBackendTurn(server, zcodeSid, turn);
       turn.stopSent = true;
     }
     // Record cancel time so the prompt()'s send-retry can use the recovery
@@ -1267,17 +2804,136 @@ async function resumeBackendSession(
  * recorded session cwd, default-model overlay only if a faithful resume
  * fails). Marks the session backend-loaded on success.
  */
-async function reloadBackendSession(
+export async function reloadBackendSession(
   server: ZcodeAcpServer,
   acpSid: string,
   zcodeSid: string,
 ): Promise<void> {
+  const cwd = server.sessionCwds.get(acpSid) ?? process.cwd();
   const zcParams: Record<string, unknown> = {
     sessionId: zcodeSid,
-    workspace: workspaceFor(server.sessionCwds.get(acpSid) ?? process.cwd()),
+    workspace: workspaceFor(cwd),
   };
+  // Eviction/respawn reload: the backend lost the per-load mcpServers runtime
+  // config with its resident session — re-send or the tools vanish (#193).
+  const reloadMcp = server.sessionMcpServers.get(acpSid);
+  if (reloadMcp) {
+    zcParams.mcpServers = reloadMcp;
+    log(`session/resume (reload) carrying ${reloadMcp.length} client MCP server(s)`);
+  }
+  // Same pre-resume steps as the ACP resume/load handlers: register the
+  // provider registry (a resumed session's history references a model the
+  // fresh backend can't process until its provider is registered — sends
+  // then fail with the backend's stale-history-model error, persistent, not
+  // transient), then repair a model that is no longer enabled. Skipping
+  // these made every backend respawn (sandbox allow-restart, eviction
+  // recovery) deaf-fail its first sends.
+  await syncProviderRegistry(server, cwd);
   await resumePreservingModel(server, zcParams);
   server.markBackendLoaded(acpSid);
+  await repairUnavailableModel(server, zcodeSid);
+}
+
+/** Outcome of a (possibly shared) resume flight. */
+interface ResumeOutcome {
+  /** True when THIS call performed the backend RPC (joiners waited on another). */
+  performed: boolean;
+  /** The resume RPC result — shared with joiners (cwd adoption is uniform). */
+  result?: unknown;
+  /** Settled history read (fresh flights only) — ordering guarantee vs hydration. */
+  history?: ZcodeMessage[];
+}
+
+/**
+ * Re-apply the bridge-remembered model/thought choice after a resume.
+ *
+ * Why: the backend persists the per-session model selection as a
+ * `session_entry` whose write carries a session FK — and the session row is
+ * only created at FIRST INPUT (source: core events.ts ensureSessionPersisted),
+ * so a setModel/setThoughtLevel before the first prompt loses its persistence
+ * (observed warn `session.model_selection.persist_failed`, FOREIGN KEY
+ * constraint failed) while applying in-memory only. A session resumed without
+ * a persisted entry then reverts to the workspace default (create-app.ts
+ * restorePersistedModelSelection → setSessionModelSelection(undefined)) — the
+ * editor dropdown still shows the user's last choice, so "displayed default ≠
+ * actually called model". The bridge's remembered choice IS the session's own
+ * last selection (every switch path funnels through setConfigOption or the
+ * setModel/setThoughtLevel extensions), so re-applying it restores the
+ * intended stickiness; a backend-side switch made outside this bridge is
+ * deliberately overridden. Silent (no config_option_update — clients already
+ * show this value) and best-effort: a failed re-assert never fails the
+ * resume, and repairUnavailableModel (run after the flight by reload callers)
+ * still wins when the remembered model is no longer enabled.
+ */
+async function reassertModelChoice(server: ZcodeAcpServer, zcodeSid: string): Promise<void> {
+  // Everything inside the try: a best-effort re-assert (and a stub server
+  // without every map) must never fail the resume flight it rides on.
+  try {
+    const choice = server.sessionModelChoices?.get(zcodeSid);
+    if (!choice) return;
+    const { model, thought } = choice;
+    // An empty thought is a remembered RESET — falsy here, so the re-apply
+    // naturally skips it instead of resurrecting the old level.
+    if (!model && !thought) return;
+    const { setConfigOption } = await import("../config/options.js");
+    // Model and thought are independent settings: a failed model re-assert
+    // must not drop the thought level (and a thought-only session — the
+    // model was never switched — still gets its level back).
+    if (model && !(await setConfigOption(server, zcodeSid, "model", model))) {
+      warn(`resume: re-asserting model choice failed (${model}) — keeping backend default`);
+    }
+    if (thought) {
+      await setConfigOption(server, zcodeSid, "thought", thought);
+    }
+    const parts = [model ? `model ${model}` : "", thought ? `thought ${thought}` : ""].filter(
+      Boolean,
+    );
+    log(`resume: re-applied remembered choice (${parts.join(", ")})`);
+  } catch (e) {
+    warn(`resume: model choice re-assert threw (${e instanceof Error ? e.message : String(e)})`);
+  }
+}
+
+/**
+ * Cache the FULL model-availability list from a session snapshot's
+ * `settings.model.available`.
+ *
+ * `session/create` AND `session/resume`/`fork` all return the complete list
+ * with authoritative `reasoning.defaultLevel` — only `session/read` is
+ * hardcoded to `modelAvailability:"current"` (source: server-operations.ts:1828-1831
+ * vs the option-less snapshot resume/fork get at :1518-1521/:2323). A resume is
+ * therefore a free refresh for models added after create (a personal
+ * `provider_config.json` rule, a host account push) that the create snapshot
+ * missed: model switches resolve a target's default reasoning level from this
+ * cache, and the object form of `session/setModel` hard-fails a level-bearing
+ * model without one ("Reasoning level is required").
+ *
+ * Best-effort: an empty or missing list leaves any previous cache intact.
+ */
+export function cacheModelAvailability(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+  result: unknown,
+): void {
+  const settings = (result as { settings?: Record<string, unknown> } | null | undefined)?.settings;
+  const model = settings?.model as
+    | {
+        available?: Array<{
+          ref?: { providerId?: string; modelId?: string };
+          reasoning?: { defaultLevel?: string; levels?: Array<{ value?: string }> };
+        }>;
+      }
+    | undefined;
+  const avail = model?.available ?? [];
+  if (avail.length === 0) return;
+  server.modelAvailability.set(
+    zcodeSid,
+    avail.map((a) => ({
+      providerId: a.ref?.providerId,
+      modelId: a.ref?.modelId,
+      defaultLevel: a.reasoning?.defaultLevel ?? a.reasoning?.levels?.[0]?.value,
+    })),
+  );
 }
 
 /**
@@ -1287,21 +2943,190 @@ async function reloadBackendSession(
  * runtimeModel overlay). The overlay is now a FALLBACK repair only: when the
  * faithful resume fails outright (history carrying a stale/revoked model),
  * retry once pinned to the first enabled provider's first model.
+ *
+ * Single-flight per backend session id (server.resumeInFlight), and the
+ * flight covers resume RPC + hydration settle TOGETHER: a concurrent caller
+ * for the SAME session (the ADR-0017 first-entry race — the App's
+ * session/load racing the TUI's boot-resume) joins the in-flight flight
+ * instead of sending its own resume, AND its later history read observes the
+ * settled store — a joiner that only awaited the RPC could still read a
+ * mid-hydration prefix, and the joiner is the client that actually renders
+ * the history (the TUI boot path replays nothing). Joiners await the same
+ * promise (a failed flight fails them too) and share the performer's
+ * outcome — including the backend-authoritative workspace, so a joiner never
+ * overwrites the performer's corrected session root with its own stale cwd.
  */
 async function resumePreservingModel(
   server: ZcodeAcpServer,
   zcParams: Record<string, unknown>,
-): Promise<unknown> {
-  try {
-    return await resumeBackendSession(server, zcParams);
-  } catch (err) {
-    const overlay = buildResumeRuntimeModel();
-    if (overlay === null) throw err;
-    warn(
-      `resume failed (${err instanceof Error ? err.message : String(err)}); retrying with default-model overlay`,
-    );
-    return resumeBackendSession(server, { ...zcParams, runtimeModel: overlay });
+): Promise<ResumeOutcome> {
+  const zcodeSid = String(zcParams["sessionId"] ?? "");
+  const inFlight = server.resumeInFlight.get(zcodeSid) as Promise<ResumeOutcome> | undefined;
+  if (inFlight) {
+    // Known limitation (#193): the joiner rides the performer's params as
+    // frozen at flight start, so mcpServers the joiner just remembered are
+    // NOT delivered by this resume. Window: only right after a bridge
+    // restart (map empty) with two clients loading the same session; the
+    // next eviction reload re-sends the set. Re-issuing a second resume
+    // here would break the single-flight dehydration guarantee.
+    const shared = await inFlight; // rethrows the first flight's failure
+    return { ...shared, performed: false };
   }
+  const flight = (async (): Promise<ResumeOutcome> => {
+    let result: unknown;
+    try {
+      result = await resumeBackendSession(server, zcParams);
+    } catch (err) {
+      // A session the backend no longer stores cannot be repaired by ANY
+      // overlay — rethrow the honest cause instead of retrying (3.12+
+      // backends reject the runtimeModel key outright, so the retry would
+      // surface "Unrecognized key" and mask the real not-found failure).
+      if (isSessionGoneError(err)) throw err;
+      const overlay = buildResumeRuntimeModel();
+      if (overlay === null) throw err;
+      warn(
+        `resume failed (${err instanceof Error ? err.message : String(err)}); ` +
+          `retrying with default-model overlay`,
+      );
+      try {
+        result = await resumeBackendSession(server, { ...zcParams, runtimeModel: overlay });
+      } catch (overlayErr) {
+        // Schema drift (3.12+ "Unrecognized key: runtimeModel"): the overlay
+        // fallback is dead on that build — propagate the ORIGINAL failure.
+        if (overlayErr instanceof Error && /unrecognized key/i.test(overlayErr.message)) {
+          throw err;
+        }
+        throw overlayErr;
+      }
+    }
+    // The settle rides the flight (see the docstring): joiners awaiting this
+    // promise are ordered after hydration, not merely after the RPC.
+    const history = await fetchMessagesSettled(server, zcodeSid);
+    // Resume/fork snapshots carry the FULL model-availability list (only
+    // session/read is hardcoded "current") — refresh the switch-time level
+    // lookup for models added after create BEFORE the remembered choice
+    // re-asserts (it resolves its level from this cache).
+    cacheModelAvailability(server, zcodeSid, result);
+    // Re-apply the bridge-remembered model choice (best-effort — never fails
+    // the resume): the resumed session may have silently reverted to the
+    // workspace default when the backend's own selection entry was lost.
+    await reassertModelChoice(server, zcodeSid);
+    return {
+      performed: true,
+      result,
+      history,
+    };
+  })();
+  server.resumeInFlight.set(zcodeSid, flight);
+  try {
+    return await flight;
+  } finally {
+    // Guarded delete: only the owner removes its own entry.
+    if (server.resumeInFlight.get(zcodeSid) === flight) server.resumeInFlight.delete(zcodeSid);
+  }
+}
+
+/** Settle-poll gap after a fresh resume (see fetchMessagesSettled). */
+const RESUME_SETTLE_GAP_MS = 300;
+/**
+ * Cap for the settle poll — past this the largest snapshot seen wins. Large
+ * enough for the full two-stable-read plateau on slow readers (big sessions'
+ * reads take seconds each — 3–5 reads must fit, observed 2.4–6.3s/read on a
+ * 7413-message session), while still bounding a genuinely stuck hydration.
+ */
+const RESUME_SETTLE_CAP_MS = 30_000;
+/** Non-growing reads required to call the store settled (plateau guard). */
+const RESUME_SETTLE_STABLE_READS = 2;
+
+/**
+ * fetchMessages + bounded read-back settle, for paths that JUST performed a
+ * resume. The backend's `session/messages` reflects only what it has hydrated
+ * so far — a query landing mid-restore returns a PREFIX, and replaying that
+ * prefix makes the conversation "end in the middle" on first entry (re-entry
+ * is fine once hydration finished; big sessions hydrate slowly, hence
+ * "often but not always"). Poll until the count has stopped growing for TWO
+ * consecutive reads (a single equal pair can be a >gap plateau inside a slow
+ * hydration), capped; on the cap the largest snapshot seen wins. A capped
+ * exit records the session in server.hydrationUnsettled so later replay
+ * reads re-settle (fetchMessagesForReplay); a stable exit clears it.
+ *
+ * Re-settles (a marker left by a capped settle) fast-path on the WATERMARK:
+ * one non-growing read that itself reaches the largest length any settle has
+ * ever observed counts as caught-up. Demanding the full two-read plateau again
+ * meant slow-reading sessions NEVER cleared the marker — every load re-paid
+ * a capped settle (observed 2026-09-20: 22–56s loads on a 7413-message
+ * session). The confirming READ (not this flight's running max) must reach
+ * the live watermark, so a read that dips below what any settle has seen
+ * falls back to the plateau rule; watermark writes are monotonic, so a
+ * concurrent settle's higher observation is never traded down. Residual,
+ * accepted: a hydration stalling at/above the watermark across one read+gap
+ * still exits early with a prefix — bounded, and the next plain read
+ * self-heals. Watermarks reset on backend respawn (ensureBackend).
+ */
+export async function fetchMessagesSettled(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+): Promise<ZcodeMessage[]> {
+  let messages = await fetchMessages(server, zcodeSid);
+  // The catch-up anchor: what a previous settle already saw of this store.
+  const entryWatermark = server.hydrationWatermark.get(zcodeSid) ?? 0;
+  raiseWatermark(server, zcodeSid, messages.length);
+  let stable = 0;
+  const deadline = Date.now() + RESUME_SETTLE_CAP_MS;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, RESUME_SETTLE_GAP_MS));
+    const next = await fetchMessages(server, zcodeSid);
+    // Shrinking should not happen; never trade down either way.
+    if (next.length <= messages.length) {
+      // A failed read comes back EMPTY (fetchMessages swallows errors) — never
+      // let it vouch for stability while hydration may still be running.
+      const errored = next.length === 0 && messages.length > 0;
+      // Watermark fast-path: the confirming read itself reached everything
+      // any settle has ever seen (live value — a concurrent settle may have
+      // raised it past our entry snapshot) AND the store is not growing.
+      const liveWatermark = server.hydrationWatermark.get(zcodeSid) ?? 0;
+      const reachedWatermark = entryWatermark > 0 && next.length >= liveWatermark;
+      if (!errored && (reachedWatermark || ++stable >= RESUME_SETTLE_STABLE_READS)) {
+        server.hydrationUnsettled.delete(zcodeSid);
+        raiseWatermark(server, zcodeSid, Math.max(messages.length, entryWatermark));
+        return messages;
+      }
+    } else {
+      stable = 0;
+      messages = next;
+      raiseWatermark(server, zcodeSid, messages.length);
+    }
+    if (Date.now() >= deadline) {
+      server.hydrationUnsettled.add(zcodeSid);
+      warn(
+        `settle capped at ${RESUME_SETTLE_CAP_MS}ms for ${zcodeSid} still growing ` +
+          `(${messages.length} messages) — replaying the largest snapshot, ` +
+          `next load re-settles`,
+      );
+      return messages;
+    }
+  }
+}
+
+/** Monotonic watermark write — a concurrent settle's higher observation wins. */
+function raiseWatermark(server: ZcodeAcpServer, zcodeSid: string, length: number): void {
+  if (length > (server.hydrationWatermark.get(zcodeSid) ?? 0)) {
+    server.hydrationWatermark.set(zcodeSid, length);
+  }
+}
+
+/**
+ * History read for replay paths: plain unless the last settle for this
+ * session capped out mid-hydration — then re-settle first (the marker is
+ * maintained by fetchMessagesSettled). Stable sessions pay zero extra reads;
+ * a still-hydrating session gets the settle poll instead of a prefix.
+ */
+async function fetchMessagesForReplay(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+): Promise<ZcodeMessage[]> {
+  if (!server.hydrationUnsettled.has(zcodeSid)) return fetchMessages(server, zcodeSid);
+  return fetchMessagesSettled(server, zcodeSid);
 }
 
 /**
@@ -1318,7 +3143,9 @@ async function repairUnavailableModel(server: ZcodeAcpServer, zcodeSid: string):
     const resp = await backend.request(
       server.nextId(),
       "session/read",
-      { sessionId: zcodeSid },
+      // messageLimit: only settings.model.current is read; the cap keeps the
+      // backend from serializing the whole message array for it.
+      { sessionId: zcodeSid, messageLimit: 1 },
       5000,
     );
     if (resp.error) return;
@@ -1347,6 +3174,32 @@ async function repairUnavailableModel(server: ZcodeAcpServer, zcodeSid: string):
   }
 }
 
+/**
+ * Cold-start send rejection worth retrying: right after a sandbox-allow
+ * respawn, the reloaded session's recorded model briefly reads as
+ * unavailable while the fresh backend finishes loading its model list — the
+ * same send succeeds seconds later (verified in production: the automatic
+ * continuation was rejected with "历史任务使用的模型已不可用", a manual
+ * resend a minute later went through). Matches the backend's Chinese wording
+ * plus a generic English form.
+ */
+export function isTransientSendError(message: string): boolean {
+  const m = message.toLowerCase();
+  return m.includes("模型已不可用") || /model .*(unavailable|no longer available)/.test(m);
+}
+
+/**
+ * A failure proving the backend no longer STORES the session at all — as
+ * opposed to "Session is not active", which only means the resident runtime
+ * was evicted and a session/resume reloads it. Matches both spellings the
+ * builds in the wild produce ("Session not found: <sid>", "Session ID 不存在"),
+ * mirroring translateResumeFailure's match.
+ */
+export function isSessionGoneError(e: unknown): boolean {
+  const raw = e instanceof Error ? e.message : String(e);
+  return /不存在|not\s*found/i.test(raw);
+}
+
 /** Get or create the session-level ProjectionDiffer (persists across turns). */
 function getOrCreateDiffer(server: ZcodeAcpServer, zcodeSid: string): ProjectionDiffer {
   let d = server.differs.get(zcodeSid);
@@ -1360,6 +3213,72 @@ function getOrCreateDiffer(server: ZcodeAcpServer, zcodeSid: string): Projection
 }
 
 /**
+ * Map the backend's merged per-turn usage (`EventTranslator.turnUsage`) onto
+ * the ACP `PromptResponse.usage` shape (UNSTABLE in agent-client-protocol;
+ * per-turn semantics per its "Token usage for this turn" description). The
+ * three required counters are always present in the backend object (its
+ * reducer 0-fills them); the optional ones pass through as null when
+ * unreported. Field renames: reasoningTokens→thoughtTokens,
+ * cacheRead/cacheWriteTokens→cachedRead/cachedWriteTokens.
+ *
+ * The backend's inputTokens is OpenAI-style: it ALREADY contains the cache
+ * read+write tokens (verified live 2026-09-18: totalTokens == inputTokens +
+ * outputTokens on a real turn.completed frame). ACP's de-facto convention —
+ * claude-agent-acp passthrough and DeepSeek's dsh-token-meter four-bucket
+ * model alike — reports inputTokens EXCLUDING cache, and clients (martty's
+ * stats-view, Zed) compute cache hit rate as cachedRead / (input + cachedRead
+ * + cachedWrite). Forwarding the inclusive number double-counts the cache in
+ * their denominator, so normalize: inputTokens here is cache-exclusive,
+ * clamped at 0. totalTokens passes through unchanged — the backend's
+ * input+output sum IS the convention's four-bucket total, arithmetically.
+ */
+export function toAcpTurnUsage(u: Record<string, unknown> | null): acp.Usage | undefined {
+  if (!u) return undefined;
+  const num = (k: string): number => (typeof u[k] === "number" ? (u[k] as number) : 0);
+  const numOrNull = (k: string): number | null =>
+    typeof u[k] === "number" ? (u[k] as number) : null;
+  const cacheRead = numOrNull("cacheReadTokens") ?? 0;
+  const cacheWrite = numOrNull("cacheWriteTokens") ?? 0;
+  return {
+    totalTokens: num("totalTokens"),
+    inputTokens: Math.max(0, num("inputTokens") - cacheRead - cacheWrite),
+    outputTokens: num("outputTokens"),
+    thoughtTokens: numOrNull("reasoningTokens"),
+    cachedReadTokens: numOrNull("cacheReadTokens"),
+    cachedWriteTokens: numOrNull("cacheWriteTokens"),
+  };
+}
+
+/**
+ * Build the ACP `session/prompt` result for a concluded turn, attaching the
+ * turn's usage when the backend reported one (absent otherwise — no synthetic
+ * zeros). Spec fields carry the standard counters; backend extras (source,
+ * modelRequestCount, web request counts) ride in `_meta.zcode.usage` per the
+ * bridge's extension policy, plus `rawInputTokens` whenever normalization
+ * changed it (reconciliation/diagnostics).
+ */
+export function turnResult(
+  translator: EventTranslator,
+  stopReason: acp.StopReason,
+): acp.PromptResponse {
+  const raw = translator.turnUsage;
+  const usage = toAcpTurnUsage(raw);
+  if (!usage || !raw) return { stopReason };
+  const extras: Record<string, unknown> = {};
+  for (const k of ["source", "modelRequestCount", "webFetchRequests", "webSearchRequests"]) {
+    if (raw[k] !== undefined) extras[k] = raw[k];
+  }
+  if (typeof raw["inputTokens"] === "number" && raw["inputTokens"] !== usage.inputTokens) {
+    extras.rawInputTokens = raw["inputTokens"];
+  }
+  return {
+    stopReason,
+    usage,
+    _meta: { zcode: { usage: extras } },
+  };
+}
+
+/**
  * Event-driven turn loop: translate zcode events via EventTranslator and
  * dispatch each internal event to the ACP client. No-progress timeout is 120s
  * (refreshed by any event). Cancel is honoured on each iteration.
@@ -1368,7 +3287,7 @@ function getOrCreateDiffer(server: ZcodeAcpServer, zcodeSid: string): Projection
  * handling (requestPermission / ExitPlanMode / AskUserQuestion) lands in
  * Commit 6 — for now they're polled to keep the inbox clear.
  */
-async function runEventTurn(
+export async function runEventTurn(
   server: ZcodeAcpServer,
   listener: EventStreamListener,
   monitor: TurnMonitor,
@@ -1377,13 +3296,53 @@ async function runEventTurn(
   acpSid: string,
   chunkMsgId: string,
   turn: PendingTurn,
-  preempted: boolean,
+  gateArmed: boolean,
 ): Promise<acp.PromptResponse> {
   const backend = server.ensureBackend();
   const translator = new EventTranslator();
   differ.resetTurn();
   const NO_PROGRESS_MS = 120_000;
-  let lastProgress = Date.now();
+  // Stall termination policy. Two candidate liveness signals were verified
+  // against the Aug-28 app-server and both are unusable for kill decisions:
+  //   - `session/goal show` succeeds mid-turn (never reports the 1308 lock),
+  //   - a probe `session/send` is ACCEPTED while the turn runs (queued as
+  //     steer input) — the prompt lock is only held during finalisation.
+  // So "lock released" proves nothing about turn liveness, and killing on it
+  // murdered live sub-agent turns after 120s of stream silence. The honest
+  // signal is the read-projection watermark: contextUsed / totalTokenCount /
+  // turnCount / currentTurnId advance while the backend makes progress
+  // (verified: a sub-agent turn advanced the watermark for 5+ minutes with
+  // zero stream events). A live turn may still freeze the watermark for a
+  // while (long CoT, quiet tools — observed 60s+ pauses), so a freeze alone
+  // never kills: only a freeze sustained past STALE_FREEZE_MS with no known
+  // active foreground tool ends the turn, reply-fetch first, stop as the last
+  // resort.
+  const STALE_FREEZE_MS = 600_000;
+  // Upstream ACP clients commonly enforce their own idle deadline (some use
+  // 300s). A session/read watermark can prove that ZCode is still
+  // working even when its event stream is quiet, but that proof is otherwise
+  // invisible beyond this bridge.  Forward a state-bearing update at a modest
+  // cadence so the client's deadline observes the same authoritative progress.
+  const UPSTREAM_PROGRESS_INTERVAL_MS = 60_000;
+  let lastProtocolProgressAt = Date.now();
+  let nextNoProgressDecisionAt = lastProtocolProgressAt + NO_PROGRESS_MS;
+  let lastWatermarkAdvanceAt = Date.now();
+  let lastUpstreamProgressAt = Date.now();
+  let watermark: string | null = null;
+  let pendingWatermarkProgress: ZcodeProjection | null = null;
+  const noteWatermark = (proj: ZcodeProjection | null): void => {
+    if (!proj) return;
+    const next = `${proj.contextUsed ?? 0}/${proj.totalTokenCount ?? 0}/${proj.turnCount ?? 0}/${proj.currentTurnId ?? ""}`;
+    if (watermark === null) {
+      watermark = next;
+      return;
+    }
+    if (next !== watermark) {
+      watermark = next;
+      lastWatermarkAdvanceAt = Date.now();
+      pendingWatermarkProgress = proj;
+    }
+  };
   let lastStallCheck = Date.now();
   let emittedText = false;
   let emittedOutput = false;
@@ -1398,7 +3357,220 @@ async function runEventTurn(
   let thinkingHintSent = false;
   const THINKING_HINT_DELAY_MS = 1200;
 
-  while (Date.now() - lastProgress < NO_PROGRESS_MS) {
+  // Sub-agent visibility (session/subagents RPC, 0.16.9): the model can run
+  // sub-agents for minutes behind a silent stream — the watermark keeps
+  // moving but the editor shows nothing. Piggyback on the stall-reconcile
+  // cadence (it fires exactly in those quiet phases) to poll the backend's
+  // sub-agent roster and surface CHANGES as one-line text updates, plus a
+  // one-shot terminal summary when the roster drains. Best-effort: probe
+  // failures (old backends answer -32601) are silent and never affect the
+  // turn.
+  let lastSubagentLine = "";
+  let subagentEndedBaseline: number | null = null;
+  let subagentEndedLineSent = false;
+  const turnEpoch = Date.now();
+  const pollSubagentsOnce = async (): Promise<void> => {
+    if (turn.cancelled) return;
+    let result: unknown;
+    try {
+      const resp = await backend.request(
+        server.nextId(),
+        "session/subagents",
+        // endedLimit raises the backend's default 20-item cap (schema max
+        // 100, source: zcode-protocol index.ts:1615) so the failed/cancelled
+        // breakdown stays exact for larger batches — `ended.total` was
+        // always exact, only the per-status counts were truncated.
+        { sessionId: turn.zcodeSid, endedLimit: 100 },
+        8000,
+      );
+      if (resp.error || resp.result === undefined) return;
+      result = resp.result;
+    } catch {
+      return;
+    }
+    const roster = result as {
+      running?: Array<{ status?: string }>;
+      ended?: { total?: number; items?: Array<{ status?: string; endedAt?: number }> };
+    };
+    const running = Array.isArray(roster.running) ? roster.running : [];
+    const endedTotal = typeof roster.ended?.total === "number" ? roster.ended.total : 0;
+    if (subagentEndedBaseline === null) subagentEndedBaseline = endedTotal;
+    if (running.length > 0) {
+      const count = (status: string) => running.filter((a) => a.status === status).length;
+      const line = messages().subagentStatusLine(
+        count("running"),
+        count("waiting"),
+        count("blocked"),
+      );
+      if (line !== lastSubagentLine) {
+        lastSubagentLine = line;
+        try {
+          await sendTextChunk(cx, acpSid, line, randomUUID());
+        } catch (e) {
+          // Best-effort like forwardAuthoritativeProgress: a rejecting cx
+          // (dead connection) must never kill the turn loop over a status
+          // courtesy.
+          warn(`subagent status line failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    } else if (lastSubagentLine !== "") {
+      lastSubagentLine = "";
+      const endedDuringTurn = (roster.ended?.items ?? []).filter(
+        (item) => typeof item.endedAt === "number" && item.endedAt >= turnEpoch - 5_000,
+      );
+      if (
+        !subagentEndedLineSent &&
+        subagentEndedBaseline !== null &&
+        endedTotal > subagentEndedBaseline
+      ) {
+        subagentEndedLineSent = true;
+        const failed = endedDuringTurn.filter((item) => item.status === "failed").length;
+        const cancelled = endedDuringTurn.filter((item) => item.status === "cancelled").length;
+        try {
+          await sendTextChunk(
+            cx,
+            acpSid,
+            messages().subagentEndedLine(endedTotal - subagentEndedBaseline, failed, cancelled),
+            randomUUID(),
+          );
+        } catch (e) {
+          warn(`subagent ended line failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
+  };
+
+  const recordProtocolProgress = (): void => {
+    lastProtocolProgressAt = Date.now();
+    nextNoProgressDecisionAt = lastProtocolProgressAt + NO_PROGRESS_MS;
+    lastUpstreamProgressAt = lastProtocolProgressAt;
+    pendingWatermarkProgress = null;
+  };
+
+  const forwardAuthoritativeProgress = async (): Promise<void> => {
+    if (Date.now() - lastUpstreamProgressAt < UPSTREAM_PROGRESS_INTERVAL_MS) return;
+
+    const proj = pendingWatermarkProgress;
+    const used = proj ? proj.contextUsed || proj.totalTokenCount || 0 : 0;
+    const activeToolId = [...translator.seenToolIds].find(
+      (toolId) => !translator.finalToolIds.has(toolId),
+    );
+    if (!proj && !activeToolId) return;
+
+    try {
+      if (proj) {
+        // Reuse normal UsageDelta dispatch so a projection that reports a zero
+        // contextWindow gets the configured model limit instead of emitting an
+        // invalid/empty context bar.  The token count itself comes directly
+        // from the authoritative session/read projection.
+        await dispatchEvent(
+          server,
+          cx,
+          acpSid,
+          { kind: "UsageDelta", used, size: proj.contextWindow ?? 0 },
+          chunkMsgId,
+        );
+      } else if (activeToolId) {
+        await sendSessionUpdate(cx, acpSid, {
+          sessionUpdate: "tool_call_update",
+          toolCallId: activeToolId,
+          status: "in_progress",
+        });
+      }
+      lastUpstreamProgressAt = Date.now();
+      pendingWatermarkProgress = null;
+    } catch (e) {
+      // Liveness forwarding is best-effort.  A detached client must not kill
+      // the ZCode turn; normal event dispatch or the stale policy will still
+      // settle it through the existing paths.
+      warn(`authoritative progress update failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  // Shared "the turn finished but its terminal event was lost" ending: deliver
+  // the last reply when nothing streamed, then end the turn as a recovered one
+  // (prompt() skips auto-compact for it — the completion was inferred, and
+  // compressing an in-flight task's context would destroy the work).
+  const recoverLostTerminalTurn = async (): Promise<acp.PromptResponse> => {
+    if (!emittedText) {
+      const reply = await fetchLastReply(server, turn.zcodeSid, differ);
+      if (reply) {
+        registerFetchedReply(translator, reply);
+        await sendTextChunk(cx, acpSid, reply.text, chunkMsgId);
+      } else if (!emittedOutput) {
+        // No text and no output → suspected failure.
+        stopBackendTurn(server, turn.zcodeSid, turn);
+        throw new RequestError(-32603, "turn produced no output");
+      }
+    }
+    turn.stallRecovered = true;
+    return turnResult(translator, "end_turn");
+  };
+
+  while (true) {
+    if (Date.now() >= nextNoProgressDecisionAt) {
+      if (listener.hasQueuedEvents()) {
+        // An event that arrived exactly at the deadline is real protocol
+        // progress. Consume it below before making any terminal decision.
+        recordProtocolProgress();
+      } else if (turn.cancelled) {
+        // Preserve the pre-existing bounded cancel behaviour. A stuck prompt
+        // lock after stop must not keep a user-cancelled turn alive forever.
+        stopBackendTurn(server, turn.zcodeSid, turn);
+        return turnResult(translator, "max_turn_requests");
+      } else {
+        const frozenMs = Date.now() - lastWatermarkAdvanceAt;
+        const activeTools = [...translator.seenToolIds].filter(
+          (toolId) => !translator.finalToolIds.has(toolId),
+        ).length;
+        if (activeTools > 0) {
+          // A nonterminal foreground tool is direct evidence that the turn is
+          // not complete, even when token/turn counters are quiet. In
+          // particular, TaskOutput can legitimately span the generic stale
+          // budget while the backend still owns the prompt. Keep forwarding
+          // its state-bearing refreshes instead of inventing end_turn.
+          log(
+            `  [stall] watermark frozen ${Math.round(frozenMs / 1000)}s with ${activeTools} active tool(s); deferring terminal decision`,
+          );
+          nextNoProgressDecisionAt = Date.now() + NO_PROGRESS_MS;
+        } else if (frozenMs < STALE_FREEZE_MS) {
+          // The read watermark moved recently — direct evidence the backend is
+          // still making progress (typically a sub-agent or slow tool working
+          // behind a silent stream). Keep waiting; the 15s stall-reconcile
+          // below keeps refreshing the watermark via session/read.
+          log(
+            `  [stall] watermark advanced within the last ${Math.round(frozenMs / 1000)}s (activeTools=${activeTools}); deferring terminal decision`,
+          );
+          nextNoProgressDecisionAt = Date.now() + NO_PROGRESS_MS;
+        } else if (emittedText || emittedOutput) {
+          // Watermark frozen past the budget and something was already
+          // delivered — treat as a completed-but-terminal-event-lost turn
+          // (never compress its context; the completion is inferred).
+          turn.stallRecovered = true;
+          log(
+            `  [stall] watermark frozen ${Math.round(frozenMs / 1000)}s; ending turn after delivered output`,
+          );
+          return turnResult(translator, "end_turn");
+        } else {
+          const reply = await fetchLastReply(server, turn.zcodeSid, differ);
+          if (reply) {
+            registerFetchedReply(translator, reply);
+            await sendTextChunk(cx, acpSid, reply.text, chunkMsgId);
+            turn.stallRecovered = true;
+            log(
+              `  [stall] watermark frozen ${Math.round(frozenMs / 1000)}s; recovered reply via session/messages`,
+            );
+            return turnResult(translator, "end_turn");
+          }
+          log(
+            `  [stall] watermark frozen ${Math.round(frozenMs / 1000)}s with no output; stopping backend turn`,
+          );
+          stopBackendTurn(server, turn.zcodeSid, turn);
+          return turnResult(translator, "max_turn_requests");
+        }
+      }
+    }
+
     // Drain + handle server→client requests (interaction/*). Refreshes the
     // no-progress timer when any are handled. Pass `turn` so interaction
     // requests become turn-cancel aware (user stop aborts pending popups).
@@ -1411,26 +3583,42 @@ async function runEventTurn(
       warn(`handleServerRequests threw: ${e instanceof Error ? e.message : String(e)}`);
     }
     if (handled) {
-      lastProgress = Date.now();
+      recordProtocolProgress();
     }
 
     if (turn.cancelled) {
-      // Cancel requested: ensure stop was fired (cancel()/preempt normally do
-      // this, but guard anyway). We do NOT silence subsequent events here — if
-      // the backend ignored the stop and kept producing, that content is still
-      // valuable to the user and should be displayed (the backend is the single
-      // source of truth within a session). Cross-turn contamination is handled
-      // separately by the turn-attribution gate below, which discards this
-      // turn's leftover events from the *next* turn's queue. The loop exits
-      // normally on the terminal event (translator.turnDone below).
+      // Cancel requested: fire the stop (cancel()/preempt normally already
+      // did — this is a guard) and END THE TURN AT ONCE. The backend's
+      // session/stop is fire-and-forget and, as verified against app-server
+      // 0.16.5, does NOT abort the in-flight model stream — waiting for the
+      // backend's terminal event used to keep the turn streaming for the
+      // full remaining generation (10s+ past the stop) while the user stared
+      // at a live spinner. Returning here resolves session/prompt with
+      // stopReason "cancelled" immediately; the finally below unregisters
+      // the turn listener, so events the backend still pushes are delivered
+      // to no turn listener, and the next turn's turn-attribution gate
+      // discards any residue that slipped into the queue meanwhile.
       if (!turn.stopSent) {
-        stopBackendTurn(server, turn.zcodeSid);
+        stopBackendTurn(server, turn.zcodeSid, turn);
         turn.stopSent = true;
       }
+      return turnResult(translator, "cancelled");
     }
 
     const ev = await listener.pollEvent(500);
     if (ev === null) {
+      // Dead-reader fast-fail: a backend whose reader died will never emit
+      // another event — without this check the loop waits out the full stall
+      // policy (2min no-progress / 10min stale-freeze) on a dead process.
+      // Throwing the backend-lost shape routes into runOneTurn's respawn
+      // recovery instead.
+      if (!turn.cancelled && backend.isDead) {
+        throw new TurnFailedError({
+          code: "UNKNOWN_ERROR",
+          message: "Turn execution failed",
+          cause: { code: "ERR_INVALID_STATE", message: "reader dead" },
+        });
+      }
       // Thinking-phase hint: if the turn has started but produced no output
       // yet (no text/reasoning/tool streamed), and we've been silent longer
       // than the threshold, emit a single "thinking" thought chunk so the
@@ -1447,7 +3635,7 @@ async function runEventTurn(
         thinkingHintSent = true;
         await sendSessionUpdate(cx, acpSid, {
           sessionUpdate: "agent_thought_chunk",
-          content: { type: "text", text: "正在思考…" },
+          content: { type: "text", text: messages().thinkingPlaceholder },
           messageId: `thinking_${chunkMsgId}`,
         });
       }
@@ -1459,11 +3647,22 @@ async function runEventTurn(
       if (
         !turn.cancelled &&
         translator.turnStarted &&
-        Date.now() - lastProgress > 15_000 &&
+        Date.now() - lastProtocolProgressAt > 15_000 &&
         Date.now() - lastStallCheck > 15_000
       ) {
         lastStallCheck = Date.now();
+        // Authoritative terminal broadcast (0.16.9): the protocol layer's
+        // state.updated {reason:"prompt_completed"|"prompt_failed"}
+        // (server-operations.ts:2469/:2445) proves the backend finished our
+        // turn even though turn.completed was lost. End now instead of
+        // waiting out the double-idle probe or STALE_FREEZE_MS (10 min).
+        if (translator.sawPromptCompleted || translator.sawPromptFailed) {
+          return await recoverLostTerminalTurn();
+        }
         const proj = await monitor.pollOnce();
+        noteWatermark(proj);
+        await forwardAuthoritativeProgress();
+        await pollSubagentsOnce();
         if (proj?.status === "idle") {
           // A single idle probe can also fire mid-work: the backend is silent
           // during the model's thinking/connection phase and may report idle
@@ -1473,33 +3672,19 @@ async function runEventTurn(
           // turn is alive (it stays queued for the next poll).
           await sleep(1500);
           if (listener.hasQueuedEvents()) {
-            lastProgress = Date.now();
+            recordProtocolProgress();
             continue; // alive — events will be consumed by the next poll
           }
           const proj2 = await monitor.pollOnce();
+          noteWatermark(proj2);
+          await forwardAuthoritativeProgress();
           if (proj2?.status === "idle" && !listener.hasQueuedEvents()) {
             // Turn completed but the event was lost (double-confirmed).
-            if (!emittedText) {
-              const reply = await fetchLastReply(server, turn.zcodeSid, differ);
-              if (reply) {
-                registerFetchedReply(translator, reply);
-                await sendTextChunk(cx, acpSid, reply.text, chunkMsgId);
-              } else if (!emittedOutput) {
-                // No text and no output → suspected failure.
-                stopBackendTurn(server, turn.zcodeSid);
-                throw new RequestError(-32603, "turn produced no output");
-              }
-            }
-            // Heuristic ending: prompt() must skip auto-compact for this
-            // turn — the completion was inferred, and compressing an
-            // in-flight task's context would destroy the work.
-            turn.stallRecovered = true;
-            return { stopReason: "end_turn" };
+            return await recoverLostTerminalTurn();
           }
           // Second probe says the backend is still working (or events arrived
           // mid-probe) — keep waiting; queued events are consumed by the next
           // poll iteration.
-          lastProgress = Date.now();
           if (proj2?.status === "running") {
             await listener.resubscribe(() => server.nextId());
           }
@@ -1510,14 +3695,24 @@ async function runEventTurn(
           // The send-retry loop in prompt() already covers the recovery window
           // for the NEXT turn; for this in-flight turn we just resubscribe and
           // let the backend emit its terminal event when ready.
-          lastProgress = Date.now();
           await listener.resubscribe(() => server.nextId());
         }
       }
       continue;
     }
 
-    lastProgress = Date.now();
+    recordProtocolProgress();
+    // Steer-swallow guard: a send accepted while the previous turn is still
+    // generating is queued as steer input, which the backend silently DROPS
+    // when that turn ends — no new turn ever starts (no turn.started), and
+    // the attribution gate below would discard the steerQueued event like
+    // any other residue, leaving this prompt to hang until the 120s watchdog
+    // with the message lost. turn.steerQueued is definitive proof of the
+    // swallow: report it at once so the user can resend immediately.
+    if (ev.type === "turn.steerQueued" && !translator.turnStarted && gateArmed) {
+      await sendTextChunk(cx, acpSid, messages().messageSwallowedByTurn, chunkMsgId);
+      return turnResult(translator, "max_turn_requests");
+    }
     // Turn-attribution gate: before this turn's own turn.started arrives, any
     // event is leftover from a prior turn (cancelled/preempted but still
     // finalising) that landed in the queue while send was retrying on a busy
@@ -1529,14 +3724,24 @@ async function runEventTurn(
     // terminal event here would flip them and make THIS turn exit prematurely
     // at the first check after its own turn.started passes the gate.
     //
-    // The gate is armed ONLY when this send preempted another prompt. Without
-    // preemption no prior-turn residue can exist: the queue can only contain
-    // events of a backend-owned turn that was already active at send time
-    // (e.g. the main-branch turn auto-resumed after a compaction) — this send
-    // was steered into it and produces NO new turn.started, so dropping those
-    // events would silently swallow the entire turn's output in the UI.
-    if (shouldDropEventForTurnAttribution(ev, translator.turnStarted, preempted)) {
+    // Armed when this send preempted another prompt, OR when a cancel is
+    // recent: the backend ignores session/stop, so an abandoned turn keeps
+    // streaming until its natural end while the turn loop has already
+    // returned — a prompt sent in that window reaches subscribe while the
+    // residue is still arriving. Backend serialisation bounds the exposure:
+    // a send is accepted only after the prior turn released the lock, so the
+    // residue can only arrive BEFORE this turn's turn.started. (A send that
+    // lands mid-generation instead is a steer whose input is dropped — the
+    // turn.steerQueued guard above reports that at once.)
+    if (shouldDropEventForTurnAttribution(ev, translator.turnStarted, gateArmed)) {
       continue;
+    }
+    if (ev.type === "turn.started") {
+      // Remember the runtime's foreground execution id: the v4/command stop
+      // (see stopBackendTurn) targets it if the user cancels mid-turn.
+      const fge = (ev.payload as { foregroundExecutionId?: string } | undefined)
+        ?.foregroundExecutionId;
+      if (fge) turn.foregroundExecutionId = fge;
     }
     const internalEvents = translator.translate(ev);
     // Capture the turn-start timestamp for the thinking-phase hint above.
@@ -1553,6 +3758,68 @@ async function runEventTurn(
       // otherwise only set by its own diff / emitInitialUsage).
       if (iev.kind === "UsageDelta") differ.setLastUsage(iev.used);
       await dispatchEvent(server, cx, acpSid, iev, chunkMsgId);
+    }
+
+    // Filesystem-permission failure surfacing (the tool output itself already
+    // reached the editor above). Two scans, both only on tool.updated so
+    // mid-stream deltas aren't scanned, and both skipping read-only tools —
+    // their output merely ECHOES text, and acting on it would raise a phantom
+    // ask for a path nothing tried to touch.
+    if (ev.type === "tool.updated") {
+      const outputText = JSON.stringify(ev.payload ?? {});
+      const toolCallId = String((ev.payload as { toolCallId?: unknown })?.toolCallId ?? "");
+      const toolName = (translator.toolNames.get(toolCallId) ?? "").toLowerCase();
+      // Case-insensitive: zsh prints redirects as "operation not permitted".
+      const lower = outputText.toLowerCase();
+      const scannable = !READ_ONLY_TOOLS.has(toolName);
+      if (scannable && server.backendSandboxed && lower.includes("operation not permitted")) {
+        // Sandbox write-denial (ADR-0011): EPERM outside the Seatbelt
+        // whitelist → dynamic-allow flow (ask → persist → kill backend → the
+        // turn unwinds as cancelled; prompt() fires the continuation). Gated
+        // on the PROCESS fact backendSandboxed (not the config wish) — EPERM
+        // can only come from a sandboxed process; unsandboxed EPERM is
+        // ordinary filesystem permissions.
+        const denial = extractSandboxDenial(outputText);
+        if (denial) {
+          await handleSandboxDenial(server, cx, acpSid, denial, toolCallId);
+          if (turn.cancelled) return turnResult(translator, "cancelled");
+        } else {
+          // No path parsed — one generic hint per session, not one per retry.
+          let asked = server.sandboxAskedPaths.get(acpSid);
+          if (!asked) {
+            asked = new Map();
+            server.sandboxAskedPaths.set(acpSid, asked);
+          }
+          if (asked.get(GENERIC_HINT_KEY) === undefined) {
+            asked.set(GENERIC_HINT_KEY, Number.POSITIVE_INFINITY);
+            await sendTextChunk(cx, acpSid, messages().sandboxGenericDenialHint, chunkMsgId);
+          }
+        }
+      } else if (scannable && lower.includes("permission denied")) {
+        // EACCES — ordinary filesystem permissions, sandbox or not. Nothing
+        // the bridge can "allow" (no popup fixes chmod/ownership), so surface
+        // it as a one-time hint per path per session; without it the model
+        // silently swallows the failure and reroutes, and the user never
+        // learns why the command died.
+        const deniedPath = extractPermDeniedPath(outputText);
+        if (deniedPath) {
+          const cwd = server.sessionCwds.get(acpSid);
+          const real = resolveReal(
+            path.isAbsolute(deniedPath)
+              ? deniedPath
+              : path.resolve(cwd ?? process.cwd(), deniedPath),
+          );
+          let hinted = server.fsDeniedPaths.get(acpSid);
+          if (!hinted) {
+            hinted = new Set();
+            server.fsDeniedPaths.set(acpSid, hinted);
+          }
+          if (!hinted.has(real)) {
+            hinted.add(real);
+            await sendTextChunk(cx, acpSid, messages().fsPermDeniedHint(real), chunkMsgId);
+          }
+        }
+      }
     }
 
     // Edit/Write diff eager dispatch: on tool.updated result, grab the
@@ -1607,11 +3874,11 @@ async function runEventTurn(
       // terminal resultType (cancelled / success / failed), honour the user's
       // intent and report cancelled.
       if (turn.cancelled || translator.turnResultType === "cancelled") {
-        return { stopReason: "cancelled" };
+        return turnResult(translator, "cancelled");
       }
       if (translator.turnFailed) {
         // Best-effort stop in case the failed turn left a residual lock.
-        stopBackendTurn(server, turn.zcodeSid);
+        stopBackendTurn(server, turn.zcodeSid, turn);
         // Throw a TurnFailedError carrying the structured error so the caller
         // (prompt's retry loop) can classify transient vs fatal. The error
         // message is formatted for display when it ultimately reaches the user.
@@ -1642,15 +3909,29 @@ async function runEventTurn(
       // compaction, before the user's next send) would leave its entire output
       // invisible in the UI. `fetchLastReply` above only covers the last
       // assistant message, not the whole missing span.
-      const snapshot = await buildSnapshot(server, turn.zcodeSid);
+      //
+      // Scoped to the differ's anchor: the completion diff only cares about
+      // THIS turn's messages, and the baseline markSeen at turn entry already
+      // covers everything before the anchor (so even the backend's
+      // cursor-not-found full-list fallback dedups against seen ids). No
+      // `limit`: a long turn's own message count is the natural bound, and a
+      // cap here would silently drop the earliest messages of a huge turn.
+      const snapshot = await buildSnapshot(server, turn.zcodeSid, {
+        ...TURN_READ,
+        afterMessageId: differ.historyAnchor,
+      });
       const completionEvents = differ.diff(snapshot);
       for (const iev of completionEvents) {
-        if (
-          (iev.kind === "TextDelta" || iev.kind === "ReasoningDelta") &&
-          iev.messageId &&
-          translator.deliveredMessageIds.has(iev.messageId)
-        ) {
-          continue;
+        // Per-kind dedup (see deliveredReasoningMessageIds): text and reasoning
+        // share one assistant message id, so the kind that streamed live must
+        // be suppressed while the other kind — typically GLM reasoning that
+        // only exists in the completion snapshot — must still go through.
+        if (iev.kind === "TextDelta" || iev.kind === "ReasoningDelta") {
+          const delivered =
+            iev.kind === "TextDelta"
+              ? translator.deliveredMessageIds
+              : translator.deliveredReasoningMessageIds;
+          if (iev.messageId && delivered.has(iev.messageId)) continue;
         }
         await dispatchEvent(server, cx, acpSid, iev, chunkMsgId);
       }
@@ -1660,13 +3941,9 @@ async function runEventTurn(
       // push current_mode_update + config_option_update when it changed since
       // the last value advertised to the client.
       await emitModeIfChanged(server, cx, acpSid, turn.zcodeSid);
-      return { stopReason: "end_turn" };
+      return turnResult(translator, "end_turn");
     }
   }
-
-  // No progress is an unknown native outcome, not an ordinary end_turn.
-  stopBackendTurn(server, turn.zcodeSid);
-  throw new TurnFailedError({ message: "turn made no observed progress before the stop request" });
 }
 
 /**
@@ -1710,6 +3987,11 @@ function registerFetchedReply(
  * window after `status:idle` where `session/messages` may not yet include the
  * just-finished reply. Skips assistant messages the differ already saw (by
  * dedup key) so a previous turn's reply is never re-emitted as this turn's.
+ *
+ * Scoped to the differ's anchor plus a tail cap: the just-finished reply is
+ * the newest message, and the cap bounds the backend's cursor-not-found
+ * fallback (a rewind that discarded the anchor's branch answers with the
+ * whole store) to a window that still contains the reply.
  */
 async function fetchLastReply(
   server: ZcodeAcpServer,
@@ -1717,7 +3999,11 @@ async function fetchLastReply(
   differ: ProjectionDiffer,
 ): Promise<{ text: string; messageId: string | null } | null> {
   for (let attempt = 0; attempt < 4; attempt++) {
-    const messages = await fetchMessages(server, zcodeSid);
+    const messages = await fetchMessages(server, zcodeSid, {
+      ...TURN_READ,
+      afterMessageId: differ.historyAnchor,
+      limit: REPLY_READ_LIMIT,
+    });
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (!m) continue;
@@ -1758,10 +4044,14 @@ export function flattenTodos(
 }
 
 /** Build a {projection, messages, todos} snapshot from session/messages + session/read. */
-async function buildSnapshot(server: ZcodeAcpServer, zcodeSid: string): Promise<ZcodeSnapshot> {
+async function buildSnapshot(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+  opts: FetchMessagesOptions = {},
+): Promise<ZcodeSnapshot> {
   const backend = server.ensureBackend();
   const [msgs, readResp] = await Promise.all([
-    fetchMessages(server, zcodeSid),
+    fetchMessages(server, zcodeSid, opts),
     backend.request(server.nextId(), "session/read", { sessionId: zcodeSid }, 8000),
   ]);
   const read = (readResp.result ?? {}) as {
@@ -1792,7 +4082,7 @@ export async function emitModeIfChanged(
     const last = server.lastMode.get(acpSid);
     if (last === modes.currentModeId) return;
     server.lastMode.set(acpSid, modes.currentModeId);
-    const options = await buildConfigOptions(server, zcodeSid);
+    const options = await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx));
     await sendSessionUpdate(cx, acpSid, {
       sessionUpdate: "config_option_update",
       configOptions: options,
@@ -1812,6 +4102,11 @@ export async function emitModeIfChanged(
  * a ToolCallUpdate with diff content immediately (don't wait for turn
  * completion — model rate-limiting could delay it indefinitely). Always marks
  * the tool seen in the differ so turn-completion diff won't re-emit it.
+ *
+ * Scoped to the differ's anchor plus a tail cap: the tool message that just
+ * completed is the newest one in the store, so the native cursor reaches it
+ * without transferring the session's whole history on every edit of a long
+ * refactoring turn. The cap only bounds the cursor-not-found fallback.
  */
 async function dispatchEditDiff(
   server: ZcodeAcpServer,
@@ -1822,7 +4117,11 @@ async function dispatchEditDiff(
   differ: ProjectionDiffer,
   chunkMsgId: string,
 ): Promise<void> {
-  const messages = await fetchMessages(server, zcodeSid);
+  const messages = await fetchMessages(server, zcodeSid, {
+    ...TURN_READ,
+    afterMessageId: differ.historyAnchor,
+    limit: EDIT_DIFF_READ_LIMIT,
+  });
   for (const m of messages) {
     for (const p of m.parts ?? []) {
       if (!p || typeof p !== "object") continue;

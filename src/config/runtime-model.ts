@@ -26,6 +26,7 @@
  * See provider-registry.ts.
  */
 
+import { accountProviderIdFor } from "./account-provider.js";
 import { buildModelElement, type ModelEntry } from "./provider-registry.js";
 import {
   findProviderConfig,
@@ -33,6 +34,7 @@ import {
   isBuiltinProvider,
   loadAllModels,
   parseModelValue,
+  personalModelSpec,
 } from "./options.js";
 import type { ModelRef } from "./options.js";
 import { log, warn } from "../utils.js";
@@ -114,15 +116,21 @@ export function buildResumeRuntimeModel(): unknown | null {
  * `value` is the configOption value: either `"providerId\modelId"` (encoded) or
  * a legacy plain modelId (resolved to the first enabled builtin provider).
  *
- * Sends BOTH a `model` ref (the target) AND a `runtimeModel` (the full provider
- * definition). The runtimeModel lets the backend register the provider into its
- * workspace catalog (so even third-party / non-default models are recognised),
- * while `model` names the selection. `persistAsWorkspaceLastUsed:false` keeps
- * this a runtime-only change. Invalidates the model cache on success.
+ * 3.12+ schema (source-verified 2026-09-21 against the open-sourced 0.16.9):
+ * `zcodeSessionSetModelParamsSchema` is strict and `model` must be the
+ * modelSelectionSchema OBJECT — no `runtimeModel` key, no string form
+ * (zcode-protocol/index.ts:1952-1959; model-selection.ts:4-15). The object
+ * form REQUIRES `options.reasoningLevel` for models that declare levels
+ * ("Reasoning level is required for <p>/<m>"); the string form that skips that
+ * check exists only inside the app facade and is unreachable over the
+ * protocol. We therefore send the target model's own default level, read from
+ * the captured create/resume snapshot when we have it, and fall back to
+ * omitting `options` for level-less models.
  *
- * NOTE: the older `session/updateRuntimeModelConfig` path returns `changed:false`
- * on current backends without applying — `session/setModel` is the working
- * protocol since the backend model-management refactor.
+ * Provider ids are translated to the registry's own spelling: config.json says
+ * `builtin:bigmodel-coding-plan` while the registry exposes
+ * `account:bigmodel-individual-coding-plan` (see account-provider.ts). An
+ * untranslated id fails with "Provider Registry 中不存在 Model".
  */
 export async function applyModelSwitch(
   server: ZcodeAcpServer,
@@ -130,21 +138,17 @@ export async function applyModelSwitch(
   value: string,
 ): Promise<boolean> {
   const { providerId, modelId } = parseModelValue(value);
-  const runtimeModel = buildRuntimeModel({ providerId, providerName: providerId, modelId });
-  if (runtimeModel === null) {
-    log(`runtime-model: cannot build overlay for "${value}" (provider not found)`);
-    return false;
-  }
   const backend = server.ensureBackend();
+  const registryProviderId = accountProviderIdFor(providerId);
+  const model: Record<string, unknown> = { providerId: registryProviderId, modelId };
+  // The object form requires the level for level-bearing models; resolve the
+  // target's authoritative default from the captured create/resume snapshot.
+  const level = resolveDefaultReasoningLevel(server, zcodeSid, registryProviderId, modelId);
+  if (level) model.options = { reasoningLevel: level };
   const resp = await backend.request(
     server.nextId(),
     "session/setModel",
-    {
-      sessionId: zcodeSid,
-      model: { providerId, modelId },
-      runtimeModel,
-      persistAsWorkspaceLastUsed: false,
-    },
+    { sessionId: zcodeSid, model, persistAsWorkspaceLastUsed: false },
     15000,
   );
   if (resp.error) {
@@ -153,6 +157,63 @@ export async function applyModelSwitch(
   }
   invalidateModelCache(server, zcodeSid);
   return true;
+}
+
+/**
+ * The reasoning level a switch should start the model at.
+ *
+ * The object form REQUIRES a level for level-bearing models
+ * ("Reasoning level is required for <p>/<m>"), so one must be supplied. The
+ * backend's own answer is the only correct source: config.json's
+ * `reasoning.variants` go stale (observed 2026-09 — a third-party model
+ * configured `off/high/max` actually ran `low/high/max`). `session/create`'s
+ * captured availability list (server.modelAvailability) carries the
+ * authoritative `defaultLevel`; models that declare no levels yield null and
+ * callers omit `options` so they accept the switch.
+ */
+function resolveDefaultReasoningLevel(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+  providerId: string,
+  modelId: string,
+): string | null {
+  const cached = server.modelAvailability.get(zcodeSid) ?? [];
+  const hit = cached.find((a) => a.providerId === providerId && a.modelId === modelId);
+  if (hit?.defaultLevel) return hit.defaultLevel;
+  if (hit) return null; // present but level-less — omit options
+  // Not in the captured list (a model the registry gained after create):
+  // fall back to config.json's declaration rather than sending no level.
+  try {
+    const p = findProviderConfig(providerId);
+    const entry = (
+      p?.models as
+        | Record<
+            string,
+            { reasoning?: { enabled?: boolean; variants?: string[]; defaultVariant?: string } }
+          >
+        | undefined
+    )?.[modelId];
+    const reasoning = entry?.reasoning;
+    if (reasoning && reasoning.enabled !== false) {
+      if (reasoning.defaultVariant) return reasoning.defaultVariant;
+      if (reasoning.variants?.length) return reasoning.variants[0]!;
+    }
+  } catch {
+    // unreadable config — try the personal config below
+  }
+  // In config.json neither — a model the desktop added to its personal
+  // provider config after this session was created. The rule carries the
+  // level vocabulary (`optionSpecs.reasoningLevel`); its declared default or
+  // first value is the best-effort level (omitting `options` would hard-fail
+  // a level-bearing switch).
+  try {
+    const spec = personalModelSpec(providerId, modelId);
+    const values = spec?.reasoningValues;
+    if (values?.length) return values[0]!;
+  } catch {
+    // unreadable personal config — omit options
+  }
+  return null;
 }
 
 /** Invalidate the session-level model cache after a switch. */

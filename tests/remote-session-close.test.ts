@@ -11,7 +11,11 @@ import { createServer, type Server } from "node:http";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createSessionCloseHandler } from "../src/remote/session-close-endpoint.js";
+import {
+  createSessionCloseHandler,
+  serveTerminateDecision,
+  tuiTeardownPids,
+} from "../src/remote/session-close-endpoint.js";
 import { collectStatus } from "../src/remote/status-endpoint.js";
 import { collectSessions } from "../src/remote/endpoint.js";
 import { ZcodeAcpServer } from "../src/server.js";
@@ -74,6 +78,59 @@ describe("session close endpoint", () => {
     expect((await collectSessions(server)).map((s) => s.sessionId)).not.toContain(acpSid);
   });
 
+  it("notifies attached clients ($/zcode/session_closed) per alias on a serve-origin close", async () => {
+    // The martty-quit channel: an incubated window showing the closed session
+    // exits cleanly on this notification instead of waiting for terminate
+    // signals. Serve-origin only — and one copy per session alias, because a
+    // client may hold the conversation under a different acpSid.
+    process.env.ZCODE_ACP_REMOTE_ORIGIN = "serve";
+    try {
+      const server = new ZcodeAcpServer();
+      const { acpSid, zcodeSid } = seedSession(server, { title: "remote" });
+      const altSid = randomUUID();
+      server.registerSession(altSid, zcodeSid);
+      const received: Array<{ method: string; params: Record<string, unknown> }> = [];
+      server.clients.add({
+        notify: async (method: string, params: unknown) => {
+          received.push({ method, params: params as Record<string, unknown> });
+        },
+        request: async () => {
+          throw new Error("no server→client requests expected");
+        },
+      });
+      const base = await bootClose(server);
+
+      const res = await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" });
+      expect(res.status).toBe(200);
+      expect(received).toEqual([
+        { method: "$/zcode/session_closed", params: { sessionId: acpSid } },
+        { method: "$/zcode/session_closed", params: { sessionId: altSid } },
+      ]);
+    } finally {
+      delete process.env.ZCODE_ACP_REMOTE_ORIGIN;
+    }
+  });
+
+  it("stays silent on close for an editor-origin bridge (no window teardown hint)", async () => {
+    // A remote retire must never hint a user-launched CLI window into
+    // closing itself — ADR-0006's self-heal owns that case.
+    const server = new ZcodeAcpServer();
+    const { acpSid } = seedSession(server, { title: "editor" });
+    const received: Array<{ method: string }> = [];
+    server.clients.add({
+      notify: async (method: string) => {
+        received.push({ method });
+      },
+      request: async () => {
+        throw new Error("no server→client requests expected");
+      },
+    });
+    const base = await bootClose(server);
+
+    expect((await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" })).status).toBe(200);
+    expect(received).toEqual([]);
+  });
+
   it("rejects closing a session with a running turn", async () => {
     const server = new ZcodeAcpServer();
     const { acpSid, zcodeSid } = seedSession(server);
@@ -94,6 +151,52 @@ describe("session close endpoint", () => {
       404,
     );
     expect((await fetch(`${base}/sessions/whatever/close`)).status).toBe(405);
+  });
+
+  it("evicts the backend resident runtime (session/close) and clears the liveness cache", async () => {
+    const server = new ZcodeAcpServer();
+    const { acpSid, zcodeSid } = seedSession(server);
+    const sent: Array<{ method: string; params: unknown }> = [];
+    server.backend = {
+      isDead: false,
+      send: (method: string, params: unknown) => sent.push({ method, params }),
+    } as unknown as typeof server.backend;
+    server.markBackendLoaded(acpSid);
+    const base = await bootClose(server);
+
+    const res = await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" });
+    expect(res.status).toBe(200);
+    expect(sent).toEqual([{ method: "session/close", params: { sessionId: zcodeSid } }]);
+    // Stale "still loaded" trust must go, or a later resume would skip the
+    // backend's session/resume RPC.
+    expect(server.isBackendSessionLive(acpSid)).toBe(false);
+  });
+
+  it("closes without a live backend (no spawn, discovery still retired)", async () => {
+    const server = new ZcodeAcpServer();
+    const { acpSid } = seedSession(server);
+    const base = await bootClose(server);
+
+    const res = await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" });
+    expect(res.status).toBe(200);
+    expect(server.backend).toBeNull(); // close never spawned one
+  });
+
+  it("closes an empty remote-created placeholder (no summary, still advertised)", async () => {
+    // Regression: the 404 guard only checked sessionSummaries, so a
+    // phone-minted placeholder could never be closed — it stayed advertised
+    // forever and blocked the serve-origin last-close CLI termination.
+    const server = new ZcodeAcpServer();
+    const acpSid = randomUUID();
+    server.remoteCreatedSessions.add(acpSid);
+    const base = await bootClose(server);
+
+    expect((await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" })).status).toBe(200);
+    expect(server.remoteCreatedSessions.has(acpSid)).toBe(false);
+    // With nothing else advertised, a serve-origin bridge WOULD now terminate.
+    expect(serveTerminateDecision(0, { ZCODE_ACP_REMOTE_ORIGIN: "serve" })).toEqual({
+      terminate: true,
+    });
   });
 
   it("a closed session reappears once the editor touches it again (self-healing)", async () => {
@@ -124,5 +227,70 @@ describe("session close endpoint", () => {
     // hasActivity unset) — the session must stay hidden until real use.
     server.registerSession(acpSid, zcodeSid);
     expect(collectStatus(server).sessions).toHaveLength(0);
+  });
+});
+
+describe("serve-origin termination decision (remote close ends the CLI)", () => {
+  it("editor-origin bridges never terminate — retire-only semantics hold", () => {
+    expect(serveTerminateDecision(0, { ZCODE_ACP_TUI_CLI_PID: "4242" })).toBeNull();
+  });
+
+  it("a TUI bridge terminates on the LAST close, targeting its process group", () => {
+    expect(
+      serveTerminateDecision(1, {
+        ZCODE_ACP_REMOTE_ORIGIN: "serve",
+        ZCODE_ACP_TUI_CLI_PID: "4242",
+      }),
+    ).toEqual({ terminate: false });
+
+    expect(
+      serveTerminateDecision(0, {
+        ZCODE_ACP_REMOTE_ORIGIN: "serve",
+        ZCODE_ACP_TUI_CLI_PID: "4242",
+      }),
+    ).toEqual({ terminate: true, tuiPgid: 4242 });
+  });
+
+  it("a headless serve bridge self-exits (no TUI pid) and a stale pid is ignored", () => {
+    expect(serveTerminateDecision(0, { ZCODE_ACP_REMOTE_ORIGIN: "serve" })).toEqual({
+      terminate: true,
+    });
+    expect(
+      serveTerminateDecision(0, {
+        ZCODE_ACP_REMOTE_ORIGIN: "serve",
+        ZCODE_ACP_TUI_CLI_PID: "not-a-pid",
+      }),
+    ).toEqual({ terminate: true });
+  });
+
+  it("teardown targets the CLI pid and the bridge's parent, deduped", () => {
+    // Ghostty's AppleScript tab and Warp's URI tab run the script WITHOUT a
+    // new session: the process group never exists and the direct pids are
+    // the only signal that lands (verified live 2026-09-08).
+    expect(tuiTeardownPids(100, 200)).toEqual([100, 200]);
+    // Same process hosting both roles (bridge spawned by the CLI itself).
+    expect(tuiTeardownPids(100, 100)).toEqual([100]);
+    // launchd (1) never gets signalled; malformed values drop out.
+    expect(tuiTeardownPids(1, 200)).toEqual([200]);
+    expect(tuiTeardownPids(100, 1)).toEqual([100]);
+    expect(tuiTeardownPids(Number.NaN, 200)).toEqual([200]);
+  });
+
+  it("remote-created empty placeholders count as advertised — close keeps the CLI alive", async () => {
+    const server = new ZcodeAcpServer();
+    // One live TUI conversation + one phone-created empty session.
+    const live = seedSession(server);
+    const empty = randomUUID();
+    server.remoteCreatedSessions.add(empty);
+    const base = await bootClose(server);
+
+    expect((await fetch(`${base}/sessions/${live.acpSid}/close`, { method: "POST" })).status).toBe(
+      200,
+    );
+    // The empty placeholder still holds the CLI up.
+    expect(serveTerminateDecision(1, { ZCODE_ACP_REMOTE_ORIGIN: "serve" })).toEqual({
+      terminate: false,
+    });
+    expect(server.remoteCreatedSessions.has(empty)).toBe(true);
   });
 });

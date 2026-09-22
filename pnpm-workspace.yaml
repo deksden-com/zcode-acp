@@ -1,4 +1,6 @@
 allowBuilds:
-  esbuild: set this to true or false
+  esbuild: true
+minimumReleaseAgeExclude:
+  - zcode-acp-martty@0.2.39-zcode.5
 onlyBuiltDependencies:
   - esbuild

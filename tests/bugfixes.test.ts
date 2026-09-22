@@ -58,13 +58,13 @@ describe("Bug A: pollEvent zombie waiter", () => {
 });
 
 describe("background root cancellation", () => {
-  it("stops an untracked backend turn after the ACP prompt already returned", async () => {
+  it("does not stop an unowned quiet-window turn through ordinary ACP cancel", async () => {
     const server = new ZcodeAcpServer();
     server.sessionMap.set("adapter-root", "native-root");
     const send = vi.fn();
     vi.spyOn(server, "ensureBackend").mockReturnValue({ send } as never);
     await cancel(server, { sessionId: "adapter-root" });
-    expect(send).toHaveBeenCalledWith("session/stop", { sessionId: "native-root" });
+    expect(send).not.toHaveBeenCalled();
   });
 });
 

@@ -26,10 +26,12 @@ import {
 } from "@agentclientprotocol/sdk/experimental/node";
 import { WebSocketServer } from "ws";
 
+import { runtimeSpawnParts } from "../runtime.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { AGENT_INFO, log, warn } from "../utils.js";
 import { createFileHandler } from "./file-endpoint.js";
 import { createSessionCloseHandler } from "./session-close-endpoint.js";
+import { createSessionListHandler } from "./session-list-endpoint.js";
 import { createSessionRenameHandler } from "./session-rename-endpoint.js";
 import { createStatusHandler, runningZcodeSids, type SessionRunStatus } from "./status-endpoint.js";
 import type { RemoteConfig } from "./config.js";
@@ -46,6 +48,8 @@ interface AdvertisedSession {
 const HEARTBEAT_MS = 10_000;
 /** Minimum spacing between hub spawn attempts (avoids spawn storms). */
 const SPAWN_THROTTLE_MS = 60_000;
+/** Cap for the 401-spawn backoff ladder (starts at SPAWN_THROTTLE_MS, doubles). */
+const AUTH_SPAWN_MAX_BACKOFF_MS = 10 * 60_000;
 /** Max ports probed above ZCODE_ACP_REMOTE_PORT before giving up. */
 const MAX_PORT_PROBES = 100;
 
@@ -80,7 +84,9 @@ function tryListen(server: Server, port: number): Promise<boolean> {
  * - Accessible: every member is a registered acp→zcode mapping here, so a
  *   remote `session/load` resolves and resumes it on demand. Lazy
  *   placeholders without a backend session never ran a turn and stay
- *   invisible.
+ *   invisible — except REMOTE-created ones (`remoteCreatedSessions`), which
+ *   the phone must see in its active list right after creating them (for as
+ *   long as the hosting CLI bridge lives).
  *
  * Advertised ids are the ACP session ids the EDITOR uses (placeholder ids,
  * stable across bridges via Zed's own storage and the durable alias store) —
@@ -112,6 +118,22 @@ export async function collectSessions(server: ZcodeAcpServer): Promise<Advertise
       ...(summary.title !== undefined ? { title: summary.title } : {}),
       updatedAt: summary.updatedAt,
     });
+  }
+  // Remote-created conversations with zero turns: a phone has no editor-side
+  // session storage, so the ACTIVE list must show its own fresh session at
+  // once. Visibility is bound to the CLI bridge that hosts it (the in-memory
+  // set dies with the process): the window closing ends the empty session's
+  // list presence, while the phone app sleeping/reconnecting does not — the
+  // bridge keeps heartbeating either way. Still-pure placeholders only —
+  // once the first turn materializes it, the loop above takes over under the
+  // zcodeSid key and the skips here prevent a duplicate row. Locally minted
+  // placeholders stay invisible.
+  const advertised = new Set(Array.from(live.values(), (s) => s.sessionId));
+  for (const acpSid of server.remoteCreatedSessions) {
+    if (server.resolveSid(acpSid)) continue; // materialized — covered above
+    if (advertised.has(acpSid)) continue;
+    const summary = server.sessionSummaries.get(acpSid);
+    live.set(acpSid, { sessionId: acpSid, updatedAt: summary?.updatedAt ?? Date.now() });
   }
 
   const backend = server.backend;
@@ -202,6 +224,7 @@ export async function startRemoteEndpoint(
   const statusHandler = createStatusHandler(server);
   const sessionCloseHandler = createSessionCloseHandler(server);
   const sessionRenameHandler = createSessionRenameHandler(server);
+  const sessionListHandler = createSessionListHandler(server);
 
   const httpServer = createServer((req, res) => {
     const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
@@ -212,6 +235,7 @@ export async function startRemoteEndpoint(
     else if (path === "/status") statusHandler(req, res);
     else if (closeMatch) sessionCloseHandler(req, res, closeMatch[1]!);
     else if (renameMatch) sessionRenameHandler(req, res, renameMatch[1]!);
+    else if (path === "/sessions") sessionListHandler(req, res);
     else {
       res.writeHead(404, { "Content-Type": "text/plain" });
       res.end("not found");
@@ -250,7 +274,26 @@ export async function startRemoteEndpoint(
   const instanceStartedAt = Date.now();
   let stopped = false;
   let authRejected = false;
+  // 401-spawn schedule: an independent ladder from the unreachable-path
+  // throttle, because a mixed-token fleet can keep the mismatched hub alive
+  // indefinitely (its own bridges keep re-registering) — every spawn before
+  // that hub dies is a lost port race, so the attempts back off to a cap.
+  let nextAuthSpawnAt = 0;
+  let authSpawnBackoffMs = SPAWN_THROTTLE_MS;
+  // Last non-2xx/non-401 register status we warned about (once per stretch).
+  let unexpectedStatus: number | null = null;
   let spawnThrottledUntil = 0;
+
+  // The incubated TUI tree this bridge belongs to (ZCODE_ACP_TUI_CLI_PID —
+  // the .command script's $$, exec'd into the CLI): lets the hub's instance
+  // shutdown tear the whole window down, not just this leaf bridge. Serve
+  // origin only — an editor bridge inheriting the var from a TUI-launched
+  // shell must never name another tree.
+  const tuiPidRaw = Number.parseInt((process.env.ZCODE_ACP_TUI_CLI_PID ?? "").trim(), 10);
+  const tuiPid =
+    config.origin === "serve" && Number.isInteger(tuiPidRaw) && tuiPidRaw > 1
+      ? tuiPidRaw
+      : undefined;
 
   const payload = (sessions: AdvertisedSession[]) => ({
     token: config.token,
@@ -260,6 +303,15 @@ export async function startRemoteEndpoint(
     startedAt: instanceStartedAt,
     workspace: server.workspaceLabel(),
     sessions,
+    // "editor" (stdio bridge) or "serve" (headless, hub-spawned, ADR-0014):
+    // lets the hub dedupe headless instances per workspace and label them.
+    origin: config.origin,
+    ...(tuiPid !== undefined ? { tuiPid } : {}),
+    // Hub-incubation correlation (ADR-0016/0017): the hub generates a nonce
+    // per spawn and matches its registration poll against it — several
+    // incubations can race for one workspace, and without this one's poll
+    // could claim another's bridge. Bridges started by hand carry none.
+    ...(process.env.ZCODE_ACP_SPAWN_NONCE ? { nonce: process.env.ZCODE_ACP_SPAWN_NONCE } : {}),
     // Lets the hub detect that it is older than this bridge and restart
     // itself (we then re-spawn it from this dist — see registerOnce).
     version: AGENT_INFO.version,
@@ -269,7 +321,7 @@ export async function startRemoteEndpoint(
     try {
       // dist/remote/endpoint.js → dist/bin/hub.js (one level up, then bin/).
       const hubJs = fileURLToPath(new URL("../bin/hub.js", import.meta.url));
-      const child = spawn(process.execPath, [hubJs], {
+      const child = spawn(...runtimeSpawnParts(hubJs), {
         detached: true,
         // Surface the daemon's stderr through the bridge's diagnostics — a
         // detached "ignore" pipe silently eats startup failures.
@@ -303,15 +355,18 @@ export async function startRemoteEndpoint(
   let lastSessions: AdvertisedSession[] = [];
 
   const registerOnce = async (): Promise<void> => {
-    if (stopped || authRejected) return;
+    if (stopped) return;
     // Project-scoped session list before every heartbeat (session/list merge,
-    // ~100-300ms). Never throws; wrapped anyway so a surprise failure can't
-    // fall into the hub-spawn catch below (which would misread it as "hub
-    // unreachable").
-    try {
-      lastSessions = await collectSessions(server);
-    } catch {
-      /* keep lastSessions */
+    // ~100-300ms). Skipped while token-rejected: the payload would be refused
+    // anyway, so keep advertising lastSessions until a hub accepts us again.
+    // Never throws; wrapped anyway so a surprise failure can't fall into the
+    // hub-spawn catch below (which would misread it as "hub unreachable").
+    if (!authRejected) {
+      try {
+        lastSessions = await collectSessions(server);
+      } catch {
+        /* keep lastSessions */
+      }
     }
     try {
       const res = await postJson(
@@ -319,11 +374,49 @@ export async function startRemoteEndpoint(
         payload(lastSessions),
       );
       if (res.status === 401) {
-        authRejected = true;
-        warn(
-          "remote: hub rejected the token (401) — registration stopped, check ZCODE_ACP_REMOTE_TOKEN",
-        );
+        // Token mismatch — typically the token was rotated while this bridge
+        // (or the running hub) kept the old value. Never poison permanently:
+        // keep heartbeating so the bridge heals the moment a hub with a
+        // matching token answers, and spawn a replacement hub carrying OUR
+        // token. While a mismatched hub still holds the port the spawn loses
+        // the singleton race and exits; once that hub stops answering (it
+        // idle-exits once no bridge can register with it) the next spawn
+        // installs one that accepts us. Spawn spacing backs off to the cap —
+        // see nextAuthSpawnAt above.
+        if (!authRejected) {
+          authRejected = true;
+          warn(
+            "remote: hub rejected the token (401) — registration keeps retrying; " +
+              "a replacement hub is spawned (with backoff) until one accepts this token",
+          );
+        }
+        if (Date.now() >= nextAuthSpawnAt) {
+          nextAuthSpawnAt = Date.now() + authSpawnBackoffMs;
+          authSpawnBackoffMs = Math.min(authSpawnBackoffMs * 2, AUTH_SPAWN_MAX_BACKOFF_MS);
+          spawnHub();
+          const retry = setTimeout(() => void registerOnce(), 1500);
+          retry.unref();
+        }
         return;
+      }
+      if (res.ok) {
+        if (authRejected) {
+          authRejected = false;
+          // Fresh ladder for any future rejection stretch — BOTH the backoff
+          // and the next-spawn timestamp, or the next stretch's first 401
+          // would inherit the old schedule and skip its own replacement
+          // spawn for up to the 10min cap.
+          authSpawnBackoffMs = SPAWN_THROTTLE_MS;
+          nextAuthSpawnAt = 0;
+          log("remote: hub registration recovered after 401 rejection");
+        }
+        unexpectedStatus = null;
+      } else if (unexpectedStatus !== res.status) {
+        // Neither 2xx nor 401 — e.g. the port is held by a non-hub service.
+        // Without this the endpoint would be silently dead; warn once per
+        // stretch so the 10s heartbeat can't spam it.
+        unexpectedStatus = res.status;
+        warn(`remote: hub answered registration with unexpected status ${res.status}`);
       }
       // Version handshake: the hub saw a newer bridge and is exiting. It is
       // gone by now (it exits ~0.5s after replying) — re-spawn it from THIS

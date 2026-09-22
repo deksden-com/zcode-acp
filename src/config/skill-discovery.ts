@@ -9,13 +9,15 @@
  * and passes the text through.
  *
  * Discovery sources (in priority order — first occurrence wins on name clash):
- *   1. ~/.zcode/skills/&#42;/SKILL.md          (user scope, ZCode native)
+ *   1. <zcode-home>/skills/&#42;/SKILL.md      (user scope, ZCode native)
  *   2. ~/.agents/skills/&#42;/SKILL.md          (user scope, shared agents)
  *   3. enabled plugin <cache>/skills/&#42;/SKILL.md
  *   4. <cwd>/.agents/skills/&#42;/SKILL.md      (project scope)
  *
- * Skills explicitly disabled in `~/.zcode/cli/config.json` (skills map with
- * `enable: false`, keyed by absolute SKILL.md path) are excluded.
+ * `<zcode-home>` is the ZCode data root (`~/.zcode`, or `$ZCODE_HOME` when
+ * set — see `zcodeHomeDir()`). Skills explicitly disabled in
+ * `<zcode-home>/cli/config.json` (skills map with `enable: false`, keyed by
+ * absolute SKILL.md path) are excluded.
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -23,7 +25,13 @@ import { homedir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 
-import { compareVersions, log } from "../utils.js";
+import {
+  compareVersions,
+  log,
+  zcodeCliConfigPath,
+  zcodeHomeDir,
+  zcodePluginCacheDir,
+} from "../utils.js";
 
 /** A slash-command entry compatible with `sendAvailableCommands`. */
 export interface SkillEntry {
@@ -38,14 +46,6 @@ interface CliConfig {
     enabledPlugins?: Record<string, boolean>;
   };
 }
-
-const HOME = homedir();
-
-/** Path to the ZCode CLI config (skills enable/disable, plugins, mcp). */
-const CLI_CONFIG_PATH = path.join(HOME, ".zcode", "cli", "config.json");
-
-/** Root of the plugin cache directory. */
-const PLUGIN_CACHE_DIR = path.join(HOME, ".zcode", "cli", "plugins", "cache");
 
 /** Max description length before truncation with ellipsis. */
 const MAX_DESC_LEN = 80;
@@ -157,8 +157,9 @@ export function loadSkillCommands(): SkillEntry[] {
   // Load config for disabled-skills list + enabled-plugins list.
   let config: CliConfig | null = null;
   try {
-    if (existsSync(CLI_CONFIG_PATH)) {
-      config = JSON.parse(readFileSync(CLI_CONFIG_PATH, "utf8")) as CliConfig;
+    const cliConfigPath = zcodeCliConfigPath();
+    if (existsSync(cliConfigPath)) {
+      config = JSON.parse(readFileSync(cliConfigPath, "utf8")) as CliConfig;
     }
   } catch (e) {
     log(`skill-discovery: config read failed (${e instanceof Error ? e.message : String(e)})`);
@@ -166,11 +167,11 @@ export function loadSkillCommands(): SkillEntry[] {
 
   const disabledPaths = loadDisabledSkillPaths(config);
 
-  // 1. ~/.zcode/skills/
-  scanSkillDir(path.join(HOME, ".zcode", "skills"), disabledPaths, results, seen);
+  // 1. User skills under the ZCode data root.
+  scanSkillDir(path.join(zcodeHomeDir(), "skills"), disabledPaths, results, seen);
 
   // 2. ~/.agents/skills/
-  scanSkillDir(path.join(HOME, ".agents", "skills"), disabledPaths, results, seen);
+  scanSkillDir(path.join(homedir(), ".agents", "skills"), disabledPaths, results, seen);
 
   // 3. Enabled plugin skills.
   const enabledPlugins = config?.plugins?.enabledPlugins ?? {};
@@ -181,7 +182,7 @@ export function loadSkillCommands(): SkillEntry[] {
     const pluginName = pluginKey.slice(0, atIdx);
     const marketplace = pluginKey.slice(atIdx + 1);
 
-    const pluginDir = path.join(PLUGIN_CACHE_DIR, marketplace, pluginName);
+    const pluginDir = path.join(zcodePluginCacheDir(), marketplace, pluginName);
     if (!existsSync(pluginDir)) continue;
 
     // Find the latest version directory.

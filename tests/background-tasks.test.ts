@@ -7,11 +7,20 @@
  * backend or ACP client — `notifyByZcodeSid` is stubbed to record calls.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BackgroundTaskListener } from "../src/handlers/background-tasks.js";
 import type { ZcodeAcpServer } from "../src/server.js";
 import type { ZcodeEvent } from "../src/backend/types.js";
+
+// Pin the language: asserted card titles are English and fs is not mocked.
+beforeEach(() => {
+  vi.stubEnv("ZCODE_ACP_LANG", "en");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 /** A minimal fake server: records every session/update it would send. */
 interface FakeServer {
@@ -19,6 +28,8 @@ interface FakeServer {
   /** Mirrors ZcodeAcpServer.terminalSentData — set by tests to simulate a
    *  tracked launch card so BackgroundTaskListener reuses it. */
   terminalSentData: Map<string, string>;
+  /** Mirrors ZcodeAcpServer.notifyTurnActiveSince (notification busy window). */
+  notifyTurnActiveSince: Map<string, number>;
 }
 type TestServer = FakeServer & Pick<ZcodeAcpServer, "notifyByZcodeSid">;
 
@@ -27,6 +38,7 @@ function makeServer(): TestServer {
   const server = {
     calls,
     terminalSentData: new Map<string, string>(),
+    notifyTurnActiveSince: new Map<string, number>(),
     async notifyByZcodeSid(zcodeSid: string, update: Record<string, unknown>): Promise<boolean> {
       calls.push({ zcodeSid, update });
       return true;
@@ -125,9 +137,11 @@ describe("BackgroundTaskListener", () => {
     const l = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
     // A notification turn starts.
     l.handleEvent(
-      zcodeEvent("turn.started", { inputSource: "background_task", turnId: "turn_bg1" }),
+      zcodeEvent("turn.started", { inputSource: "background_task" }, { turnId: "turn_bg1" }),
     );
     await Promise.resolve();
+    // The notification busy window opens with the turn.
+    expect(server.notifyTurnActiveSince.has("sess_test")).toBe(true);
     // Its text deltas are forwarded.
     l.handleEvent(zcodeEvent("model.streaming", { kind: "text_delta", delta: "result part 1 " }));
     l.handleEvent(zcodeEvent("model.streaming", { kind: "text_delta", delta: "part 2" }));
@@ -135,6 +149,8 @@ describe("BackgroundTaskListener", () => {
     // turn.completed ends the notification turn.
     l.handleEvent(zcodeEvent("turn.completed", { resultType: "success" }));
     await Promise.resolve();
+    // ...and the busy window closes with it.
+    expect(server.notifyTurnActiveSince.has("sess_test")).toBe(false);
     // Subsequent text_delta (no active bg turn) is NOT forwarded.
     l.handleEvent(zcodeEvent("model.streaming", { kind: "text_delta", delta: "leak" }));
     await Promise.resolve();
@@ -146,6 +162,19 @@ describe("BackgroundTaskListener", () => {
     expect(chunks[0]!.update["messageId"]).toBe(chunks[1]!.update["messageId"]);
   });
 
+  it("turn.failed also closes the notification busy window", async () => {
+    const server = makeServer();
+    const l = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    l.handleEvent(
+      zcodeEvent("turn.started", { inputSource: "background_task" }, { turnId: "turn_bg2" }),
+    );
+    await Promise.resolve();
+    expect(server.notifyTurnActiveSince.has("sess_test")).toBe(true);
+    l.handleEvent(zcodeEvent("turn.failed", { error: { code: "x" } }));
+    await Promise.resolve();
+    expect(server.notifyTurnActiveSince.has("sess_test")).toBe(false);
+  });
+
   it("allocates a fresh messageId per background task (no cross-task reuse)", async () => {
     // Regression guard: firstMessageId must be reset when a background
     // notification turn ends, else two tasks in the same session share one
@@ -153,14 +182,14 @@ describe("BackgroundTaskListener", () => {
     const server = makeServer();
     const l = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
     // Task 1's notification turn.
-    l.handleEvent(zcodeEvent("turn.started", { inputSource: "background_task", turnId: "t1" }));
+    l.handleEvent(zcodeEvent("turn.started", { inputSource: "background_task" }, { turnId: "t1" }));
     await Promise.resolve();
     l.handleEvent(zcodeEvent("model.streaming", { kind: "text_delta", delta: "task1 result" }));
     await Promise.resolve();
     l.handleEvent(zcodeEvent("turn.completed", { resultType: "success" }));
     await Promise.resolve();
     // Task 2's notification turn (same session, same listener instance).
-    l.handleEvent(zcodeEvent("turn.started", { inputSource: "background_task", turnId: "t2" }));
+    l.handleEvent(zcodeEvent("turn.started", { inputSource: "background_task" }, { turnId: "t2" }));
     await Promise.resolve();
     l.handleEvent(zcodeEvent("model.streaming", { kind: "text_delta", delta: "task2 result" }));
     await Promise.resolve();
@@ -175,7 +204,9 @@ describe("BackgroundTaskListener", () => {
   it("does NOT forward a normal (non-background) turn's text_delta", async () => {
     const server = makeServer();
     const l = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
-    l.handleEvent(zcodeEvent("turn.started", { inputSource: "user_prompt", turnId: "turn_user" }));
+    l.handleEvent(
+      zcodeEvent("turn.started", { inputSource: "user_prompt" }, { turnId: "turn_user" }),
+    );
     await Promise.resolve();
     l.handleEvent(zcodeEvent("model.streaming", { kind: "text_delta", delta: "user reply" }));
     await Promise.resolve();
@@ -430,5 +461,60 @@ describe("BackgroundTaskListener: background Bash reuses launch card", () => {
     expect(meta.backgroundTask.cancelled).toBe(true);
     expect(meta.terminal_exit.exit_code).toBe(1);
     expect(server.terminalSentData.has("call_bash4")).toBe(false);
+  });
+});
+
+describe("emitShutdownRecords (#194)", () => {
+  it("emits a failed shutdown record for an in-flight task and skips terminal ones", async () => {
+    const server = makeServer();
+    const l = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    l.handleEvent(zcodeEvent("session.updated", { taskId: "exec_live", status: "running" }));
+    l.handleEvent(zcodeEvent("session.updated", { taskId: "exec_done", status: "completed" }));
+    await Promise.resolve();
+    server.calls.length = 0;
+
+    await l.emitShutdownRecords();
+
+    // Only the still-running task gets a record; the completed one is skipped.
+    expect(server.calls).toHaveLength(1);
+    const rec = server.calls[0]!.update;
+    expect(rec["sessionUpdate"]).toBe("tool_call_update");
+    expect(rec["status"]).toBe("failed");
+    const meta = rec["_meta"] as { backgroundTask: { shutdown: boolean } };
+    expect(meta.backgroundTask.shutdown).toBe(true);
+
+    // Idempotent: a second sweep finds nothing in flight.
+    server.calls.length = 0;
+    await l.emitShutdownRecords();
+    expect(server.calls).toHaveLength(0);
+  });
+
+  it("emits terminal_exit for a reused launch card on shutdown", async () => {
+    const server = makeServer();
+    server.terminalSentData.set("call_bash9", "bg launch text\n");
+    const l = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    l.handleEvent(
+      zcodeEvent("session.updated", {
+        taskId: "exec_shutdown",
+        toolCallId: "call_bash9",
+        status: "running",
+      }),
+    );
+    await Promise.resolve();
+    server.calls.length = 0;
+
+    await l.emitShutdownRecords();
+
+    expect(server.calls).toHaveLength(1);
+    const rec = server.calls[0]!.update;
+    expect(rec["toolCallId"]).toBe("call_bash9");
+    expect(rec["status"]).toBe("failed");
+    const meta = rec["_meta"] as {
+      backgroundTask: { shutdown: boolean };
+      terminal_exit: { exit_code: number };
+    };
+    expect(meta.backgroundTask.shutdown).toBe(true);
+    expect(meta.terminal_exit.exit_code).toBe(1);
+    expect(server.terminalSentData.has("call_bash9")).toBe(false);
   });
 });

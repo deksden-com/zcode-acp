@@ -170,16 +170,17 @@ API only because the ZCode backend itself sends them for inference.
 
 ### `handlers/` — ACP method handling
 
-| File                  | Responsibility                                                                                                                                                                                          |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `session.ts`          | session/new/list/resume/load/prompt/set_config_option/cancel                                                                                                                                            |
-| `extensions.ts`       | fork/rewind/rewindCascade/goal/compact/steer/cancelBackgroundTask/setModel/setMode/setThoughtLevel                                                                                                      |
-| `dispatch.ts`         | dispatchEvent single exit point: InternalEvent → ACP session/update                                                                                                                                     |
-| `background-tasks.ts` | Session-scoped `BackgroundTaskListener` — forwards background sub-agent status (`session.updated` taskId) + completion-notification turns to the client OUTSIDE request handlers (lives across prompts) |
-| `server-requests.ts`  | Handle zcode interaction/* requests (tool auth, ExitPlanMode, AskUserQuestion), protocol negotiation routing                                                                                            |
-| `io.ts`               | ACP notification helpers (including `sendAvailableCommandsDeferred` deferred notification)                                                                                                              |
-| `slash.ts`            | Interception of `/`-prefixed commands (/compact /goal /fork /rewind /steer /model /mode /thought); non-advertised `/x` prompts are neutralized into plain text (`neutralizeSlashText`)                  |
-| `account.ts`          | `account/usage_stats` — account-level plan quota for remote clients (Proposal 0002; quota pipeline + graceful error)                                                                                    |
+| File                  | Responsibility                                                                                                                                                                                                         |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `session.ts`          | session/new/list/resume/load/prompt/set_config_option/cancel                                                                                                                                                           |
+| `extensions.ts`       | fork/rewind/rewindCascade/goal/compact/steer/cancelBackgroundTask/setModel/setMode/setThoughtLevel                                                                                                                     |
+| `dispatch.ts`         | dispatchEvent single exit point: InternalEvent → ACP session/update                                                                                                                                                    |
+| `background-tasks.ts` | Session-scoped `BackgroundTaskListener` — forwards background sub-agent status (`session.updated` taskId) + completion-notification turns to the client OUTSIDE request handlers (lives across prompts)                |
+| `session-titles.ts`   | Session-scoped `SessionTitleListener` — adopts backend `session.titleUpdated` pushes (`generated`/`custom` sources; manual renames win) into sessionTitles/tasks-index/terminal tab + broadcasts `session_info_update` |
+| `server-requests.ts`  | Handle zcode interaction/* requests (tool auth, ExitPlanMode, AskUserQuestion), protocol negotiation routing                                                                                                           |
+| `io.ts`               | ACP notification helpers (including `sendAvailableCommandsDeferred` deferred notification)                                                                                                                             |
+| `slash.ts`            | Interception of `/`-prefixed commands (/compact /goal /fork /rewind /steer /model /mode /thought); non-advertised `/x` prompts are neutralized into plain text (`neutralizeSlashText`)                                 |
+| `account.ts`          | `account/usage_stats` — account-level plan quota for remote clients (Proposal 0002; quota pipeline + graceful error)                                                                                                   |
 
 ### `interaction/` — Interaction bridging
 
@@ -226,8 +227,11 @@ would keep running pre-upgrade code until its 10-minute idle exit.
 Discovery liveness has two layers: the heartbeat TTL (30s, pruned every 5s)
 drops bridges that stopped registering — the fallback for hard kills — and
 `GET /api/instances?probe=1` actively TCP-probes each registered loopback port
-on demand, so a client refresh gets an immediately-honest list with no
-background probing cost.
+on demand, so a client refresh gets an honest list with no background probing
+cost. A probe failure is not a verdict: the first one only marks the instance
+unhealthy, and ~8s of continuous unreachability (confirmed by a later probe)
+prunes it — a busy bridge's event loop can stall past the connect timeout
+while perfectly alive, and evicting it would kick every attached client.
 
 Session file access (ADR-0004) rides the same loopback server: the bridge
 serves read-only `GET /fs/list` + `GET /fs/file` scoped to each session's cwd,
@@ -263,10 +267,38 @@ editor still has it open).
     | turn.completed      | -> end_turn
     | turn.failed         | -> error
     | turn.cancelled      | -> cancelled
-    | timeout (120s)      | -> max_turn_requests
-    | manual cancel       | -> cancelled
+    | no protocol         |
+    | progress (120s)     | -> check read watermark
+    |   watermark moved   | -> forward throttled usage -> defer (alive)
+    |   active tool       | -> refresh in_progress -> defer (alive)
+    |   frozen < 10 min   | -> defer decision
+    |   frozen >= 10 min  | -> fetch reply -> end_turn
+    |                       |   no reply, no output -> max_turn_requests
+    | manual cancel        | -> cancelled
     +---------------------+
 ```
+
+Projection polling is a recovery signal, not protocol progress. In
+particular, `projection.status=running` may be stale and therefore never
+refreshes the 120-second deadline. Neither is the prompt lock a liveness
+signal — verified against the Aug-28 app-server, `session/goal show` succeeds
+mid-turn, and a probe `session/send` is accepted (queued as steer input) while
+the turn runs; the lock is only held during finalisation. Instead the 15s
+stall-reconcile reads feed a liveness watermark
+(`contextUsed`/`totalTokenCount`/`turnCount`/`currentTurnId` from
+`session/read`): an advancing watermark proves a silently-working turn
+(typically a sub-agent) and defers the terminal decision indefinitely. Because
+an upstream ACP client can have a shorter idle deadline than this bridge, the
+bridge also forwards authoritative progress at most once per minute: a
+`usage_update` when the watermark advances, or an `in_progress` refresh for a
+known active tool while its watermark is temporarily quiet. These updates are
+state-bearing; the bridge never fabricates transcript text as a heartbeat. A
+watermark frozen for 10 minutes (STALE_FREEZE_MS) still marks the projection as
+truly stale unless a known foreground tool remains nonterminal. An active tool
+is direct lifecycle evidence that the turn has not completed, so the bridge
+keeps waiting and refreshing its existing card. Without an active tool, the
+turn ends gently (reply fetch first, bounded stop only when nothing was ever
+delivered). Already-queued events win the deadline race and are consumed first.
 
 ### Tool lifecycle
 
@@ -290,8 +322,10 @@ zcode interaction request received
   │     └─ Always uses session/request_permission (its native purpose)
   │
   ├─ ExitPlanMode (interaction/requestUserInput + plan_approval)
-  │     ├─ Client supports elicitation.form → elicitation/create (approve/reject form)
-  │     └─ Otherwise → session/request_permission (fallback)
+  │     ├─ martty attached (hasMarttyClient) → elicitation/create (approve/reject form;
+  │     │     its permission overlay draws only the title — the plan needs the form)
+  │     └─ Otherwise → session/request_permission (editors render toolCall.content
+  │           as full markdown; elicitation form descriptions are plain text there)
   │
   └─ AskUserQuestion (interaction/requestUserInput)
         ├─ Client supports elicitation.form → elicitation/create (single form)
@@ -299,8 +333,11 @@ zcode interaction request received
 ```
 
 **Key**: `server.supportsElicitationForm()` is detected at `initialize` time from
-`clientCapabilities.elicitation.form`. Tool auth always goes through
-request_permission, since that is its native purpose.
+`clientCapabilities.elicitation.form` (AskUserQuestion). ExitPlanMode keys on
+`server.hasMarttyClient()` instead — Zed ≥1.12 declares `elicitation.form` too,
+but its form descriptions are plain text while its permission popups render
+`toolCall.content` as markdown, so only martty benefits from the form. Tool auth
+always goes through request_permission, since that is its native purpose.
 
 ## Deferred Notification Mechanism
 

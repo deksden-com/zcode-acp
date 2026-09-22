@@ -28,12 +28,14 @@ import {
   queryCombined,
   type Provider,
 } from "../quota/combined.js";
+import { clearOcCache } from "../quota/ollama-cloud/index.js";
 import { clearGoCache } from "../quota/opencode-go/index.js";
 
-/** Clear both provider caches — used by watch mode per tick for live values. */
+/** Clear all provider caches — used by watch mode per tick for live values. */
 function clearAllCaches(): void {
   clearGlmCache();
   clearGoCache();
+  clearOcCache();
 }
 
 /** Minimum watch interval (ms). Equals the quota cache TTL. */
@@ -58,7 +60,7 @@ export interface CliOptions {
   /** True when the user wants per-model MCP detail sub-lines shown. */
   detail: boolean;
   help: boolean;
-  /** Which provider(s) to query — first positional arg (`glm`/`go`), else `all`. */
+  /** Which provider(s) to query — first positional arg (`glm`/`go`/`oc`), else `all`. */
   provider: Provider;
   /** True when the user explicitly asked for the plain monochrome layout. */
   plain: boolean;
@@ -67,20 +69,28 @@ export interface CliOptions {
 /** Human-readable usage text. */
 const HELP_TEXT = `Usage: zcode-acp quota [provider] [options]
 
-Query usage from the terminal. By default shows both GLM Coding Plan and
-Opencode Go in one card; pass a provider to focus on one.
+Query usage from the terminal. By default shows GLM Coding Plan, Opencode Go,
+and Ollama Cloud (when configured) in one card; pass a provider to focus on one.
 
 Providers:
-  (none)                    Both GLM + Opencode Go (rolling + weekly + monthly).
+  (none)                    All configured providers (GLM + Opencode Go + Ollama Cloud).
   glm                       GLM Coding Plan only.
   go                        Opencode Go only (rolling + weekly + monthly).
+  oc                        Ollama Cloud only (5h + weekly).
 
 GLM credentials: read from ~/.zcode/v2/config.json (created by the ZCode app).
-Opencode Go credentials (env vars override the config file, field by field):
-  Config file  ~/.pi/agent/opencode-go.json   {"workspaceId":"wrk_…","authCookie":"Fe26.2**…"}
+Non-GLM credentials resolve per field, highest precedence first:
+  1. ~/.config/zcode-acp/config.json "quota" section, e.g.
+     {"quota":{"ollamaApiKey":"…","opencodeGoWorkspaceId":"wrk_…","opencodeGoAuthCookie":"Fe26.2**…","opencodeGoSessionToken":"st_…"}}
+  2. Environment variables (one-off overrides)
+  3. ~/.pi/agent/opencode-go.json (legacy Pi-extension reuse, Opencode Go only)
+Opencode Go (log in at https://opencode.ai/console first, then DevTools →
+Application → Cookies → opencode.ai):
   OPENCODE_GO_WORKSPACE_ID    e.g. wrk_abc123 (from the opencode.ai workspace URL)
   OPENCODE_GO_AUTH_COOKIE     the "auth" cookie value (starts with Fe26.2**)
-  Get the cookie via browser DevTools → Application → Cookies → opencode.ai.
+  OPENCODE_GO_SESSION_TOKEN   the "__Host-console_session" cookie value (st_…)
+Ollama Cloud:
+  OLLAMA_API_KEY              an Ollama Cloud API key (cloud.ollama.ai → API keys)
 
 Options:
   -w, --watch              Watch mode: clear the screen and refresh periodically.
@@ -92,12 +102,13 @@ Options:
   -h, --help               Show this help and exit.
 
 Examples:
-  zcode-acp quota                 # both providers, print once and exit (color bars)
+  zcode-acp quota                 # all providers, print once and exit (color bars)
   zcode-acp quota go              # Opencode Go only (3 windows)
+  zcode-acp quota oc              # Ollama Cloud only (5h + weekly)
   zcode-acp quota glm -w          # GLM only, live monitor every 30s
-  zcode-acp quota -w -i 60        # both, refresh every 60s
-  zcode-acp quota -d              # both, include per-model MCP breakdown
-  zcode-acp quota --plain         # both, classic monochrome bars`;
+  zcode-acp quota -w -i 60        # all, refresh every 60s
+  zcode-acp quota -d              # all, include per-model MCP breakdown
+  zcode-acp quota --plain         # all, classic monochrome bars`;
 
 /**
  * Clamp a raw interval (seconds, optional) to a valid ms value. Returns the
@@ -166,7 +177,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         } else if (arg?.startsWith("-i") && arg.length > 2) {
           const n = Number(arg.slice(2));
           if (Number.isFinite(n)) interval = n;
-        } else if (arg === "glm" || arg === "go") {
+        } else if (arg === "glm" || arg === "go" || arg === "oc") {
           // First positional provider token. Only honor the first; a second
           // (e.g. `zcode-acp quota glm go`) is ignored to keep parsing simple.
           if (provider === "all") provider = arg;
@@ -336,13 +347,13 @@ async function runOnce(provider: Provider, detail: boolean, color: boolean): Pro
 
   // Failure = every selected provider ended up unavailable (not merely
   // not_configured, which is a deliberate "skip me" state).
-  const glmFailed = combined.glm.kind === "unavailable";
-  const goFailed = combined.go.kind === "unavailable";
-  const glmSelected = provider === "all" || provider === "glm";
-  const goSelected = provider === "all" || provider === "go";
-  const selectedFailed =
-    (glmSelected && glmFailed && (!goSelected || goFailed)) ||
-    (goSelected && goFailed && (!glmSelected || glmFailed));
+  const selected: Array<[boolean, boolean]> = [
+    [provider === "all" || provider === "glm", combined.glm.kind === "unavailable"],
+    [provider === "all" || provider === "go", combined.go.kind === "unavailable"],
+    [provider === "all" || provider === "oc", combined.oc.kind === "unavailable"],
+  ];
+  const anySelected = selected.some(([sel]) => sel);
+  const selectedFailed = anySelected && selected.every(([sel, failed]) => !sel || failed);
 
   if (selectedFailed) {
     process.stderr.write(out + "\n");

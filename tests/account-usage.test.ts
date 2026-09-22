@@ -60,6 +60,7 @@ describe("accountUsageStats", () => {
         ],
       },
       go: { kind: "not_configured" },
+      oc: { kind: "not_configured" },
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
@@ -75,6 +76,7 @@ describe("accountUsageStats", () => {
     });
     // not_configured Go is reported as-is — the client omits the section.
     expect(out.opencode).toEqual({ kind: "not_configured" });
+    expect(out.ollama).toEqual({ kind: "not_configured" });
   });
 
   it("converts Go reset countdowns to absolute timestamps", async () => {
@@ -88,6 +90,7 @@ describe("accountUsageStats", () => {
         weekly: { usagePercent: 25, resetInSec: 86_400 },
         monthly: null, // absent window is dropped, not rendered as "(no data)"
       },
+      oc: { kind: "not_configured" },
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
@@ -105,12 +108,14 @@ describe("accountUsageStats", () => {
     queryCombinedMock.mockResolvedValue({
       glm: { kind: "auth_error" },
       go: { kind: "auth_error" },
+      oc: { kind: "auth_error" },
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
     expect(out).toEqual({
       glm: { kind: "auth_error" },
       opencode: { kind: "auth_error" },
+      ollama: { kind: "auth_error" },
     });
   });
 
@@ -118,10 +123,58 @@ describe("accountUsageStats", () => {
     queryCombinedMock.mockResolvedValue({
       glm: { kind: "success", level: "pro", items: [] },
       go: { kind: "not_configured" },
+      oc: { kind: "not_configured" },
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
     expect(out.glm.items).toEqual([]);
     expect(out.opencode.kind).toBe("not_configured");
+  });
+
+  it("converts Ollama fractions to percent windows (no resetsAt)", async () => {
+    queryCombinedMock.mockResolvedValue({
+      glm: { kind: "unavailable" },
+      go: { kind: "not_configured" },
+      oc: { kind: "success", session: 0.31, weekly: 0.675, fetchedAt: NOW },
+    } satisfies CombinedResult);
+
+    const out = await accountUsageStats();
+    expect(out.ollama.kind).toBe("success");
+    expect(out.ollama.windows).toEqual([
+      { key: "session", label: "5h", usagePercent: 31 },
+      { key: "weekly", label: "Week", usagePercent: 67.5 },
+    ]);
+  });
+
+  it("passes derived Ollama reset moments through as resetsAt", async () => {
+    queryCombinedMock.mockResolvedValue({
+      glm: { kind: "unavailable" },
+      go: { kind: "not_configured" },
+      oc: {
+        kind: "success",
+        session: 0.31,
+        sessionResetAt: NOW + 7_200_000,
+        monthly: 0.006,
+        monthlyResetAt: NOW + 5 * 86_400_000,
+        fetchedAt: NOW,
+      },
+    } satisfies CombinedResult);
+
+    const out = await accountUsageStats();
+    expect(out.ollama.windows).toEqual([
+      { key: "session", label: "5h", usagePercent: 31, resetsAt: NOW + 7_200_000 },
+      { key: "monthly", label: "Month", usagePercent: 0.6, resetsAt: NOW + 5 * 86_400_000 },
+    ]);
+  });
+
+  it("credit-plan Ollama (monthly only) emits a single Month window", async () => {
+    queryCombinedMock.mockResolvedValue({
+      glm: { kind: "unavailable" },
+      go: { kind: "not_configured" },
+      oc: { kind: "success", monthly: 0.006, fetchedAt: NOW },
+    } satisfies CombinedResult);
+
+    const out = await accountUsageStats();
+    expect(out.ollama.windows).toEqual([{ key: "monthly", label: "Month", usagePercent: 0.6 }]);
   });
 });

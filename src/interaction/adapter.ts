@@ -23,6 +23,7 @@ import type {
   ZcodeInteractionResponse,
   ZcodeInteractionUserInputParams,
 } from "../backend/types.js";
+import { messages } from "../i18n.js";
 
 // ---------- classification ----------
 
@@ -79,13 +80,122 @@ function normalizeKind(kind: string | undefined): PermissionOption["kind"] {
 }
 
 /** Convert a zcode tool-permission request into ACP requestPermission params. */
+
+/**
+ * Cap for the popup title built from tool input. Clients render the title in
+ * a single popup line (martty draws it in the overlay border, which truncates
+ * past the terminal width), so keep it small enough to survive that cut —
+ * the full input still rides in `content` for detail-capable clients.
+ */
+const POPUP_TITLE_MAX = 80;
+
+/** First line of a string, whitespace-trimmed. */
+function firstLine(value: string): string {
+  return value.split("\n", 1)[0]!.trim();
+}
+
+/** Head-truncated line: keeps the start, ellipsis at the end. */
+function headLine(value: string): string {
+  const line = firstLine(value);
+  return line.length > POPUP_TITLE_MAX ? line.slice(0, POPUP_TITLE_MAX - 1) + "…" : line;
+}
+
+/**
+ * Tail-truncated line for PATHS: the deciding part (parent dirs + filename)
+ * sits at the END, and popup overlays cut exactly there — so keep the tail
+ * and elide the front instead. If the cut lands inside a surrogate pair the
+ * orphaned low surrogate is dropped (display-layer hygiene only).
+ */
+function tailLine(value: string): string {
+  const line = firstLine(value);
+  if (line.length <= POPUP_TITLE_MAX) return line;
+  let start = line.length - (POPUP_TITLE_MAX - 1);
+  if (start > 0 && line.charCodeAt(start) >= 0xdc00 && line.charCodeAt(start) <= 0xdfff) start++;
+  return "…" + line.slice(start);
+}
+
+/**
+ * Human one-line summary of a tool's input for a permission popup title.
+ *
+ * The command / file path IS the decision the user is making, and some clients
+ * (martty) render only `toolCall.title` in their approval overlay — without
+ * this summary the popup reads as a bare "tool" and the path is invisible.
+ * Commands keep their head (the binary is the informative part); paths keep
+ * their TAIL (the filename is). Spec-complete clients also render `content`,
+ * which carries the full input (see `inputPopupContent`) — multi-line
+ * commands included.
+ */
+export function describeToolInput(input: unknown): string | undefined {
+  if (input === null || input === undefined) return undefined;
+  if (typeof input !== "object") return headLine(String(input));
+  const rec = input as Record<string, unknown>;
+  const command = rec["command"];
+  if (typeof command === "string" && command.trim()) return headLine(command.trim());
+  for (const key of ["file_path", "path", "notebook_path", "url", "pattern", "query"]) {
+    const v = rec[key];
+    if (typeof v === "string" && v.trim()) return tailLine(v);
+  }
+  try {
+    return headLine(JSON.stringify(input) ?? "");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Full-input text block for the permission popup: the complete command (every
+ * line — the title only shows the first) or a pretty-printed input object, so
+ * detail-capable clients never hide what is being approved.
+ */
+function inputPopupContent(
+  input: unknown,
+): Array<{ type: "content"; content: { type: "text"; text: string } }> | undefined {
+  if (input === null || input === undefined) return undefined;
+  let text: string | undefined;
+  if (typeof input === "object") {
+    const command = (input as Record<string, unknown>)["command"];
+    if (typeof command === "string" && command.trim()) text = command.trim();
+  }
+  if (text === undefined) {
+    try {
+      text = JSON.stringify(input, null, 2) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  if (!text) return undefined;
+  if (text.length > 8000) text = text.slice(0, 8000 - 1) + "…";
+  return [{ type: "content", content: { type: "text", text } }];
+}
+
+/** File paths in a tool input, as ToolCallUpdate.locations for editors that link them. */
+function inputLocations(input: unknown): Array<{ path: string }> | undefined {
+  if (typeof input !== "object" || input === null) return undefined;
+  const rec = input as Record<string, unknown>;
+  const paths: Array<{ path: string }> = [];
+  for (const key of ["file_path", "path", "notebook_path"]) {
+    const v = rec[key];
+    if (typeof v === "string" && v.trim()) paths.push({ path: v.trim() });
+  }
+  return paths.length > 0 ? paths : undefined;
+}
+
+/** Permission-request details shared by every toolCall builder below. */
+interface PermissionToolCall {
+  toolCallId: string;
+  title?: string;
+  content?: Array<{ type: "content"; content: { type: "text"; text: string } }>;
+  locations?: Array<{ path: string }>;
+  rawInput: unknown;
+}
+
 export function zcodePermissionToAcp(
   params: ZcodeInteractionPermissionParams,
   acpSid: string,
 ): {
   options: PermissionOption[];
   sessionId: string;
-  toolCall: { toolCallId: string; rawInput: unknown };
+  toolCall: PermissionToolCall;
 } | null {
   const options: PermissionOption[] = [];
   for (const opt of params.options ?? []) {
@@ -96,10 +206,21 @@ export function zcodePermissionToAcp(
     });
   }
   if (options.length === 0) return null;
+  const toolName = params.toolName ?? "";
+  const detail = describeToolInput(params.input);
+  const title = [toolName, detail].filter(Boolean).join(": ") || undefined;
+  const content = inputPopupContent(params.input);
+  const locations = inputLocations(params.input);
   return {
     options,
     sessionId: acpSid,
-    toolCall: { toolCallId: params.toolCallId ?? "", rawInput: params.input },
+    toolCall: {
+      toolCallId: params.toolCallId ?? "",
+      rawInput: params.input,
+      ...(title ? { title } : {}),
+      ...(content ? { content } : {}),
+      ...(locations ? { locations } : {}),
+    },
   };
 }
 
@@ -111,9 +232,23 @@ export function zcodePermissionToAcp(
  * Any optionId not in this set is treated as deny (fail-safe). */
 const ALLOW_OPTION_IDS = new Set(["allow", "allow_once", "allow_always", "allow_project"]);
 
-/** Convert an ACP requestPermission response → zcode {decision, reason?}. */
+/**
+ * Convert an ACP requestPermission response → the zcode interaction response.
+ *
+ * The backend's options each carry the authoritative `response` object
+ * (`zcodePermissionOptionSchema`, zcode-protocol/index.ts:589-597): the
+ * "Always allow in this project" option ships `permissionUpdates` that the
+ * runtime persists (core/src/tool/executor/permission-flow.ts:359-366), and
+ * deny ships the normalized STOP reason. Echoing the selected option's
+ * response verbatim is what the desktop host does
+ * (interaction-broker.ts:70-124) — synthesizing our own {decision} instead
+ * drops the persistent rules and degrades "always allow" to a one-shot allow.
+ *
+ * Options without a `response` (older builds) fall back to the allow-id set.
+ */
 export function acpPermissionResponseToZcode(
   acpResp: unknown,
+  options?: ZcodeInteractionPermissionParams["options"],
 ): Extract<ZcodeInteractionResponse, { decision: string }> {
   if (!acpResp || typeof acpResp !== "object") {
     return { decision: "deny", reason: "invalid client response" };
@@ -121,6 +256,19 @@ export function acpPermissionResponseToZcode(
   const outcome = (acpResp as { outcome?: { outcome?: string; optionId?: string } }).outcome ?? {};
   if (outcome.outcome === "cancelled") return { decision: "deny", reason: "cancelled by user" };
   const optionId = outcome.optionId ?? "";
+  const selected = (options ?? []).find((o) => o.optionId === optionId);
+  const resp = selected?.response as
+    { decision?: string; reason?: string; permissionUpdates?: unknown[] } | undefined;
+  if (resp && (resp.decision === "allow" || resp.decision === "deny")) {
+    const echoed: Extract<ZcodeInteractionResponse, { decision: string }> = {
+      decision: resp.decision,
+    };
+    if (typeof resp.reason === "string") echoed.reason = resp.reason;
+    if (Array.isArray(resp.permissionUpdates) && resp.permissionUpdates.length > 0) {
+      echoed.permissionUpdates = resp.permissionUpdates;
+    }
+    return echoed;
+  }
   if (ALLOW_OPTION_IDS.has(optionId)) return { decision: "allow" };
   return { decision: "deny", reason: `rejected (${optionId})` };
 }
@@ -134,18 +282,34 @@ export function exitPlanModeToAcpPermission(
 ): {
   options: PermissionOption[];
   sessionId: string;
-  toolCall: { toolCallId: string; title?: string; rawInput: unknown };
+  toolCall: PermissionToolCall;
 } {
+  const m = messages();
+  // The plan text rides in toolCall.content so approval popups can show WHAT
+  // is being approved — rawInput alone is a machine-readable blob some clients
+  // never render (martty's overlay shows the title and nothing else).
+  const plan =
+    typeof params.input === "object" && params.input !== null
+      ? (params.input as { plan?: unknown }).plan
+      : undefined;
+  const planText = typeof plan === "string" && plan.trim() ? plan : undefined;
   return {
     options: [
-      { kind: "allow_once", name: "Approve — exit plan mode", optionId: "approve" },
-      { kind: "reject_once", name: "Reject — keep planning", optionId: "reject" },
+      { kind: "allow_once", name: m.planApproveOption, optionId: "approve" },
+      { kind: "reject_once", name: m.planRejectOption, optionId: "reject" },
     ],
     sessionId: acpSid,
     toolCall: {
       toolCallId: params.toolCallId ?? "",
-      title: "Exit plan mode",
+      title: m.planPopupTitle,
       rawInput: params.input,
+      ...(planText
+        ? {
+            content: [
+              { type: "content" as const, content: { type: "text" as const, text: planText } },
+            ],
+          }
+        : {}),
     },
   };
 }
@@ -164,6 +328,95 @@ export function acpPermissionResponseToExitPlanMode(
     return { action: "accept", content: { answer_0: "approve" } };
   }
   return { action: "decline", reason: "rejected" };
+}
+
+// ---------- ExitPlanMode via elicitation form ----------
+
+/**
+ * Build an elicitation FORM for ExitPlanMode plan approval — the martty
+ * surface (see handleSinglePermission's routing comment; the gate lives
+ * there). martty renders the field's `description` through its full markdown
+ * pipeline in a scrollable detail pane — the COMPLETE plan lives there, not
+ * in a one-line popup title. The decision itself is a required enum field
+ * (approve / reject); a cancelled or declined form maps to decline. The
+ * caller falls back to the requestPermission path when the form channel
+ * fails; that path carries the plan in `toolCall.content` for the same
+ * reason.
+ */
+export function buildPlanApprovalElicitationForm(
+  params: ZcodeInteractionUserInputParams,
+  acpSid: string,
+  toolCallId?: string,
+): {
+  mode: "form";
+  sessionId: string;
+  toolCallId?: string;
+  message: string;
+  requestedSchema: {
+    type: "object";
+    properties: Record<string, unknown>;
+    required: string[];
+  };
+} {
+  const m = messages();
+  const plan =
+    typeof params.input === "object" && params.input !== null
+      ? (params.input as { plan?: unknown }).plan
+      : undefined;
+  const form: {
+    mode: "form";
+    sessionId: string;
+    toolCallId?: string;
+    message: string;
+    requestedSchema: {
+      type: "object";
+      properties: Record<string, unknown>;
+      required: string[];
+    };
+  } = {
+    mode: "form",
+    sessionId: acpSid,
+    message: m.planPopupTitle,
+    requestedSchema: {
+      type: "object",
+      properties: {
+        approval: {
+          type: "string",
+          title: m.planFieldTitle,
+          ...(typeof plan === "string" && plan.trim() ? { description: plan } : {}),
+          oneOf: [
+            { const: "approve", title: m.planApproveOption },
+            { const: "reject", title: m.planRejectOption },
+          ],
+        },
+      },
+      required: ["approval"],
+    },
+  };
+  if (toolCallId) form.toolCallId = toolCallId;
+  return form;
+}
+
+/**
+ * Parse an elicitation form response → zcode ExitPlanMode response.
+ * Mirrors `acpPermissionResponseToExitPlanMode`: approve → accept with
+ * content.answer_0 (the backend reads answer_0), anything else → decline.
+ */
+export function parsePlanApprovalElicitationResponse(
+  acpResp: unknown,
+): Extract<ZcodeInteractionResponse, { action: string }> {
+  if (!acpResp || typeof acpResp !== "object") {
+    return { action: "decline", reason: "invalid client response" };
+  }
+  const action = (acpResp as { action?: string }).action;
+  if (action === "decline" || action === "cancel") {
+    return { action: "decline", reason: "plan rejected" };
+  }
+  const content = (acpResp as { content?: Record<string, unknown> }).content ?? {};
+  if (content["approval"] === "approve") {
+    return { action: "accept", content: { answer_0: "approve" } };
+  }
+  return { action: "decline", reason: "plan rejected" };
 }
 
 // ---------- AskUserQuestion split (single + multi-select) ----------
@@ -204,11 +457,12 @@ export function splitAskUserQuestions(
     if (labels.length === 0) continue;
 
     const multi = q.multiSelect === true;
+    const m = messages();
     if (multi) {
       const options: PermissionOption[] = [];
       for (const lb of labels) {
-        options.push({ optionId: `${lb}:yes`, kind: "allow_once", name: `Include: ${lb}` });
-        options.push({ optionId: `${lb}:no`, kind: "reject_once", name: `Skip: ${lb}` });
+        options.push({ optionId: `${lb}:yes`, kind: "allow_once", name: m.askIncludeOption(lb) });
+        options.push({ optionId: `${lb}:no`, kind: "reject_once", name: m.askSkipLabelOption(lb) });
       }
       result.push({ question: q.question, multiSelect: true, options });
     } else {
@@ -217,7 +471,7 @@ export function splitAskUserQuestions(
         kind: "allow_once",
         name: lb,
       }));
-      options.push({ optionId: "__skip__", kind: "reject_once", name: "Skip" });
+      options.push({ optionId: "__skip__", kind: "reject_once", name: m.askSkipOption });
       result.push({ question: q.question, multiSelect: false, options });
     }
   }
@@ -229,15 +483,22 @@ export function buildAskUserAcpParams(
   params: ZcodeInteractionUserInputParams,
   acpSid: string,
   options: PermissionOption[],
+  popupTitle?: string,
 ): {
   options: PermissionOption[];
   sessionId: string;
-  toolCall: { toolCallId: string; rawInput: unknown };
+  toolCall: PermissionToolCall;
 } {
   return {
     options,
     sessionId: acpSid,
-    toolCall: { toolCallId: params.toolCallId ?? "", rawInput: params.input },
+    toolCall: {
+      toolCallId: params.toolCallId ?? "",
+      rawInput: params.input,
+      // The question IS the popup title: martty's overlay renders nothing but
+      // the title, so without it the ask reads as a bare "tool" prompt.
+      ...(popupTitle ? { title: popupTitle } : {}),
+    },
   };
 }
 
@@ -312,7 +573,7 @@ export function buildAskUserElicitationForm(
     if (labels.length === 0) continue;
     // Titled enum option for "skip": const carries the sentinel value the
     // parser recognizes; title is what the client renders in the dropdown.
-    const skipOption = { const: ELICIT_SKIP, title: "Skip this question" };
+    const skipOption = { const: ELICIT_SKIP, title: messages().askSkipQuestionTitle };
     if (q.multiSelect) {
       properties[key] = {
         type: "array",
@@ -420,8 +681,8 @@ export function parseAskUserElicitationResponse(
   return answers;
 }
 
-// ExitPlanMode is handled via session/request_permission (see
-// `exitPlanModeToAcpPermission` / `acpPermissionResponseToExitPlanMode` above) —
-// not via elicitation/create. Plan approval is a permission decision, and
-// routing it through elicitation surfaces a generic "input request" shell that
-// reads wrong for this flow. AskUserQuestion is the elicitation use case.
+// ExitPlanMode has two client paths, both built above: form-capable clients
+// get the elicitation form (`buildPlanApprovalElicitationForm` — the plan
+// renders as markdown in the field description); everyone else gets
+// session/request_permission (`exitPlanModeToAcpPermission` — the plan rides
+// in toolCall.content). Both parse back through their respective functions.

@@ -5,12 +5,13 @@
  *    zcode (decline) and cache the result — an unanswered request makes the
  *    backend reannounce forever, refreshing the turn loop's no-progress timer
  *    until the turn hangs.
- * 2. waitForTurnIdle grace: with expectLock, a lock never observed past the
- *    grace window counts a successful probe as released (covers turns that
- *    finish between probes and backend error-message drift).
- * 3. Todo push recheck: when the todos signature is unchanged at tool-result
+ * 2. Todo push recheck: when the todos signature is unchanged at tool-result
  *    time (the backend writes the projection asynchronously after the result
  *    event), one delayed re-check must still push the PlanUpdate.
+ *
+ * (The batch's waitForTurnIdle grace-window cases were folded into
+ * tests/wait-turn-idle.test.ts, which covers the same three branches plus
+ * the lock-seen and timeout-false edges.)
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
@@ -28,7 +29,6 @@ vi.mock("../src/handlers/io.js", () => ({
 }));
 
 import { handleServerRequests } from "../src/handlers/server-requests.js";
-import { waitForTurnIdle } from "../src/handlers/extensions.js";
 import { dispatchPlanIfChanged } from "../src/handlers/session.js";
 import { ProjectionDiffer } from "../src/translators/projection-differ.js";
 
@@ -91,58 +91,7 @@ describe("settle-once: forward throw still replies to zcode", () => {
   });
 });
 
-// ---------- 2. waitForTurnIdle grace ----------
-
-function probeServer(responses: unknown[]): ZcodeAcpServer {
-  let i = 0;
-  const backend = {
-    request: vi.fn(() => {
-      const r = responses[i] ?? responses[responses.length - 1];
-      i++;
-      return Promise.resolve(r);
-    }),
-  };
-  return {
-    ensureBackend: () => backend,
-    nextId: () => 1,
-  } as unknown as ZcodeAcpServer;
-}
-
-describe("waitForTurnIdle grace window", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("counts a successful probe as released once the grace expires", async () => {
-    // Lock never observed: probe always succeeds (turn finished between
-    // probes, or the backend's lock error message drifted).
-    const server = probeServer([{ result: {} }]);
-    const p = waitForTurnIdle(server, "zs1", 60_000, "session/goal", true, 100);
-    await vi.advanceTimersByTimeAsync(0); // probe #1: in grace → sleep(500)
-    await vi.advanceTimersByTimeAsync(600); // probe #2: past grace → released
-    expect(await p).toBe(true);
-  });
-
-  it("still requires the lock observation inside the grace window", async () => {
-    // Lock observed on probe #1, released on probe #2 → released.
-    const server = probeServer([{ error: { message: "prompt is running" } }, { result: {} }]);
-    const p = waitForTurnIdle(server, "zs1", 60_000, "session/goal", true, 100);
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(2500);
-    expect(await p).toBe(true);
-  });
-
-  it("non-lock error past grace also counts as released", async () => {
-    const server = probeServer([{ error: { message: "something else" } }]);
-    const p = waitForTurnIdle(server, "zs1", 60_000, "session/goal", true, 100);
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(600);
-    expect(await p).toBe(true);
-  });
-});
+// ---------- waitForTurnIdle grace: see tests/wait-turn-idle.test.ts ----------
 
 // ---------- 3. todo push recheck ----------
 
@@ -171,6 +120,7 @@ describe("dispatchPlanIfChanged delayed re-check", () => {
     const server = {
       ensureBackend: () => backend,
       nextId: () => 1,
+      sessionAliases: (sid: string) => [sid],
     } as unknown as ZcodeAcpServer;
     const cx = { notify: vi.fn().mockResolvedValue(undefined) } as unknown as acp.AgentContext;
 

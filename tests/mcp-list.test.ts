@@ -8,7 +8,7 @@
 
 import { homedir } from "node:os";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type * as acp from "@agentclientprotocol/sdk";
 import { ZcodeAcpServer } from "../src/server.js";
@@ -45,8 +45,7 @@ vi.mock("node:fs", async () => {
       return entries;
     },
     statSync: (p: string) => {
-      if (mockDirs.has(p))
-        return { isDirectory: () => true } as ReturnType<typeof actual.statSync>;
+      if (mockDirs.has(p)) return { isDirectory: () => true } as ReturnType<typeof actual.statSync>;
       return actual.statSync(p);
     },
   };
@@ -62,8 +61,16 @@ function resetMocks(): void {
 
 const HOME = homedir();
 
+// Asserts the English /mcp card; pin the language — this suite's fs mock
+// falls through to the real fs for unknown paths, so without the pin the
+// outcome would depend on the developer's ~/.zcode/v2/setting.json.
+beforeEach(() => {
+  vi.stubEnv("ZCODE_ACP_LANG", "en");
+});
+
 afterEach(() => {
   resetMocks();
+  vi.unstubAllEnvs();
 });
 
 describe("loadMcpServers", () => {
@@ -94,6 +101,36 @@ describe("loadMcpServers", () => {
     expect(servers[0]!.type).toBe("stdio");
     expect(servers[0]!.command).toBe("codegraph");
     expect(servers[0]!.source).toBe("config");
+  });
+
+  it("reads the CLI config from ZCODE_HOME when set (real home ignored)", () => {
+    resetMocks();
+    mockFiles.set(
+      `${HOME}/.zcode/cli/config.json`,
+      JSON.stringify({
+        mcp: {
+          servers: {
+            realHomeServer: { type: "stdio", command: "real" },
+          },
+        },
+      }),
+    );
+    const altRoot = `${HOME}/zcode-alt-home`;
+    mockFiles.set(
+      `${altRoot}/cli/config.json`,
+      JSON.stringify({
+        mcp: {
+          servers: {
+            altHomeServer: { type: "http", url: "https://example.com/mcp" },
+          },
+        },
+      }),
+    );
+    vi.stubEnv("ZCODE_HOME", altRoot);
+    const servers = loadMcpServers();
+    expect(servers).toHaveLength(1);
+    expect(servers[0]!.name).toBe("altHomeServer");
+    expect(servers[0]!.url).toBe("https://example.com/mcp");
   });
 
   it("discovers http servers from config.json", () => {
@@ -314,9 +351,7 @@ describe("formatMcpServers", () => {
   });
 
   it("includes the auto-invoke note", () => {
-    const text = formatMcpServers([
-      { name: "s", type: "stdio", command: "x", source: "config" },
-    ]);
+    const text = formatMcpServers([{ name: "s", type: "stdio", command: "x", source: "config" }]);
     expect(text).toContain("auto-invoked by the model");
   });
 });
@@ -366,10 +401,7 @@ describe("/mcp slash command", () => {
 
   it("returns end_turn with 'no servers' message when empty", async () => {
     resetMocks();
-    mockFiles.set(
-      `${HOME}/.zcode/cli/config.json`,
-      JSON.stringify({ mcp: { servers: {} } }),
-    );
+    mockFiles.set(`${HOME}/.zcode/cli/config.json`, JSON.stringify({ mcp: { servers: {} } }));
 
     const { cx, sent } = mockContext();
     const server = new ZcodeAcpServer();

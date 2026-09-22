@@ -9,6 +9,14 @@
 
 本服务端以子进程方式启动 ZCode 无头 app-server（`zcode app-server --stdio`），将其内部事件流翻译为 ACP `session/update` 通知，并把 ZCode 的交互通道桥接到 ACP —— 当客户端支持时优先使用 `elicitation/create`，否则回退到 `session/request_permission` —— 从而让编辑器获得原生的、一流的编码助手体验。
 
+## 为什么选 zcode-acp
+
+- **编辑器原生体验** —— 流式改动以真实 diff 呈现，权限确认、计划模式都走 Zed / JetBrains 自己的 agent 面板，无需并排终端。
+- **官方 harness，而非重新实现** —— 驱动真实的 `zcode app-server`：原生工具、skills、MCP 与斜杠命令、自动压缩、会话恢复/分叉。
+- **不止于编辑器** —— 完整的双语终端 REPL（`zcode-acp`，中/英可切换，SSH 下可用），手机/网页访问相同会话（`zcode-acp-remote`），可选的只限写入沙箱。凭据留在 `~/.zcode`。
+
+由于驱动的是真实 ZCode 客户端，你现有的 GLM Coding Plan 原样生效——当前的套餐权益（150% 额度加成、高于直连 API 的请求优先级）和包月计费方式都和在官方 App 中一致。编辑器设置无需任何 API key。
+
 ## 状态
 
 早期开发中。核心框架已就绪，功能正在陆续加入。进度请看项目看板。
@@ -23,14 +31,25 @@
 ## 安装
 
 ```bash
-git clone <repo-url>
+npm install -g zcode-acp-server
+```
+
+会同时安装两个 bin：`zcode-acp-server`（编辑器调用）和 `zcode-acp`（统一 CLI）。
+在你的 ACP 客户端里配置启动它 —— 见下方的 **在 Zed 中配置** 或你的编辑器的 ACP 文档。
+
+<details>
+<summary>改为从源码安装</summary>
+
+```bash
+git clone https://github.com/william0wang/zcode-acp.git
 cd zcode-acp-server
 pnpm install
 pnpm build
 ```
 
-编译产物入口为 `dist/index.js`（同时作为 `zcode-acp-server` bin 暴露）。在你的
-ACP 客户端里配置启动它 —— 见下方的 **在 Zed 中配置** 或你的编辑器的 ACP 文档。
+编译产物入口为 `dist/index.js`（同时作为 `zcode-acp-server` bin 暴露）。
+
+</details>
 
 ## 在 Zed 中配置
 
@@ -42,17 +61,19 @@ ACP 客户端里配置启动它 —— 见下方的 **在 Zed 中配置** 或你
   "agent_servers": {
     "ZCode": {
       "type": "custom",
-      "command": "node",
-      "args": ["/absolute/path/to/zcode-acp-server/dist/index.js"],
+      "command": "zcode-acp-server",
       "env": {
-        // 指向桌面应用内置的 ZCode CLI（默认不在 PATH 上）。
-        // 各平台路径见下方表格。
+        // 仅自定义安装时需要——CLI 会从桌面应用内置路径或 PATH 自动发现
+        // （见下方表格）。
         "ZCODE_BIN": "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
       },
     },
   },
 }
 ```
+
+从源码运行？改用 `"command": "node"` 与
+`"args": ["/absolute/path/to/zcode-acp-server/dist/index.js"]`。
 
 重启 Zed，然后从 agent 下拉菜单中选择 **ZCode**。
 
@@ -76,14 +97,53 @@ ZCode CLI 内置于桌面应用中，默认不会加到 `PATH`。用 `ZCODE_BIN`
 > Get-ChildItem -Path $env:LOCALAPPDATA,$env:APPDATA,'C:\Program Files' -Recurse -Filter zcode.cjs -ErrorAction SilentlyContinue
 > ```
 
+## 用户配置文件
+
+所有用户偏好都可以统一维护在 `~/.config/zcode-acp/config.json`(或
+`$XDG_CONFIG_HOME/zcode-acp/config.json`)。逐字段优先级:**配置文件 >
+环境变量 > 内置默认值**——环境变量全部保留为回退,但推荐用文件配置
+(GUI 启动的编辑器和 hub 守护进程继承不到 shell 的环境变量)。读取是
+实时的:改完下一次使用即生效,无需重启。唯一例外是
+`interaction.timeoutMs`——与它的环境变量一样,在 bridge 启动时解析一次。
+
+```jsonc
+{
+  "lang": "zh",                           // 用户可见文案语言:"zh" | "en"
+  "debug": false,                         // 详细诊断日志(ZCODE_ACP_DEBUG=1)
+  "session": { "mode": "yolo" },          // 新会话初始 mode:plan|build|edit|yolo|auto
+  "autoCompact": { "threshold": 240000 }, // 上下文用到 N token 时自动压缩(不设 = 关闭)
+  "goal": {
+    "maxTurns": 100,                      // goal/auto 循环回合预算
+    "mode": "backend"                     // "backend" 恢复旧的后端 /goal 路由
+  },
+  "interaction": { "timeoutMs": 0 },      // 权限请求等待上限,毫秒(0 = 一直等)
+  "sandbox": { "enabled": false },        // 全局 Seatbelt 开关(项目级: sandbox.json)
+  "remote": { /* 见远程访问 */ },
+  "quota": { /* quota 卡片凭据 */ }
+}
+```
+
+非法值会在 stderr 警告一次并丢弃(环境变量回退生效),bridge 绝不改写
+该文件。
+
+刻意不进文件的是:进程态变量(`ZCODE_ACP_RESUME_SESSION`、
+`ZCODE_ACP_REMOTE_ORIGIN`、`ZCODE_ACP_REMOTE_PIN_CWD`、`ZCODE_ACP_TUI_CLI_PID`)和启动引导变量(`ZCODE_BIN`、`ZCODE_NODE`、
+`ZCODE_HOME`、`ZCODE_PROVIDER`、`ZCODE_MODEL`、
+`ZCODE_DISALLOWED_TOOLS`)——前者承载单次运行状态,后者在任何配置可读
+之前就已解析。
+
 ## 环境变量
+
+下表中所有 `ZCODE_ACP_*` 偏好类变量都有对应的配置文件字段(见
+[用户配置文件](#用户配置文件)),文件值优先。
 
 | 变量                               | 默认值           | 用途                                                                                                                                                                                                                                                                                |
 | ---------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ZCODE_BIN`                        | `zcode`          | ZCode CLI 二进制文件路径或其 `.cjs` 入口                                                                                                                                                                                                                                            |
 | `ZCODE_NODE`                       | _（自动发现）_   | 显式指定运行 `ZCODE_BIN` 的 Node 二进制（必须支持 `node:sqlite`）                                                                                                                                                                                                                   |
 | `ZCODE_MODEL`                      | _（来自 config） | 覆盖当前使用的模型 id                                                                                                                                                                                                                                                               |
-| `ZCODE_BASE_URL`                   | _（来自 config） | 覆盖 provider 的 base URL                                                                                                                                                                                                                                                           |
+| `ZCODE_DISALLOWED_TOOLS`            | _（Cron 工具）_  | 以空格或逗号分隔的工具名，作为 `--disallowed-tools` 传给 app-server，并与内置默认值合并——默认禁用 `CronCreate CronList CronUpdate CronDelete`（桥接层无法应答后端的 `automation/*` 客户端请求，这些工具对模型可见但必然失败，见 #192）。 |
+| `ZCODE_ENABLE_AUTOMATION_TOOLS`     | _（未设置）      | 设为 `1` 取消对 Cron* 工具的默认禁用——仅对真正实现了后端 `automation/*` 端口的宿主有意义。 |
 | `ZCODE_ACP_AUTO_COMPACT_THRESHOLD` | _（未设置）      | 触发自动压缩的绝对 token 阈值。每次回合成功完成后（`end_turn`），若 `contextUsed >= 阈值`，服务端会自动调用 `session/compact` 压缩上下文，为下一个 prompt 腾出空间。设为 `0` 或不设置则禁用（默认）。例如 `240000` 表示上下文达 24 万 token 时触发压缩。压缩目标由 ZCode 后端决定。 |
 | `ZCODE_ACP_DEBUG`                  | _（未设置）      | 设为 `1` 可开启详细诊断日志（事件流、探测循环、状态更新）。默认安静——只输出警告类日志（后端管道错误、命令/权限失败、锁等待超时）。诊断桥接问题时开启；日志出现在 `Zed.log` 中，前缀为 `[zcode-acp]`。                                                                               |
 | `ZCODE_ACP_REMOTE`                 | _（未设置）_     | 设为 `1` 启用[远程访问](#远程访问)——通过 WebSocket 向更多 ACP 客户端提供相同会话。                                                                                                                                                                                                  |
@@ -91,126 +151,37 @@ ZCode CLI 内置于桌面应用中，默认不会加到 `PATH`。用 `ZCODE_BIN`
 | `ZCODE_ACP_HUB_PORT`               | `8377`           | 机器级 `zcode-acp-hub` 的端口。隧道只映射这一个端口。                                                                                                                                                                                                                               |
 | `ZCODE_ACP_HUB_HOST`               | `127.0.0.1`      | hub 绑定地址。`0.0.0.0` 会暴露仅 token 保护的明文面——只用于容器化隧道 agent 所在的私网接口（见[远程访问](#远程访问)）。                                                                                                                                                             |
 | `ZCODE_ACP_REMOTE_PORT`            | `8378`           | bridge ACP 端点的起始回环端口。每个 bridge（每个编辑器窗口）自动递增取下一个空闲端口。                                                                                                                                                                                              |
+| `ZCODE_ACP_SANDBOX`                | _（未设置）_     | 设为 `1` 全局启用 macOS Seatbelt 沙箱限制 Agent 的文件写入；项目级则在 `<工作区>/.zcode/acp/sandbox.json` 里设 `"enabled": true`（见[沙箱](#沙箱)）。                                                                                                                               |
+| `ZCODE_ACP_LANG`                   | _（继承）_       | 桥的用户可见文案（弹窗、状态/提示行、命令菜单描述）语言：`zh` 或 `en`。未设置时继承 ZCode APP 的语言设置（`~/.zcode/v2/setting.json` 的 `localePreference`/`locale`），再退回 `LC_ALL`/`LC_MESSAGES`/`LANG` 区域设置，默认英文。                                                    |
+
+## 沙箱
+
+可选的 macOS Seatbelt 写入隔离：双开关（全局 `ZCODE_ACP_SANDBOX=1`，或项目
+级在自动创建的 `<工作区>/.zcode/acp/sandbox.json` 里设 `"enabled": true`），
+白名单之外的写入会弹放行/拒绝确认，"始终"决定可见地持久化在该配置里；放行
+后后端自动以加宽的 profile 重启并续接被中断的任务。完整手册（英文）：
+[docs/SANDBOX.md](docs/SANDBOX.md)。
 
 ## 远程访问
 
-设置 `ZCODE_ACP_REMOTE=1` 后，bridge 会额外通过 WebSocket 接收 ACP 连接，
-手机或浏览器即可观看并驱动与编辑器**相同的会话**。Zed（或任何 stdio ACP
-编辑器）仍是主客户端并拥有进程：编辑器断开时，bridge 连同所有远程连接
-一起退出。
-
-```text
-phone / browser ──WS── 隧道 ── hub (127.0.0.1:8377, 唯一入口)
-                                │ 字节级代理
-                                ▼
-                  bridge ACP 端点 (127.0.0.1:8378+n)
-                                │ 与 stdio 同一个 AgentApp
-Zed ──────── stdio ────────────┘
-```
-
-启用方式：在上文「配置 Zed」的 `env` 里追加（Zed 会把这些合并进 agent
-的环境变量）：
-
-```json
-"ZCODE_ACP_REMOTE": "1",
-"ZCODE_ACP_REMOTE_TOKEN": "<一段足够长的随机密钥>"
-```
-
-相关环境变量（详见上文表格）：`ZCODE_ACP_REMOTE`（开关）、
-`ZCODE_ACP_REMOTE_TOKEN`（必填 token）、`ZCODE_ACP_HUB_PORT`（hub 端口，
-默认 8377）、`ZCODE_ACP_HUB_HOST`（hub 绑定地址）、
-`ZCODE_ACP_REMOTE_PORT`（bridge 端点起始端口，默认 8378）。
-
-**Hub。** 第一个启用远程的 bridge 会以 detached 方式拉起机器级单例
-`zcode-acp-hub`（监听 `ZCODE_ACP_HUB_PORT`，也可手动运行）。它只做三件事：
-token 鉴权、实例发现、字节级 WebSocket 代理——不保存会话状态、不解析 ACP。
-空闲约 10 分钟后退出，需要时再被拉起。每个 bridge 每 10 秒注册一次作为
-心跳，心跳停止约 30 秒后从发现列表移除；客户端刷新时也可调用
-`GET /api/instances?probe=1` 主动探测，立即清理不可达的实例。
-
-**语义。** 所有 agent 通知广播给每个已连接客户端；权限 / elicitation 请求
-发给所有客户端，**先应答者生效**，其余客户端收到 `$/cancel_request` 关闭
-对话框。同一会话的并发 prompt 与单编辑器一样串行化。任一客户端声明的能力
-按 OR 合并。
-
-**隧道。** 面向单端口隧道（Cloudflare Tunnel、frp）设计：只映射 hub 端口。
-frp 的 `tcp` 模式原样透传 WebSocket；Cloudflare Tunnel 会断开空闲连接，
-hub 因此在两段链路上每 30 秒发送 keepalive ping。bridge 端点本身只监听
-回环地址，永不直接暴露。
-
-要构建远程客户端（Web、移动端或 CLI）？完整的集成契约（端点、帧格式、
-生命周期时序、故障恢复、平台注意事项）见
+设置 `ZCODE_ACP_REMOTE=1` 后，bridge 会额外通过机器级 hub 守护进程把**相同
+的会话**暴露到 WebSocket——手机或浏览器可以旁观、驱动、甚至在本机已知项目里
+直接创建新会话，Zed 仍是主客户端并拥有进程。发现 API、隧道、鉴权与语义：
+[docs/REMOTE.md](docs/REMOTE.md)；客户端集成契约：
 [docs/REMOTE-CLIENTS.md](docs/REMOTE-CLIENTS.md)。
 
-## 独立配额查询 CLI（zcode-quota）
+## 统一 CLI（zcode-acp）
 
-除了 ACP server，本包还附带一个 `zcode-quota` 命令，可在**终端**里直接查询
-用量——无需编辑器，也无需 server 运行。默认在一张卡片里同时显示
-**GLM Coding Plan** 和 **Opencode Go**；传入 provider 参数可只看其中一个。
-
-GLM 凭证读取自 `~/.zcode/v2/config.json`。Opencode Go 凭证来自环境变量
-（dashboard 需要浏览器 cookie——见下方 [Opencode Go 配置](#opencode-go-配置)）。
-
-```bash
-# 双平台（默认）：GLM + Opencode Go 合并为一张卡片
-zcode-quota
-
-# 只看某一个 provider
-zcode-quota glm            # 仅 GLM Coding Plan
-zcode-quota go             # 仅 Opencode Go（rolling + weekly + monthly 三窗口）
-
-# 常驻监控：清屏并每 30s 刷新（默认）
-zcode-quota -w
-zcode-quota go -w          # 只监控 Opencode Go
-
-# 自定义刷新间隔（秒，最小 10）
-zcode-quota --watch --interval 60
-
-# 纯文本单色进度条（终端默认是彩色）
-zcode-quota --plain
-```
-
-默认情况下 CLI 会渲染热力配色（绿→黄→红）的进度条，并把用量数字叠在条内，
-这样每行更紧凑。传 `--plain`（或 `-p`）切回经典的 `█`/`░` 单色布局。当 stdout
-被管道或重定向时，彩色也会自动关闭，保证捕获到的输出干净。
-
-watch 模式会原地清屏重绘卡片，效果类似 `top`/`htop`。按 `Ctrl-C` 退出。
-之所以设最小间隔 10s，是因为配额 API 内部有 10s 缓存——更短的间隔只会一直
-返回过期的缓存值，没有意义。
-
-未全局安装时，可直接运行构建产物：
-
-```bash
-node dist/bin/quota.js -w
-```
-
-### Opencode Go 配置
-
-Opencode Go 订阅用量没有 JSON API——CLI 抓取的是登录后的 dashboard 页面
-`opencode.ai/workspace/<id>/go`，因此需要你的浏览器 `auth` cookie。设置两个
-环境变量：
-
-```bash
-export OPENCODE_GO_WORKSPACE_ID="wrk_你的工作区id"
-export OPENCODE_GO_AUTH_COOKIE="Fe26.2**你的cookie值"
-```
-
-获取方式：
-
-1. **Workspace ID**——打开 `https://opencode.ai`，进入你的 Go 工作区，从 URL
-   里复制 `wrk_…` id（`https://opencode.ai/workspace/<wrk_…>/go`）。
-2. **Auth cookie**——打开浏览器开发者工具（F12）→ Application → Cookies →
-   `opencode.ai` → 复制名为 `auth` 的 cookie 值（以 `Fe26.2**` 开头）。
-
-未设置这两个变量时，默认的双平台模式会**静默退化为只显示 GLM**（不报错）。
-若明确运行 `zcode-quota go` 但未配置，会打印一条配置提示。把它们加到 shell
-配置文件（`~/.zshrc` / `~/.bashrc`）即可持久化。
+本包所有能力收敛在一条命令下：交互式终端聊天 REPL（原生滚动回溯）、套餐
+用量卡片（`zcode-acp quota`，GLM + Opencode Go + Ollama Cloud）、远程 hub 守护进程
+（`zcode-acp hub`）以及编辑器调用的 stdio server（`zcode-acp server`）。
+REPL 按键、补全、历史与配额配置详见 [docs/CLI.md](docs/CLI.md)。
 
 ## ACP Registry
 
 本服务端兼容 [ACP Registry](https://agentclientprotocol.com/get-started/registry)。它在 `initialize` 时声明一个 `agent` 类型的认证方法——GLM API key 由 ZCode 后端从 `~/.zcode/v2/config.json` 读取，**编辑器侧无需配置任何凭据**。
 
-Registry 提交资产位于 [`registry/zcode-acp-server/`](registry/zcode-acp-server/)（`agent.json` + `icon.svg`）。包发布到 npm 后，将该目录复制到 [`agentclientprotocol/registry`](https://github.com/agentclientprotocol/registry) 的 fork 中并提 PR——CI 会校验 `agent.json` schema、图标，以及 `initialize` 返回的 `authMethods` 非空。
+Registry 提交资产位于 [`registry/zcode-acp/`](registry/zcode-acp/)（`agent.json` + `icon.svg`）。包发布到 npm 后，将该目录复制到 [`agentclientprotocol/registry`](https://github.com/agentclientprotocol/registry) 的 fork 中并提 PR——CI 会校验 `agent.json` schema、图标，以及 `initialize` 返回的 `authMethods` 非空。
 
 ## 开发
 
@@ -256,6 +227,9 @@ CI 会在每次 push 和 pull request 时运行 `typecheck`、`lint`、`build` �
 
 - [架构](docs/ARCHITECTURE.md) —— 事件流、双路径去重、模块职责
 - [协议](docs/PROTOCOL.md) —— ZCode JSON-RPC 协议细节
+- [沙箱](docs/SANDBOX.md) —— 沙箱完整手册（开关、白名单、弹窗、验证）
+- [远程访问](docs/REMOTE.md) —— hub、发现 API、隧道、远程创建会话
+- [统一 CLI](docs/CLI.md) —— REPL、配额卡片、hub/server 子命令
 - [开发](docs/DEVELOPMENT.md) —— 本地开发、调试、新增扩展方法
 - [故障排查](docs/TROUBLESHOOTING.md) —— 常见问题排查
 
@@ -264,8 +238,17 @@ CI 会在每次 push 和 pull request 时运行 `typecheck`、`lint`、`build` �
 欢迎贡献！请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 了解环境搭建、代码风格、
 commit 约定和 PR 检查清单。重要变更记录在 [CHANGELOG.md](CHANGELOG.md)。
 
+感谢每一位贡献者（由[贡献者图谱](https://github.com/william0wang/zcode-acp/graphs/contributors)
+自动生成，覆盖全部历史贡献者）：
+
+<a href="https://github.com/william0wang/zcode-acp/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=william0wang/zcode-acp" alt="贡献者" />
+</a>
+
 ## 相关项目
 
+- [glm-acp-agent](https://github.com/stefandevo/glm-acp-agent) —— 自包含的 ACP agent，直接调用 GLM API；zcode-acp 则桥接真实的 `zcode app-server`，继承其完整的官方 harness。
+- [claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) / [codex-acp](https://github.com/agentclientprotocol/codex-acp) —— Claude 与 Codex CLI 的官方 ACP 适配器；zcode-acp 是同一思路在 ZCode CLI 上的实现。
 - [zcode-open-bridge](https://github.com/tizerluo/zcode-open-bridge) —— 一个社区 Python 实现，将 ZCode 接入 MCP/ACP 生态。本项目参考了它的桥接架构和若干处理策略。
 
 ## 致谢

@@ -67,13 +67,31 @@ export interface UsageDeltaEvent {
   size: number;
 }
 
+/** `turn.completed` cacheStats, verbatim subset (backend schema is strict but
+ *  older builds omit the field entirely — everything here is optional to consume). */
+export interface TurnCacheStats {
+  totalMessages: number;
+  cachedMessages: number;
+  lastCacheHit: boolean;
+  cacheReadTokens?: number;
+}
+
+/** Turn-terminal info from `turn.completed` — rendered as ONE status line at
+ *  turn end (completion + cache stats, or the concrete non-success resultType). */
+export interface TurnInfoEvent {
+  kind: "TurnInfo";
+  resultType: string;
+  cacheStats?: TurnCacheStats;
+}
+
 export interface TextDeltaEvent {
   kind: "TextDelta";
   text: string;
   /**
-   * Backend message id (assistantMessageId). Set by the projection-differ's
-   * turn-completion fallback replay so the turn loop can dedup against
-   * content already streamed via events this turn; absent on live stream deltas.
+   * Backend message id (assistantMessageId). Set on live stream deltas that
+   * carry one, and by the projection-differ's turn-completion fallback replay
+   * so the turn loop can dedup against content already streamed via events
+   * this turn; absent when the backend event carried no id.
    */
   messageId?: string;
 }
@@ -133,6 +151,7 @@ export type InternalEvent =
   | ToolCallNewEvent
   | ToolCallUpdateEvent
   | UsageDeltaEvent
+  | TurnInfoEvent
   | TextDeltaEvent
   | ReasoningDeltaEvent
   | PlanUpdateEvent

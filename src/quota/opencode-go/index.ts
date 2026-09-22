@@ -1,42 +1,64 @@
 /**
  * Opencode Go usage orchestration — the entry point used by the
- * `zcode-acp quota` CLI.
+ * `zcode-acp quota` CLI and the quota dock.
  *
- * Flow: credentials (env + config file) → cache check → fetch → redirect/auth
+ * Flow: credentials (env + config file) → cache check → fetch → status/auth
  * check → parse → cache write. Any thrown error degrades to `unavailable`
  * rather than propagating, so the CLI always produces output.
  *
- * A missing/invalid credential pair yields `not_configured`, which the
+ * A missing/invalid credential triple yields `not_configured`, which the
  * combined view silently skips (vs. `unavailable`, which renders an error
  * line) — so users who only care about GLM see no noise.
  */
 
+import { loadUserConfig } from "../../config/user-config.js";
 import { log } from "../../utils.js";
 import { getCached, setCached } from "./cache.js";
-import { ENV_AUTH_COOKIE, ENV_WORKSPACE_ID, readConfigFile } from "./config.js";
-import { fetchGoDashboard } from "./client.js";
-import { parseGoDashboard } from "./parse.js";
+import { ENV_AUTH_COOKIE, ENV_SESSION_TOKEN, ENV_WORKSPACE_ID, readConfigFile } from "./config.js";
+import { fetchGoStatus } from "./client.js";
+import { parseGoStatus } from "./parse.js";
 import type { GoQueryResult } from "./types.js";
 
 /** Format validators (match pi-go-bars conventions). */
 const RE_WORKSPACE = /^wrk_[A-Za-z0-9]+$/;
 const COOKIE_PREFIX = "Fe26.2**";
 
+/** Minimum plausible session-token length (console `st_…` values). */
+const MIN_SESSION_TOKEN = 8;
+
 /**
  * Resolve & validate credentials.
  *
- * Environment variables take precedence over `~/.pi/agent/opencode-go.json`,
- * merged field-by-field: env overrides the same field from the file, but a
- * field present only in the file still counts. Returns `null` when the
- * resolved pair is incomplete or malformed — `queryGoUsage` maps that to
- * `not_configured`.
+ * Three sources, merged field-by-field with the standard user-config
+ * precedence (highest first):
+ *   1. `quota.opencodeGoWorkspaceId` / `opencodeGoAuthCookie` /
+ *      `opencodeGoSessionToken` in `~/.config/zcode-acp/config.json` (our own
+ *      config — preferred home).
+ *   2. `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE` /
+ *      `OPENCODE_GO_SESSION_TOKEN` env vars.
+ *   3. `~/.pi/agent/opencode-go.json` (legacy — the @beyona/pi-zai-usage Pi
+ *      extension convention, kept so existing setups keep working).
+ *
+ * The session token is REQUIRED since the 2026-09 console migration: the
+ * status API answers 401 to an `auth` cookie alone. A field present in a
+ * higher-precedence source overrides the same field below it; a field present
+ * only lower down still counts. Returns `null` when the resolved triple is
+ * incomplete or malformed — `queryGoUsage` maps that to `not_configured`.
  */
-function loadCredentials(): { workspaceId: string; authCookie: string } | null {
+function loadCredentials(): {
+  workspaceId: string;
+  authCookie: string;
+  sessionToken: string;
+} | null {
+  const own = loadUserConfig().quota;
   const file = readConfigFile();
-  const workspaceId = process.env[ENV_WORKSPACE_ID] ?? file.workspaceId;
-  const authCookie = process.env[ENV_AUTH_COOKIE] ?? file.authCookie;
+  const workspaceId =
+    own?.opencodeGoWorkspaceId ?? process.env[ENV_WORKSPACE_ID] ?? file.workspaceId;
+  const authCookie = own?.opencodeGoAuthCookie ?? process.env[ENV_AUTH_COOKIE] ?? file.authCookie;
+  const sessionToken =
+    own?.opencodeGoSessionToken ?? process.env[ENV_SESSION_TOKEN] ?? file.sessionToken;
 
-  if (!workspaceId || !authCookie) return null;
+  if (!workspaceId || !authCookie || !sessionToken) return null;
   if (!RE_WORKSPACE.test(workspaceId)) {
     log(`opencode-go: invalid workspaceId format (expected wrk_…)`);
     return null;
@@ -45,16 +67,20 @@ function loadCredentials(): { workspaceId: string; authCookie: string } | null {
     log(`opencode-go: authCookie does not start with ${COOKIE_PREFIX}`);
     return null;
   }
-  return { workspaceId, authCookie };
+  if (sessionToken.trim().length < MIN_SESSION_TOKEN) {
+    log(`opencode-go: sessionToken looks malformed (__Host-console_session value, st_…)`);
+    return null;
+  }
+  return { workspaceId, authCookie, sessionToken };
 }
 
 /**
- * Query the Opencode Go dashboard and return a normalised {@link GoQueryResult}.
+ * Query the Opencode Go console status API and return a normalised
+ * {@link GoQueryResult}.
  *
  * - No credentials / invalid → `not_configured`.
  * - Serves a cached result when fresh (< 10s).
- * - HTTP redirect to login (final URL no longer contains the workspace path)
- *   → `auth_error`.
+ * - HTTP 400/401/403 → `auth_error` (bad/missing org id or cookie pair).
  * - Network/timeout/parse failure → `unavailable`.
  */
 export async function queryGoUsage(): Promise<GoQueryResult> {
@@ -69,19 +95,22 @@ export async function queryGoUsage(): Promise<GoQueryResult> {
 
   let result: GoQueryResult;
   try {
-    const resp = await fetchGoDashboard(creds.workspaceId, creds.authCookie);
+    const resp = await fetchGoStatus(creds.workspaceId, creds.authCookie, creds.sessionToken);
 
-    // Redirect-to-login detection: an expired cookie silently bounces to the
-    // login page with a 200, so we check the final URL rather than the status.
-    if (!resp.finalUrl.includes(`/workspace/${creds.workspaceId}/go`)) {
+    // 401/403 = bad cookie pair; 400 = missing/unknown org id (x-org-id).
+    // The remedy is the same for all three — re-grab credentials — so they
+    // share auth_error.
+    if (resp.status === 400 || resp.status === 401 || resp.status === 403) {
       result = { kind: "auth_error" };
+    } else if (resp.status < 200 || resp.status >= 300) {
+      result = { kind: "unavailable" };
     } else {
-      const parsed = parseGoDashboard(resp.text);
+      const parsed = parseGoStatus(resp.text);
       if (parsed.parserOutdated) {
-        log("opencode-go: dashboard HTML recognised but no windows parsed (parser outdated)");
+        log("opencode-go: status JSON recognised but no windows parsed (parser outdated)");
         result = { kind: "unavailable" };
       } else if (!parsed.rolling && !parsed.weekly && !parsed.monthly) {
-        // Not a dashboard page at all (e.g. error page the redirect check missed).
+        // Not a status payload at all (e.g. an HTML error page).
         result = { kind: "unavailable" };
       } else {
         result = {
@@ -106,8 +135,14 @@ export async function queryGoUsage(): Promise<GoQueryResult> {
 
 // Re-exports for consumers (CLI + tests).
 export { clearCache, clearCache as clearGoCache } from "./cache.js";
-export { fetchGoDashboard, dashboardUrl } from "./client.js";
-export { parseGoDashboard, looksLikeDashboard } from "./parse.js";
+export { fetchGoStatus, goStatusUrl } from "./client.js";
+export { parseGoStatus, looksLikeGoStatus } from "./parse.js";
 export { formatDuration, formatGoSection } from "./format.js";
-export { readConfigFile, CONFIG_PATH, ENV_WORKSPACE_ID, ENV_AUTH_COOKIE } from "./config.js";
-export type { GoQueryResult, GoWindow, GoWindowKey, GoDashboardResponse } from "./types.js";
+export {
+  readConfigFile,
+  CONFIG_PATH,
+  ENV_WORKSPACE_ID,
+  ENV_AUTH_COOKIE,
+  ENV_SESSION_TOKEN,
+} from "./config.js";
+export type { GoQueryResult, GoWindow, GoWindowKey, GoStatusResponse } from "./types.js";

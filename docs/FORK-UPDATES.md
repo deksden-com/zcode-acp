@@ -31,6 +31,8 @@ separately; these rules do not assert that enforcement is already enabled.
    the remaining commits in dependency order. Resolve conflicts by checking the
    new upstream behavior, not by accepting the old file wholesale.
 4. Update the inventory with the resulting commits and changed contracts.
+   Pin the peeled upstream tag in `upstream-base.json`; builds use this committed
+   identity rather than depending on tags being available in shallow CI clones.
    Keep transport extensions near the existing extension handlers; avoid
    invasive rewrites of upstream session machinery for consumer-only policy.
 5. Use the Node/pnpm versions required by the selected revision. Run

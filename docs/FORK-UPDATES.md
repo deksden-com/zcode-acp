@@ -11,7 +11,9 @@ fetch or push: older qualification clones may use different remote names.
 Keep upstream refs unmodified. A local `upstream` tracking branch, if used,
 must fast-forward only and contain no downstream commits. Candidate branches
 start at an exact upstream tag; release tags and already qualified commits are
-immutable. The existing `dd-eval/v0.43.2-overlay` is one such source baseline.
+immutable. Tag `archive/dd-eval-v0.43.2-overlay` preserves the historical overlay
+baseline; completed upgrade and experiment branches are removed after an
+immutable tag preserves any unique history.
 
 Our default integration branch is `main`. Use `upgrade/zcode-acp-<version>` for
 upstream candidates and short-lived `fix/` or `docs/` branches for downstream

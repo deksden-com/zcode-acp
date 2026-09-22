@@ -23,6 +23,7 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
+import { backendError } from "../backend/errors.js";
 
 import { emitInitialUsage } from "../config/model-cache.js";
 import { applyModelSwitch } from "../config/runtime-model.js";
@@ -68,7 +69,7 @@ export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Pro
     { sessionId: zcodeSid, target: buildCheckpointTarget(params) },
     15000,
   );
-  if (resp.error) throw new Error(`fork failed: ${resp.error.message}`);
+  if (resp.error) throw backendError("session/fork", resp, zcodeSid);
   // 3.3.0 returns `forkedSessionId` (not `sessionId`) for the new session id.
   // Register it so subsequent ACP calls targeting the fork can resolve the sid.
   const result = (resp.result ?? {}) as { forkedSessionId?: string };
@@ -107,7 +108,7 @@ export async function goal(server: ZcodeAcpServer, params: ExtensionParams): Pro
   const resp = await server
     .ensureBackend()
     .request(server.nextId(), "session/goal", zcParams, 15000);
-  if (resp.error) throw new Error(`goal failed: ${resp.error.message}`);
+  if (resp.error) throw backendError("session/goal", resp, zcodeSid);
   // set/replace start an internal AI turn → wait for the prompt lock to release.
   if (action === "set" || action === "replace") {
     // timeout is in MILLISECONDS here (Date.now()-based), not seconds — Python's
@@ -142,7 +143,7 @@ export async function compact(
   const resp = await server
     .ensureBackend()
     .request(server.nextId(), "session/compact", zcParams, 30000);
-  if (resp.error) throw new Error(`compact failed: ${resp.error.message}`);
+  if (resp.error) throw backendError("session/compact", resp, zcodeSid);
   const ack = ((resp.result ?? {}) as { compact?: { state?: string } }).compact?.state;
   const alreadyRunning = ack === "already_running";
   if (alreadyRunning) {
@@ -213,7 +214,7 @@ export async function cancelBackgroundTask(
       { sessionId: zcodeSid, taskId },
       15000,
     );
-  if (resp.error) throw new Error(`cancelBackgroundTask failed: ${resp.error.message}`);
+  if (resp.error) throw backendError("session/cancelBackgroundTask", resp, zcodeSid);
   // Reflect the cancellation on the ACP tool card (status:failed + cancelled
   // flag) and clear the background listener's local tracking. Best-effort.
   const listener = server.backgroundListeners.get(zcodeSid);
@@ -238,7 +239,7 @@ export async function setThoughtLevel(
   const resp = await server
     .ensureBackend()
     .request(server.nextId(), "session/setThoughtLevel", zcParams, 15000);
-  if (resp.error) throw new Error(`setThoughtLevel failed: ${resp.error.message}`);
+  if (resp.error) throw backendError("session/setThoughtLevel", resp, zcodeSid);
   log("session/setThoughtLevel → ok");
   // Remember for the post-resume re-assert (the backend's own selection
   // persistence can be lost — see reassertModelChoice in session.ts). A
@@ -292,7 +293,7 @@ export async function setMode(
   const resp = await server
     .ensureBackend()
     .request(server.nextId(), "session/setMode", { sessionId: zcodeSid, mode }, 15000);
-  if (resp.error) throw new Error(`setMode failed: ${resp.error.message}`);
+  if (resp.error) throw backendError("session/setMode", resp, zcodeSid);
   log(`session/setMode → ${mode}`);
   // Re-build configOptions (settings.mode.current is now updated) and emit
   // config_option_update + current_mode_update to EVERY attached client, so

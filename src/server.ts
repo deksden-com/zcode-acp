@@ -39,6 +39,8 @@ export interface ClientCapabilities {
 export interface PendingTurn {
   zcodeSid: string;
   cancelled: boolean;
+  /** Confirmed native close; this exact turn must never revive the resident. */
+  closed?: boolean;
   /** Set once session/stop has been fired for this turn, to avoid re-sending. */
   stopSent?: boolean;
   /**

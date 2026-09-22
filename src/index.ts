@@ -241,7 +241,14 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       // zcode app-server 0.16+ (steer/rewind moved to the v4 conversation API);
       // the bridge dropped its passthroughs accordingly.
       .onRequest("session/fork", extParams, (ctx) => fork(server, ctx.params))
-      .onRequest("zcode/session/resolve", extParams, (ctx) => resolveSession(server, ctx.params))
+      .onRequest("zcode/session/resolve", extParams, (ctx) =>
+        resolveSession(server, ctx.params, async (sid) => {
+          await ctx.client.notify("zcode/session/allocated", {
+            adapter_session_id: ctx.params.sessionId,
+            provider_session_id: sid,
+          });
+        }),
+      )
       .onRequest("zcode/session/read", extParams, (ctx) => readSession(server, ctx.params))
       .onRequest("zcode/session/subagents", extParams, (ctx) => subagents(server, ctx.params))
       .onRequest("zcode/session/usage", extParams, (ctx) => usage(server, ctx.params))

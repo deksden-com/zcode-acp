@@ -27,6 +27,7 @@
  */
 
 import { accountProviderIdFor } from "./account-provider.js";
+import { backendError, isUnknownBackendOutcome } from "../backend/errors.js";
 import { buildModelElement, type ModelEntry } from "./provider-registry.js";
 import {
   findProviderConfig,
@@ -152,6 +153,7 @@ export async function applyModelSwitch(
     15000,
   );
   if (resp.error) {
+    if (isUnknownBackendOutcome(resp.error)) throw backendError("session/setModel", resp, zcodeSid);
     warn(`runtime-model: switch failed: ${resp.error.message}`);
     return false;
   }

@@ -20,6 +20,7 @@ function serverWith(result: unknown) {
       resolveSid: () => "sess_native",
       isBackendSessionLive: () => true,
       pendingTurns: new Map(),
+      pendingSessions: new Map(),
       sessionMap: new Map(),
       backendLoadedSessions: new Map(),
       nextId: () => 1,

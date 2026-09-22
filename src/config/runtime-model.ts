@@ -27,6 +27,7 @@
  */
 
 import { accountProviderIdFor } from "./account-provider.js";
+import { backendError, isUnknownBackendOutcome } from "../backend/errors.js";
 import { buildModelElement, type ModelEntry } from "./provider-registry.js";
 import {
   findProviderConfig,
@@ -175,6 +176,7 @@ export async function applyModelSwitch(
       invalidateModelCache(server, zcodeSid);
       return true;
     }
+    if (isUnknownBackendOutcome(resp.error)) throw backendError("session/setModel", resp, zcodeSid);
     lastError = resp.error.message ?? lastError;
     // Only level-shape rejections are ladder-recoverable; anything else
     // (provider/model not found, busy, schema) fails the switch outright.

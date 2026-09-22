@@ -12,6 +12,7 @@
  */
 
 import type { ZcodeBackend } from "./client.js";
+import { backendError } from "./errors.js";
 import type {
   ZcodeEvent,
   ZcodeProjection,
@@ -105,7 +106,9 @@ export class EventStreamListener {
             `subscribe: all ${MAX_ATTEMPTS} attempts timed out (backend unresponsive for ~${Math.round((MAX_ATTEMPTS * 5000 + 500) / 1000)}s)`,
           );
         }
-        throw new Error(formatSubscribeError(resp));
+        const error = backendError("session/subscribe", resp, this.sid);
+        error.message = formatSubscribeError(resp);
+        throw error;
       }
       log(
         `subscribe attempt ${attempt}/${MAX_ATTEMPTS} timed out, retrying in ${backoffMs(attempt)}ms`,

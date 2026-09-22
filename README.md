@@ -9,7 +9,7 @@ through `src/handlers/harness.ts`. Usage accounting and integration policy live
 in the consumer adapter. The upstream badges below do not certify our fork.
 
 See [PATCHES.md](PATCHES.md), [fork updates](docs/FORK-UPDATES.md), the
-[adapter contract](https://github.com/deksden-com/dd-flow-cli/blob/refactor/dd-zcode-native-evidence/src/harness-runtime/DD-ZCODE.md)
+[adapter contract](https://github.com/deksden-com/dd-flow-cli/blob/main/src/harness-runtime/DD-ZCODE.md)
 and [system upgrade runbook](https://github.com/deksden-com/dd-eval/blob/main/runbooks/update-zcode.md).
 Build identity is recorded in `dist/dd-harness-build.json`; the source commit
 comes from that file, including when the artifact is installed without Git.

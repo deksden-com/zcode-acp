@@ -5,8 +5,8 @@
  * Every backend adapter reuses one read-loop multiplexer, watchdog, and
  * process-group lifecycle:
  *   - responses (id, no method) → resolve the matching pending request
- *   - id + method               → our response (id registered) or a
- *                                 server→client request (hook first, then queue)
+ *   - id + method               → server→client request (hook first, then queue);
+ *                                 response-shaped frames require matching method
  *   - method + no id            → notification (backend-specific hook)
  *
  * Wire dialects differ per backend: zcode sends BARE frames (no `jsonrpc`
@@ -32,8 +32,11 @@ import type { ZcodeEvent, ZcodeInbound, ZcodeResponse } from "./types.js";
 
 /** Pending request resolver. Stored under the request id. */
 interface PendingRequest {
+  method: string;
   resolve: (resp: ZcodeResponse) => void;
   timer: ReturnType<typeof setTimeout>;
+  expired?: boolean;
+  onLateResponse?: (response: ZcodeResponse) => void | Promise<void>;
 }
 
 export interface JsonRpcChildOptions {
@@ -66,6 +69,7 @@ export abstract class JsonRpcChild implements BackendAdapter {
   private sendIdCounter = 1_000_000_000;
   /** Watchdog process that kills the backend group if this bridge dies (SIGKILL). */
   private watchdog: ChildProcess | null = null;
+  private closing?: Promise<void>;
 
   protected constructor(opts: JsonRpcChildOptions) {
     this.name = opts.name;
@@ -90,8 +94,7 @@ export abstract class JsonRpcChild implements BackendAdapter {
     // crashes with an unhandled 'error' event. Catch them here and mark the
     // reader dead so the rest of the bridge stops talking to a gone backend.
     this.proc.stdin?.on("error", (err) => {
-      this.readerDead = true;
-      warn(`backend: stdin error: ${err.message}`);
+      this.markReaderDead(`stdin error: ${err.message}`, "native_backend_pipe_broken");
     });
     this.startReader();
     this.startWatchdog();
@@ -176,10 +179,12 @@ export abstract class JsonRpcChild implements BackendAdapter {
       return;
     }
     if (id !== undefined && method !== undefined) {
-      // id + method: our pending response wins the race; else a hook gets a
-      // chance (dialect-specific auto-reply), else it queues as server→client.
-      if (this.pending.has(id as number)) {
-        this.resolvePending(id as number, msg as unknown as ZcodeResponse);
+      // Direction is structural, not determined by a colliding request ID.
+      // Late or mismatched response-shaped frames must never become requests.
+      if ("result" in msg || "error" in msg) {
+        if (this.pending.get(id as number)?.method === method) {
+          this.resolvePending(id as number, msg as unknown as ZcodeResponse);
+        }
       } else {
         const req: ServerRequest = {
           id,
@@ -222,18 +227,30 @@ export abstract class JsonRpcChild implements BackendAdapter {
     if (!p) return;
     clearTimeout(p.timer);
     this.pending.delete(id);
+    if (p.expired) {
+      void Promise.resolve()
+        .then(() => p.onLateResponse?.(resp))
+        .catch((error) => {
+          warn(`backend: late response reconciliation failed (${p.method}): ${String(error)}`);
+        });
+      return;
+    }
     p.resolve(resp);
   }
 
-  protected markReaderDead(reason: string): void {
+  protected markReaderDead(reason: string, code = "native_backend_dead"): void {
     if (this.readerDead) return;
     this.readerDead = true;
     warn(`backend: reader exited (${reason})`);
-    for (const [, p] of this.pending) {
+    for (const [id, p] of this.pending) {
       clearTimeout(p.timer);
       p.resolve({
-        id: 0,
-        error: { message: `${this.name} backend reader exited (backend dead)` },
+        id,
+        error: {
+          code,
+          message: `${this.name} backend reader exited (backend dead)`,
+          data: { method: p.method },
+        },
       });
     }
     this.pending.clear();
@@ -343,17 +360,31 @@ export abstract class JsonRpcChild implements BackendAdapter {
     method: string,
     params?: Record<string, unknown>,
     timeoutMs = 30000,
+    onLateResponse?: (response: ZcodeResponse) => void | Promise<void>,
   ): Promise<ZcodeResponse> {
     if (this.readerDead) {
-      return { id, error: { message: `${this.name} backend reader exited (backend dead)` } };
+      return {
+        id,
+        error: { code: "native_backend_dead", message: `${this.name} backend reader exited (backend dead)` },
+      };
     }
+    if (this.pending.has(id)) throw new Error(`Duplicate native request id ${id}`);
     const promise = new Promise<ZcodeResponse>((resolve) => {
       const timer = setTimeout(() => {
-        if (this.pending.delete(id)) {
-          resolve({ id, error: { message: "timeout" } });
-        }
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        if (onLateResponse) {
+          pending.expired = true;
+          // Bounded observation; durable allocation intent survives this window.
+          pending.timer = setTimeout(() => this.pending.delete(id), 60_000);
+          pending.timer.unref();
+        } else this.pending.delete(id);
+        resolve({
+          id,
+          error: { code: "native_timeout", message: "timeout", data: { method, timeout_ms: timeoutMs } },
+        });
       }, timeoutMs);
-      this.pending.set(id, { resolve, timer });
+      this.pending.set(id, { resolve, timer, method, onLateResponse });
     });
     try {
       // Fast-fail a closed pipe BEFORE the pending wait: writeFrame only
@@ -363,14 +394,7 @@ export abstract class JsonRpcChild implements BackendAdapter {
       if (!stdin || stdin.destroyed) throw new Error("stdin closed");
       this.writeFrame({ id, method, params: params ?? {} });
     } catch (e) {
-      this.pending.delete(id);
-      this.readerDead = true;
-      return {
-        id,
-        error: {
-          message: `${this.name} backend pipe broken: ${e instanceof Error ? e.message : String(e)}`,
-        },
-      };
+      this.markReaderDead(`pipe broken: ${String(e)}`, "native_backend_pipe_broken");
     }
     return promise;
   }
@@ -378,50 +402,42 @@ export abstract class JsonRpcChild implements BackendAdapter {
   // ---------- lifecycle ----------
 
   /**
-   * Kill the whole backend process group and wait for it to die.
+   * Kill the whole zcode process group and wait for it to die.
    *
-   * SIGTERM → wait up to 3s → SIGKILL if still alive. Note `proc.killed` is
-   * NOT set by `process.kill(-pid)` (group signal), so we track liveness via
-   * `exitCode === null` instead. Async so the caller can `await` a full reap
-   * before the parent exits (an unref'd timer could be skipped on fast exit,
-   * leaving orphans).
+   * SIGTERM → bounded group wait → SIGKILL. Leader exit is insufficient.
+   * Share teardown across shutdown paths and never re-signal a retired PGID.
    */
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    return (this.closing ??= this.closeGroup());
+  }
+
+  private async closeGroup(): Promise<void> {
     const proc = this.proc;
     if (!proc.pid) return;
-    try {
-      // Already exited?
-      if (proc.exitCode !== null || proc.signalCode) return;
+    this.markReaderDead("bridge closing");
+    const groupGone = () => {
       try {
-        process.kill(-proc.pid, "SIGTERM");
-      } catch {
-        return; // group already gone
+        process.kill(-proc.pid!, 0);
+        return false;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH";
       }
-      // Wait up to 3s for a clean exit.
-      const exited = await new Promise<boolean>((resolve) => {
-        let timer: ReturnType<typeof setTimeout>;
-        const done = () => {
-          clearTimeout(timer); // don't let the timeout keep the event loop alive
-          resolve(true);
-        };
-        proc.once("exit", done);
-        timer = setTimeout(() => {
-          proc.removeListener("exit", done);
-          resolve(false);
-        }, 3000);
-      });
-      if (exited) return;
-      // Still alive → SIGKILL the whole group.
+    };
+    // The leader can exit before its workers. Only group absence proves cleanup.
+    for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+      if (groupGone()) break;
       try {
-        if (proc.pid && proc.exitCode === null) process.kill(-proc.pid, "SIGKILL");
-      } catch {
-        // already gone
+        process.kill(-proc.pid, signal);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }
-    } finally {
-      // Stop the watchdog — it would self-exit on its next tick once the
-      // backend group is gone, but killing it here avoids the up-to-2s delay.
-      this.killWatchdog();
+      const deadline = Date.now() + 3000;
+      while (!groupGone() && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
     }
+    if (!groupGone()) throw new Error("Native process group cleanup is unconfirmed");
+    this.killWatchdog();
   }
 
   /** Terminate the watchdog process if it is still running. */

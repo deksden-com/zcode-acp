@@ -15,6 +15,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 
 import { backendCapabilities } from "../backend/adapter.js";
 import type { ZcodeReadResult } from "../backend/types.js";
+import { backendError } from "../backend/errors.js";
 import { recordModelChoice } from "../lazy-sessions.js";
 import {
   clientConnectionRoot,
@@ -682,7 +683,7 @@ export async function setConfigOption(
     { sessionId: zcodeSid, [dispatch.paramKey]: value },
     15000,
   );
-  if (resp.error) return null;
+  if (resp.error) throw backendError(dispatch.method, resp, zcodeSid);
   if (configId === "thought") {
     rememberModelChoice(server, acpSid, zcodeSid, { thought: value });
   }
@@ -811,7 +812,7 @@ async function sessionRead(server: ZcodeAcpServer, zcodeSid: string): Promise<Zc
     { sessionId: zcodeSid, messageLimit: 1 },
     5000,
   );
-  if (resp.error) throw new Error(resp.error.message);
+  if (resp.error) throw backendError("session/read", resp, zcodeSid);
   return (resp.result ?? {}) as ZcodeReadResult;
 }
 

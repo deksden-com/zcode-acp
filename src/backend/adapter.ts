@@ -181,6 +181,7 @@ export interface BackendAdapter {
     method: string,
     params?: Record<string, unknown>,
     timeoutMs?: number,
+    onLateResponse?: (response: ZcodeResponse) => void | Promise<void>,
   ): Promise<ZcodeResponse>;
 
   /** Send a message with an id but WITHOUT registering a pending response. */

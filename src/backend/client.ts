@@ -64,6 +64,7 @@ export class ZcodeBackend {
   private sendIdCounter = 1_000_000_000;
   /** Watchdog process that kills the zcode group if this bridge dies (SIGKILL). */
   private watchdog: ChildProcess | null = null;
+  private closing?: Promise<void>;
   /**
    * Arrival-time responder for `interaction/requestProviderRuntimeHeaders`.
    * The backend asks before EVERY model request on a zhipu-account provider,
@@ -458,14 +459,14 @@ export class ZcodeBackend {
   /**
    * Kill the whole zcode process group and wait for it to die.
    *
-   * SIGTERM → wait up to 3s → SIGKILL if still alive. Mirrors the Python
-   * `os.killpg` + `proc.wait(3)` + SIGKILL escalation. Note `proc.killed` is
-   * NOT set by `process.kill(-pid)` (group signal), so we track liveness via
-   * `exitCode === null` instead. Async so the caller can `await` a full reap
-   * before the parent exits (an unref'd timer could be skipped on fast exit,
-   * leaving orphans).
+   * SIGTERM → bounded group wait → SIGKILL. Leader exit is insufficient.
+   * Share teardown across shutdown paths and never re-signal a retired PGID.
    */
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    return (this.closing ??= this.closeGroup());
+  }
+
+  private async closeGroup(): Promise<void> {
     const proc = this.proc;
     if (!proc.pid) return;
     this.markReaderDead("bridge closing");

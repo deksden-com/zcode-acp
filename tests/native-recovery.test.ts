@@ -32,6 +32,9 @@ describe("native recovery invariants", () => {
       await backend.close();
       expect(kill).toHaveBeenCalledWith(-12345678, "SIGTERM");
       expect(present).toBe(false);
+      const calls = kill.mock.calls.length;
+      await backend.close();
+      expect(kill).toHaveBeenCalledTimes(calls);
     } finally {
       kill.mockRestore();
     }

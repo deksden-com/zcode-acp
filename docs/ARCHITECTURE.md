@@ -77,6 +77,16 @@ resume` / `session/load` of a placeholder from a previous bridge lifetime still
 resolves: with a recorded backend id the real session is resumed, without one a
 fresh (empty) session is materialized — never "Session not found".
 
+Allocation safety uses strict per-alias records under `~/.zcode/v2/acp-allocations/`.
+An exclusive intent is written before native create, and the confirmed native
+identity replaces it atomically. An unresolved intent cannot expire or authorize
+a second create after restart. A late native reply is correlated even after the
+request's observation deadline; it records identity and emits the extension
+notification `zcode/session/allocated` (adapter_session_id, provider_session_id,
+cwd). This notification is evidence only: it never restarts the failed prompt
+handler or opens a background subscription. Backend death without a reply
+leaves the durable intent unknown, not successful or retryable.
+
 ### 2. Event stream subscription
 
 ```

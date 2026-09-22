@@ -16,6 +16,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeEvent } from "../src/backend/types.js";
 import { prompt } from "../src/handlers/session.js";
+import { closeSession } from "../src/handlers/extensions.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
 // Record title persists so tests can assert the tasks-index write (the real
@@ -96,6 +97,45 @@ function promptParams(text: string): acp.PromptRequest {
 }
 
 describe("one-shot session title (set once at the FIRST prompt)", () => {
+  it.each([false, true])(
+    "settles a closed pending prompt without a terminal event (busy send: %s)",
+    async (busy) => {
+      const backend = scriptedBackend(() => []);
+      const original = backend.request;
+      let sendCount = 0;
+      const lateListeners: Array<{ handleEvent: (event: ZcodeEvent) => void }> = [];
+      const register = backend.registerEventListener.bind(backend);
+      backend.registerEventListener = (sid, listener) => {
+        lateListeners.push(listener);
+        register(sid, listener);
+      };
+      backend.unregisterEventListener = vi.fn();
+      backend.request = async (...args) => {
+        if (args[1] === "session/close") return { result: { closed: true } };
+        if (args[1] === "session/send") {
+          sendCount++;
+          if (busy) return { error: { code: 1308, message: "prompt is running" } };
+        }
+        return original(...args);
+      };
+      const server = setup(backend);
+      const { cx } = collectCx();
+      const running = prompt(server, promptParams("exercise close"), cx, 901);
+      await vi.waitFor(() => expect(sendCount).toBe(1));
+      await closeSession(server, { sessionId: "sess_ts" });
+      await expect(running).resolves.toEqual({ stopReason: "cancelled" });
+      expect(server.pendingTurns.size).toBe(0);
+      expect(backend.unregisterEventListener).toHaveBeenCalledTimes(1);
+      for (const listener of lateListeners)
+        listener.handleEvent({
+          seq: 50,
+          type: "turn.completed",
+          payload: { resultType: "success" },
+        } as ZcodeEvent);
+      expect(sendCount).toBe(1);
+      expect(server.pendingTurns.size).toBe(0);
+    },
+  );
   it("sets the title from the first prompt before the turn runs, once", async () => {
     const server = setup(
       scriptedBackend(() => [

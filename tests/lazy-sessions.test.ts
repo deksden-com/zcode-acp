@@ -11,6 +11,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  beginSessionAllocation,
+  finishSessionAllocation,
   lookupLazySession,
   recordMaterializedSession,
   rememberLazySession,
@@ -27,15 +29,18 @@ vi.mock("node:fs", async () => {
     existsSync: (p: string) => mockFiles.has(p) || mockDirs.has(p),
     readFileSync: (p: string) => {
       if (mockFiles.has(p)) return mockFiles.get(p)!;
-      throw new Error(`ENOENT: ${p}`);
+      throw Object.assign(new Error(`ENOENT: ${p}`), { code: "ENOENT" });
     },
-    writeFileSync: (p: string, data: string) => {
+    writeFileSync: (p: string, data: string, options?: { flag?: string }) => {
+      if (options?.flag === "wx" && mockFiles.has(p)) throw Object.assign(new Error("exists"), { code: "EEXIST" });
       mockDirs.add(path.dirname(p));
       mockFiles.set(p, String(data));
     },
     mkdirSync: (p: string) => {
       mockDirs.add(String(p));
     },
+    renameSync: (from: string, to: string) => { mockFiles.set(to, mockFiles.get(from)!); mockFiles.delete(from); },
+    unlinkSync: (p: string) => { mockFiles.delete(p); },
   };
 });
 
@@ -50,6 +55,29 @@ afterEach(() => {
 });
 
 describe("lazy session alias store", () => {
+  it("retains exclusive allocation intent until a confirmed result", () => {
+    rememberLazySession("a", "/tmp/ws");
+    beginSessionAllocation("a", "/tmp/ws");
+    expect(lookupLazySession("a")?.allocationPending).toBe(true);
+    expect(() => beginSessionAllocation("a", "/tmp/ws")).toThrow();
+    finishSessionAllocation("a", "/tmp/ws", "native-a");
+    rememberLazySession("a", "/other");
+    expect(lookupLazySession("a")?.zcodeSid).toBe("native-a");
+  });
+
+  it("allows retry only after a confirmed rejection", () => {
+    beginSessionAllocation("a", "/tmp/ws");
+    finishSessionAllocation("a", "/tmp/ws");
+    expect(() => beginSessionAllocation("a", "/tmp/ws")).not.toThrow();
+  });
+
+  it("fails closed on corrupt allocation metadata instead of falling back to an unused alias", () => {
+    rememberLazySession("a", "/tmp/ws");
+    beginSessionAllocation("a", "/tmp/ws");
+    const allocation = [...mockFiles.keys()].find((file) => file.includes("acp-allocations"))!;
+    mockFiles.set(allocation, "{}");
+    expect(() => lookupLazySession("a")).toThrow("Invalid retained allocation");
+  });
   it("records a placeholder at session/new and reads it back", () => {
     rememberLazySession("acp_1", "/tmp/ws");
 

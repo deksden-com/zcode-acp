@@ -14,6 +14,7 @@ import { readFileSync } from "node:fs";
 import type * as acp from "@agentclientprotocol/sdk";
 
 import type { ZcodeReadResult } from "../backend/types.js";
+import { backendError } from "../backend/errors.js";
 import { CONFIG_DISPATCH, CONFIG_META, log, ZCODE_CREDS_PATH } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { sendSessionUpdate } from "../handlers/io.js";
@@ -370,7 +371,7 @@ export async function setConfigOption(
     { sessionId: zcodeSid, [dispatch.paramKey]: value },
     15000,
   );
-  if (resp.error) return null;
+  if (resp.error) throw backendError(dispatch.method, zcodeSid, 15000, resp);
   return { kind: configId as "mode" | "thought", currentValue: value };
 }
 
@@ -437,7 +438,7 @@ async function sessionRead(server: ZcodeAcpServer, zcodeSid: string): Promise<Zc
     { sessionId: zcodeSid },
     5000,
   );
-  if (resp.error) throw new Error(resp.error.message);
+  if (resp.error) throw backendError("session/read", zcodeSid, 5000, resp);
   return (resp.result ?? {}) as ZcodeReadResult;
 }
 

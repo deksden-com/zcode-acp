@@ -19,6 +19,7 @@ import type {
   ZcodeSnapshot,
   ZcodeSubscribeResult,
 } from "./types.js";
+import { backendError } from "./errors.js";
 import { log, warn } from "../utils.js";
 
 /** ID generator function (the server's `_next_id`). */
@@ -99,7 +100,9 @@ export class EventStreamListener {
             `subscribe: all ${MAX_ATTEMPTS} attempts timed out (backend unresponsive for ~${Math.round((MAX_ATTEMPTS * 5000 + 500) / 1000)}s)`,
           );
         }
-        throw new Error(formatSubscribeError(resp));
+        const error = backendError("session/subscribe", this.sid, 5000, resp);
+        error.message = formatSubscribeError(resp);
+        throw error;
       }
       log(
         `subscribe attempt ${attempt}/${MAX_ATTEMPTS} timed out, retrying in ${backoffMs(attempt)}ms`,

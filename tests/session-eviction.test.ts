@@ -39,6 +39,8 @@ function fakeBackend(opts: {
   subscribeFailures?: number;
   /** session/resume responds with this error instead of success. */
   resumeError?: { code: number; message: string };
+  /** session/resume loses its transport after dispatch; the effect is unknown. */
+  resumeTransportError?: { code: string; message: string };
   /** History returned by session/messages. */
   history?: unknown[];
 }): { backend: ZcodeBackend; calls: Call[] } {
@@ -62,6 +64,7 @@ function fakeBackend(opts: {
           return { result: { eventSeq: 0 } };
         }
         case "session/resume":
+          if (opts.resumeTransportError) return { error: opts.resumeTransportError };
           return opts.resumeError ? { error: opts.resumeError } : { result: {} };
         case "session/read":
           return { result: { projection: { status: "idle", contextUsed: 0 }, settings: {} } };
@@ -164,9 +167,28 @@ describe("prompt() eviction recovery", () => {
     expect(count(calls, "session/subscribe")).toBe(1);
     expect(server.pendingTurns.size).toBe(0);
   });
+
+  it("does not replay a resume whose transport outcome is unknown", async () => {
+    const { backend, calls } = fakeBackend({ resumeTransportError: { code: "native_timeout", message: "timeout" } });
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    server.registerSession("sess_ts", "zs_ts");
+
+    await expect(loadSession(server, { sessionId: "sess_ts" } as acp.LoadSessionRequest, stubCx())).rejects.toThrow(/session\/resume failed: timeout/);
+    expect(count(calls, "session/resume")).toBe(1);
+  });
 });
 
 describe("ensureRealSession() eviction guard", () => {
+  it("does not hide an unknown prerequisite resume outcome", async () => {
+    const { backend, calls } = fakeBackend({ resumeTransportError: { code: "native_timeout", message: "timeout" } });
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    server.registerSession("sess_ts", "zs_ts");
+    await expect(ensureRealSession(server, "sess_ts")).rejects.toMatchObject({ data: { code: "native_timeout" } });
+    expect(count(calls, "session/resume")).toBe(1);
+    expect(count(calls, "session/send")).toBe(0);
+  });
   afterEach(() => {
     vi.restoreAllMocks();
   });

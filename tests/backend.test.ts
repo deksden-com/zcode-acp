@@ -28,7 +28,26 @@ function makeRoutingSubject(): ZcodeBackend & { route(msg: ZcodeInbound): void }
   return backend as ZcodeBackend & { route(msg: ZcodeInbound): void };
 }
 
+function makeFastRoutingSubject(): ZcodeBackend & { route(msg: ZcodeInbound): void } {
+  const backend = new ZcodeBackend([process.execPath, "-e", "process.stdin.resume()"], process.env, { lateResponseGraceMs: 25 });
+  return backend as ZcodeBackend & { route(msg: ZcodeInbound): void };
+}
+
 describe("ZcodeBackend reader routing (unit)", () => {
+  it("delivers a post-grace response exactly once without reviving its rejected observation", async () => {
+    const b = makeFastRoutingSubject();
+    const received: unknown[] = [];
+    try {
+      const result = await b.request(91, "session/create", {}, 1, (response) => { received.push(response); });
+      expect(result.error?.code).toBe("native_timeout");
+      b.route({ id: 91, result: { session: { sessionId: "late-native" } } });
+      await Promise.resolve();
+      b.route({ id: 91, result: { session: { sessionId: "late-native" } } });
+      await Promise.resolve();
+      expect(received).toHaveLength(1);
+      expect(result.error?.code).toBe("native_timeout");
+    } finally { await b.close(); }
+  });
   it("correlates a response by id to its pending request", async () => {
     const b = makeRoutingSubject();
     const pending = b.request(1, "ping", {}, 5000);
@@ -40,10 +59,31 @@ describe("ZcodeBackend reader routing (unit)", () => {
     b.close();
   });
 
-  it("returns timeout when no matching response arrives in time", async () => {
-    const b = makeRoutingSubject();
+  it("returns a structured timeout when no matching response arrives in time", async () => {
+    const b = makeFastRoutingSubject();
     const resp = await b.request(2, "ping", {}, 200);
     expect(resp.error?.message).toBe("timeout");
+    expect(resp.error?.code).toBe("native_timeout");
+    expect(resp.error?.detail).toEqual({ method: "ping", request_id: 2, timeout_ms: 200, grace_ms: 25 });
+    b.close();
+  });
+
+  it("keeps the original request alive for a late native response", async () => {
+    const b = makeFastRoutingSubject();
+    const pending = b.request(3, "session/create", {}, 10);
+    setTimeout(() => b.route({ id: 3, result: { sessionId: "sess_late" } }), 15);
+    await expect(pending).resolves.toEqual({ id: 3, result: { sessionId: "sess_late" } });
+    b.close();
+  });
+
+  it("keeps server requests separate from a colliding client response id", async () => {
+    const b = makeRoutingSubject();
+    const pending = b.request(4, "ping", {}, 1000);
+    b.route({ id: 4, method: "session/requestRuntimePreferences", params: {} });
+    expect(b.pollServerRequests()).toEqual([]);
+    b.sendReply(4, { nativeSearchEnhancementsEnabled: false });
+    b.route({ id: 4, result: { ok: true } });
+    await expect(pending).resolves.toEqual({ id: 4, result: { ok: true } });
     b.close();
   });
 
@@ -227,5 +267,21 @@ describe("ZcodeBackend spawn failure (ENOENT)", () => {
     const resp = await b.request(1, "ping", {}, 500);
     expect(resp.error).toBeDefined();
     await b.close();
+  });
+});
+
+describe("ZcodeBackend process settlement", () => {
+  it("does not treat leader exit as proof that its detached process group is gone", async () => {
+    if (process.platform === "win32") return;
+    const script = [
+      'const { spawn } = require("node:child_process");',
+      'spawn(process.execPath, ["-e", "setInterval(()=>{}, 1000)"], { stdio: "ignore" });',
+      'process.stdin.resume();',
+    ].join("");
+    const backend = new ZcodeBackend([process.execPath, "-e", script], process.env);
+    const pid = backend.proc.pid;
+    expect(pid).toBeTruthy();
+    await backend.close();
+    expect(() => process.kill(-pid!, 0)).toThrow(/ESRCH/);
   });
 });

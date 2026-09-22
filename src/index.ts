@@ -85,6 +85,7 @@ export async function main(): Promise<void> {
 
   const stream = acp.ndJsonStream(outbound, inbound);
   const server = new ZcodeAcpServer();
+  server.onSessionAllocated = (identity) => server.clients.broadcast().notify("zcode/session/allocated", identity);
 
   // Load all commands once at startup (they don't change mid-session).
   const allCommands = buildAllCommands();

@@ -14,13 +14,16 @@
  *   - `lookupLazySession` — lets resume/load/ensureRealSession recover a
  *     placeholder from a previous bridge lifetime.
  *
- * Best-effort side-channel like tasks-index: failures are logged and swallowed
+ * The legacy alias index is best-effort: failures are logged and swallowed
  * so a store problem never breaks session/new or first use. Records older than
  * 30 days are pruned on load — the real session stays reachable via
  * session/list after that, only the placeholder alias expires.
+ * Allocation intents/identities use separate strict per-alias records. They
+ * never expire automatically: absence of an outcome cannot authorize replay.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
@@ -31,6 +34,7 @@ export interface LazySessionRecord {
   cwd: string;
   /** Backend session id once the placeholder materialized (absent = never used). */
   zcodeSid?: string;
+  allocationPending?: boolean;
   createdAt: number;
 }
 
@@ -107,5 +111,35 @@ export function recordMaterializedSession(acpSid: string, zcodeSid: string, cwd:
 
 /** Look up a placeholder alias (undefined = unknown to this bridge and store). */
 export function lookupLazySession(acpSid: string): LazySessionRecord | undefined {
+  try {
+    const record = JSON.parse(readFileSync(allocationPath(acpSid), "utf8")) as LazySessionRecord;
+    if (!record || typeof record.cwd !== "string" || typeof record.createdAt !== "number" ||
+      !(record.allocationPending === true || (typeof record.zcodeSid === "string" && record.zcodeSid.length > 0))) {
+      throw new Error(`Invalid retained allocation for ${acpSid}`);
+    }
+    return record;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   return loadRecords()[acpSid];
+}
+
+function allocationPath(acpSid: string): string {
+  return path.join(path.dirname(storePath()), "acp-allocations", `${createHash("sha256").update(acpSid).digest("hex")}.json`);
+}
+
+/** Exclusive write-ahead allocation intent. A restart is not proof that a
+ * previous create failed. Separate alias files avoid shared-store lost writes. */
+export function beginSessionAllocation(acpSid: string, cwd: string): void {
+  const file = allocationPath(acpSid);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify({ cwd, createdAt: Date.now(), allocationPending: true }), { flag: "wx", mode: 0o600 });
+}
+
+export function finishSessionAllocation(acpSid: string, cwd: string, zcodeSid?: string): void {
+  const file = allocationPath(acpSid);
+  if (!zcodeSid) { unlinkSync(file); return; } // Confirmed native rejection only.
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, JSON.stringify({ cwd, zcodeSid, createdAt: Date.now() }), { flag: "wx", mode: 0o600 });
+  renameSync(temporary, file);
 }

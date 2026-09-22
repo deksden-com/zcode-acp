@@ -14,8 +14,11 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
+import { RequestError } from "@agentclientprotocol/sdk";
 
 import { emitInitialUsage } from "../config/model-cache.js";
+import { backendError } from "../backend/errors.js";
+import type { ZcodeResponse } from "../backend/types.js";
 import { applyModelSwitch } from "../config/runtime-model.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
 import { recordMaterializedSession } from "../lazy-sessions.js";
@@ -50,6 +53,14 @@ interface ExtensionParams {
 
 type Result = Record<string, unknown>;
 
+function backendFailure(method: string, sessionId: string, timeoutMs: number, response: ZcodeResponse): never {
+  const error = backendError(method, sessionId, timeoutMs, response);
+  throw new RequestError(-32603, error.message, {
+    code: error.nativeCode,
+    ...(error.details ?? {}),
+  });
+}
+
 /** Resolve a lazy ACP locator to the native ZCode Session identity. */
 export async function resolveSession(
   server: ZcodeAcpServer,
@@ -69,7 +80,7 @@ async function inspectSession(
   const resp = await server
     .ensureBackend()
     .request(server.nextId(), method, { ...options, sessionId: zcodeSid }, 15000);
-  if (resp.error) throw new Error(`${method} failed: ${resp.error.message}`);
+  if (resp.error) backendFailure(method, zcodeSid, 15_000, resp);
   return (resp.result ?? {}) as Result;
 }
 
@@ -80,11 +91,17 @@ export const subagents = (server: ZcodeAcpServer, params: ExtensionParams) =>
 
 /** Durable topology only: unlike ordinary inspection this must never load or
  * resume a closed resident. Kept a distinct method so older bridges fail closed. */
-export async function retainedSubagents(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
+export async function retainedSubagents(
+  server: ZcodeAcpServer,
+  params: ExtensionParams,
+): Promise<Result> {
   const nativeId = server.resolveSid(params.sessionId) ?? params.sessionId;
-  if (!nativeId.startsWith("sess_")) throw new Error("Retained topology requires a native Session identity");
-  const response = await server.ensureBackend().request(server.nextId(), "session/subagents", { sessionId: nativeId }, 15000);
-  if (response.error) throw new Error(`session/subagents failed: ${response.error.message}`);
+  if (!nativeId.startsWith("sess_"))
+    throw new Error("Retained topology requires a native Session identity");
+  const response = await server
+    .ensureBackend()
+    .request(server.nextId(), "session/subagents", { sessionId: nativeId }, 15000);
+  if (response.error) backendFailure("session/subagents", nativeId, 15_000, response);
   return { sessionId: nativeId, topology: response.result ?? null };
 }
 export async function usage(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
@@ -96,7 +113,7 @@ export async function usage(server: ZcodeAcpServer, params: ExtensionParams): Pr
     { sessionId: zcodeSid },
     15000,
   );
-  if (usageResponse.error) throw new Error(`session/usage failed: ${usageResponse.error.message}`);
+  if (usageResponse.error) backendFailure("session/usage", zcodeSid, 15_000, usageResponse);
   const result = (usageResponse.result ?? {}) as Result;
 
   // ZCode's compact usage projection does not currently expose cache tokens.
@@ -165,10 +182,19 @@ export async function closeSession(
 ): Promise<Result> {
   const zcodeSid = server.resolveSid(params.sessionId);
   if (!zcodeSid) throw new Error("session/close requires an already resolved Session");
+  const turns = [...server.pendingTurns.values()].filter((turn) => turn.zcodeSid === zcodeSid);
   const response = await server
     .ensureBackend()
     .request(server.nextId(), "session/close", { sessionId: zcodeSid }, 15000);
-  if (response.error) throw new Error(`session/close failed: ${response.error.message}`);
+  if (response.error) backendFailure("session/close", zcodeSid, 15000, response);
+  if ((response.result as Result | undefined)?.closed === true) {
+    // A closed native Session cannot subsequently emit the terminal event that
+    // its pending ACP prompt normally awaits. Let that prompt settle promptly.
+    for (const turn of turns) {
+      turn.closed = true;
+      turn.cancelled = true;
+    }
+  }
   log(`session/close → ${zcodeSid}`);
   return {
     ...((response.result ?? {}) as Result),
@@ -188,7 +214,7 @@ export async function residentSession(
     .ensureBackend()
     .request(server.nextId(), "session/read", { sessionId: nativeId }, 15000);
   if (response.error?.code === -32004) return { sessionId: nativeId, resident: false };
-  if (response.error) throw new Error(`session/read failed: ${response.error.message}`);
+  if (response.error) backendFailure("session/read", nativeId, 15000, response);
   return {
     sessionId: nativeId,
     resident: true,
@@ -206,7 +232,7 @@ export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Pro
     { sessionId: zcodeSid, target: buildCheckpointTarget(params) },
     15000,
   );
-  if (resp.error) throw new Error(`fork failed: ${resp.error.message}`);
+  if (resp.error) backendFailure("session/fork", zcodeSid, 15000, resp);
   // 3.3.0 returns `forkedSessionId` (not `sessionId`) for the new session id.
   // Register it so subsequent ACP calls targeting the fork can resolve the sid.
   const result = (resp.result ?? {}) as { forkedSessionId?: string };
@@ -234,7 +260,7 @@ export async function goal(server: ZcodeAcpServer, params: ExtensionParams): Pro
   const resp = await server
     .ensureBackend()
     .request(server.nextId(), "session/goal", zcParams, 15000);
-  if (resp.error) throw new Error(`goal failed: ${resp.error.message}`);
+  if (resp.error) backendFailure("session/goal", zcodeSid, 15000, resp);
   // set/replace start an internal AI turn → wait for the prompt lock to release.
   if (action === "set" || action === "replace") {
     // timeout is in MILLISECONDS here (Date.now()-based), not seconds — Python's
@@ -262,7 +288,7 @@ export async function compact(
   const resp = await server
     .ensureBackend()
     .request(server.nextId(), "session/compact", { sessionId: zcodeSid }, 30000);
-  if (resp.error) throw new Error(`compact failed: ${resp.error.message}`);
+  if (resp.error) backendFailure("session/compact", zcodeSid, 30000, resp);
   // compact's internal AI turn (read history → LLM compress → write back) can
   // take minutes; expectLock=true avoids the startup-delay false-success window.
   // timeout is in MILLISECONDS (Date.now()-based), not seconds — Python's
@@ -307,7 +333,7 @@ export async function cancelBackgroundTask(
       { sessionId: zcodeSid, taskId },
       15000,
     );
-  if (resp.error) throw new Error(`cancelBackgroundTask failed: ${resp.error.message}`);
+  if (resp.error) backendFailure("session/cancelBackgroundTask", zcodeSid, 15000, resp);
   // Reflect the cancellation on the ACP tool card (status:failed + cancelled
   // flag) and clear the background listener's local tracking. Best-effort.
   const listener = server.backgroundListeners.get(zcodeSid);
@@ -331,7 +357,7 @@ export async function setThoughtLevel(
   const resp = await server
     .ensureBackend()
     .request(server.nextId(), "session/setThoughtLevel", zcParams, 15000);
-  if (resp.error) throw new Error(`setThoughtLevel failed: ${resp.error.message}`);
+  if (resp.error) backendFailure("session/setThoughtLevel", zcodeSid, 15000, resp);
   log("session/setThoughtLevel → ok");
   return (resp.result ?? {}) as Result;
 }
@@ -350,7 +376,7 @@ export async function updateRuntimeModelConfig(
   const resp = await server
     .ensureBackend()
     .request(server.nextId(), "session/updateRuntimeModelConfig", zcParams, 15000);
-  if (resp.error) throw new Error(`updateRuntimeModelConfig failed: ${resp.error.message}`);
+  if (resp.error) backendFailure("session/updateRuntimeModelConfig", zcodeSid, 15000, resp);
   log("session/updateRuntimeModelConfig → ok");
   return (resp.result ?? {}) as Result;
 }
@@ -383,7 +409,7 @@ export async function setMode(
   const resp = await server
     .ensureBackend()
     .request(server.nextId(), "session/setMode", { sessionId: zcodeSid, mode }, 15000);
-  if (resp.error) throw new Error(`setMode failed: ${resp.error.message}`);
+  if (resp.error) backendFailure("session/setMode", zcodeSid, 15000, resp);
   log(`session/setMode → ${mode}`);
   // Re-build configOptions (settings.mode.current is now updated) and emit
   // config_option_update + current_mode_update so the editor UI reflects it.

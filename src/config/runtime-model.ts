@@ -27,6 +27,7 @@
  */
 
 import { buildModelElement, type ModelEntry } from "./provider-registry.js";
+import { backendError } from "../backend/errors.js";
 import {
   findProviderConfig,
   formatModelValue,
@@ -35,7 +36,7 @@ import {
   parseModelValue,
 } from "./options.js";
 import type { ModelRef } from "./options.js";
-import { log, warn } from "../utils.js";
+import { log } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 
 const DEFAULT_KIND = "anthropic";
@@ -148,8 +149,7 @@ export async function applyModelSwitch(
     15000,
   );
   if (resp.error) {
-    warn(`runtime-model: switch failed: ${resp.error.message}`);
-    return false;
+    throw backendError("session/setModel", zcodeSid, 15000, resp);
   }
   invalidateModelCache(server, zcodeSid);
   return true;

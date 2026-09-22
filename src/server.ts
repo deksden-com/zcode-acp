@@ -33,6 +33,8 @@ export interface ClientCapabilities {
 export interface PendingTurn {
   zcodeSid: string;
   cancelled: boolean;
+  /** Native close is terminal even when its event stream never emits turn.done. */
+  closed?: boolean;
   /** Set once session/stop has been fired for this turn, to avoid re-sending. */
   stopSent?: boolean;
   /**
@@ -58,6 +60,12 @@ export const BACKEND_RESIDENT_TTL_MS = 5 * 60_000;
 export class ZcodeAcpServer {
   /** The ZCode subprocess client (lazy — spawned on first use). */
   backend: ZcodeBackend | null = null;
+  /** Optional daemon hook invoked immediately after native session allocation. */
+  onSessionAllocated?: (identity: {
+    adapter_session_id: string;
+    provider_session_id: string;
+    cwd: string;
+  }) => Promise<void> | void;
   /** acp_sid → zcode session id (usually identical, but kept for clarity). */
   readonly sessionMap = new Map<string, string>();
   /**
@@ -85,6 +93,10 @@ export class ZcodeAcpServer {
     {
       cwd: string;
       creating?: Promise<string>;
+      /** A dispatched create whose native outcome is unknown. Keep the
+       * placeholder blocked until an explicit bridge restart/reconciliation;
+       * a later ACP call must never issue a second allocation. */
+      createOutcomeUnknown?: Error;
       /** Client-provided MCP servers from session/new, replayed verbatim into
        * the backend's session/create when the lazy session materializes. The
        * backend's mcpServers schema matches the ACP array shape (stdio entries

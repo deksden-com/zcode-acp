@@ -31,9 +31,17 @@ describe("dd harness extensions", () => {
   it("reads retained topology without materializing or resuming a session", async () => {
     const { server, request } = serverWith({ childSessionIds: [] });
     server.isBackendSessionLive = () => false;
-    await expect(retainedSubagents(server, { sessionId: "sess_child" })).resolves.toEqual({ sessionId: "sess_native", topology: { childSessionIds: [] } });
+    await expect(retainedSubagents(server, { sessionId: "sess_child" })).resolves.toEqual({
+      sessionId: "sess_native",
+      topology: { childSessionIds: [] },
+    });
     expect(request).toHaveBeenCalledTimes(1);
-    expect(request).toHaveBeenCalledWith(1, "session/subagents", { sessionId: "sess_native" }, 15000);
+    expect(request).toHaveBeenCalledWith(
+      1,
+      "session/subagents",
+      { sessionId: "sess_native" },
+      15000,
+    );
     request.mockResolvedValueOnce({ error: { code: -32004, message: "missing" } } as never);
     await expect(retainedSubagents(server, { sessionId: "sess_child" })).rejects.toThrow("missing");
   });
@@ -57,8 +65,12 @@ describe("dd harness extensions", () => {
 
   it("closes only the resolved native Session", async () => {
     const { server, request } = serverWith({ closed: true });
+    server.pendingTurns.set(1, { zcodeSid: "sess_native", cancelled: true });
+    server.pendingTurns.set(2, { zcodeSid: "sess_other", cancelled: false });
     await expect(closeSession(server, { sessionId: "acp_1" })).resolves.toEqual({ closed: true });
     expect(request).toHaveBeenCalledWith(1, "session/close", { sessionId: "sess_native" }, 15000);
+    expect(server.pendingTurns.get(1)).toMatchObject({ closed: true });
+    expect(server.pendingTurns.get(2)).not.toHaveProperty("closed");
   });
 
   it("checks native child residency without resuming and accepts only inactive evidence", async () => {
@@ -74,6 +86,31 @@ describe("dd harness extensions", () => {
     expect(request).toHaveBeenCalledWith(1, "session/read", { sessionId: "sess_native" }, 15000);
     request.mockResolvedValueOnce({ error: { code: -1, message: "offline" } } as never);
     await expect(residentSession(server, { sessionId: "acp_1" })).rejects.toThrow("offline");
+  });
+
+  it.each([{}, { closed: false }])(
+    "does not settle a turn on ambiguous close: %j",
+    async (result) => {
+      const { server } = serverWith(result);
+      const turn = { zcodeSid: "sess_native", cancelled: false };
+      server.pendingTurns.set(1, turn);
+      await closeSession(server, { sessionId: "acp_1" });
+      expect(turn).toEqual({ zcodeSid: "sess_native", cancelled: false });
+    },
+  );
+
+  it("does not apply a delayed close reply to a replacement turn", async () => {
+    const { server, request } = serverWith({ closed: true });
+    const oldTurn = { zcodeSid: "sess_native", cancelled: false };
+    const newTurn = { zcodeSid: "sess_native", cancelled: false };
+    server.pendingTurns.set(1, oldTurn);
+    request.mockImplementationOnce(async () => {
+      server.pendingTurns.set(1, newTurn);
+      return { result: { closed: true } };
+    });
+    await closeSession(server, { sessionId: "acp_1" });
+    expect(oldTurn).toMatchObject({ closed: true, cancelled: true });
+    expect(newTurn).toEqual({ zcodeSid: "sess_native", cancelled: false });
   });
 
   it("adds exact request and cache counters to the compact usage projection", async () => {

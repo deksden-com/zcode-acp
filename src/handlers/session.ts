@@ -17,6 +17,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
 
 import { EventStreamListener, TurnMonitor } from "../backend/listener.js";
+import { backendError } from "../backend/errors.js";
 import type { ZcodeCreateResult, ZcodeListResult, ZcodeSnapshot } from "../backend/types.js";
 import {
   buildModes,
@@ -28,6 +29,8 @@ import { emitInitialUsage } from "../config/model-cache.js";
 import { buildProviderRegistry } from "../config/provider-registry.js";
 import { buildResumeRuntimeModel } from "../config/runtime-model.js";
 import {
+  beginSessionAllocation,
+  finishSessionAllocation,
   lookupLazySession,
   recordMaterializedSession,
   rememberLazySession,
@@ -93,28 +96,26 @@ function workspaceFromResumeResult(result: unknown): string | null {
  * Push the provider registry to the backend so third-party providers (those in
  * config.json) are recognised. The V4 backend doesn't auto-load them from
  * config.json — without this RPC a session switching to a third-party model
- * fails with `provider_not_configured`. Best-effort: failures are logged, not
- * thrown, so a registry push problem never blocks session creation.
+ * fails with `provider_not_configured`. A failed prerequisite is surfaced to
+ * the caller: proceeding after an unknown registry state makes the resulting
+ * Session impossible to classify.
  */
-async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promise<void> {
-  try {
-    const registry = buildProviderRegistry();
-    const resp = await server
-      .ensureBackend()
-      .request(
-        server.nextId(),
-        "workspace/updateProviderRegistry",
-        { workspace: workspaceFor(cwd), registry },
-        10000,
-      );
-    if (resp.error) {
-      warn(`provider-registry: sync failed: ${resp.error.message}`);
-      return;
-    }
-    log("provider-registry: synced to backend");
-  } catch (e) {
-    warn(`provider-registry: sync threw (${e instanceof Error ? e.message : String(e)})`);
-  }
+async function syncProviderRegistry(
+  server: ZcodeAcpServer,
+  cwd: string,
+  timeoutMs = 10000,
+): Promise<void> {
+  const registry = buildProviderRegistry();
+  const resp = await server
+    .ensureBackend()
+    .request(
+      server.nextId(),
+      "workspace/updateProviderRegistry",
+      { workspace: workspaceFor(cwd), registry },
+      timeoutMs,
+    );
+  if (resp.error) throw backendError("workspace/updateProviderRegistry", null, timeoutMs, resp);
+  log("provider-registry: synced to backend");
 }
 
 /** Convert a millisecond timestamp to ISO 8601 (for session list). */
@@ -187,6 +188,7 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
         log(`ensureRealSession: ${acpSid} possibly evicted from backend — reloading`);
         await reloadBackendSession(server, acpSid, existing);
       } catch (e) {
+        if (isUnknownBackendOutcome(e)) throw e;
         log(
           `ensureRealSession: reload failed, continuing with existing mapping ` +
             `(${e instanceof Error ? e.message : String(e)})`,
@@ -208,12 +210,20 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
       return record.zcodeSid;
     }
     if (record) {
+      if (record.allocationPending) throw backendError("session/create", null, 0, {
+        id: 0, error: { code: "native_outcome_unknown", message: "Retained allocation has no confirmed outcome; reconcile its original owner before creating again" },
+      });
       pending = { cwd: record.cwd };
       server.pendingSessions.set(acpSid, pending);
       if (record.cwd !== "/") server.sessionCwds.set(acpSid, record.cwd);
     }
   }
   if (!pending) throw new Error(`session ${acpSid} not found`);
+  // A native create that timed out or lost its transport may already have
+  // allocated a session. Until reconciliation proves the
+    // result, fail the same placeholder rather than dispatching a duplicate
+  // allocation on a later ACP call.
+  if (pending.createOutcomeUnknown) throw pending.createOutcomeUnknown;
   if (pending.creating) return pending.creating;
 
   // The create body runs synchronously up to its first await, so the `creating`
@@ -225,9 +235,19 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
     // provider's reasoning/model definitions it falls back to the bare
     // anthropic channel (2-state thought: enabled/disabled) instead of the
     // real provider (max/high/low). Also covers third-party providers for
-    // later model switches (provider_not_configured). Best-effort — a failed
-    // push logs and continues, the session still works over the fallback.
-    await syncProviderRegistry(server, pending.cwd);
+    // later model switches (provider_not_configured). A failed push is a
+    // prerequisite failure: do not create against an unknown registry state.
+    // One bounded budget covers the prerequisite and the dependent create.
+    // A registry timeout must never authorize a create against unknown state.
+    const createDeadline = Date.now() + 30_000;
+    const remaining = () => {
+      const milliseconds = createDeadline - Date.now();
+      if (milliseconds <= 0) throw backendError("session/create", null, 30_000, {
+        id: 0, error: { code: "native_timeout", message: "startup deadline exhausted before create dispatch" },
+      });
+      return milliseconds;
+    };
+    await syncProviderRegistry(server, pending.cwd, remaining());
     // Client-provided MCP servers (ACP session/new mcpServers) ride along
     // when the lazy session materializes. The backend accepts the ACP array
     // shape verbatim; the verified merge behaviour is additive (client
@@ -241,24 +261,53 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
       createParams.mcpServers = pending.mcpServers;
       log(`session/create carrying ${pending.mcpServers.length} client MCP server(s)`);
     }
-    const resp = await backend.request(server.nextId(), "session/create", createParams, 15000);
+    const createTimeoutMs = remaining();
+    try {
+      beginSessionAllocation(acpSid, pending.cwd);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw backendError("session/create", null, createTimeoutMs, {
+        id: 0, error: { code: "native_outcome_unknown", message: "Another allocation already owns this alias; reconcile instead of replaying" },
+      });
+      throw error;
+    }
+    const retainIdentity = async (sid: string) => {
+      finishSessionAllocation(acpSid, pending.cwd, sid);
+      server.registerSession(acpSid, sid);
+      server.pendingSessions.delete(acpSid);
+      if (!backend.isDead) server.markBackendLoaded(acpSid);
+      recordMaterializedSession(acpSid, sid, pending.cwd);
+      recordMaterializedSession(sid, sid, pending.cwd);
+      await server.onSessionAllocated?.({
+        adapter_session_id: acpSid, provider_session_id: sid, cwd: pending.cwd,
+      });
+    };
+    const resp = await backend.request(server.nextId(), "session/create", createParams, createTimeoutMs, async (late) => {
+      const sid = (late.result as ZcodeCreateResult | undefined)?.session?.sessionId;
+      if (typeof sid === "string" && sid.length > 0 && !late.error) {
+        // Record only: never restart the rejected handler, subscribe or send a prompt.
+        await retainIdentity(sid);
+      } else {
+        warn(`session/create late result did not establish identity for ${acpSid}; allocation remains blocked`);
+      }
+    });
     if (resp.error) {
-      throw new Error(`zcode create failed: ${resp.error.message ?? ""}`);
+      const error = backendError("session/create", null, createTimeoutMs, resp);
+      if (!isUnknownBackendOutcome(error)) finishSessionAllocation(acpSid, pending.cwd);
+      throw error;
     }
     const result = (resp.result ?? {}) as ZcodeCreateResult;
     const session = result.session ?? {};
     const sid = session.sessionId;
-    if (!sid) throw new Error("zcode create returned no sessionId");
+    if (!sid) throw backendError("session/create", null, createTimeoutMs, {
+      id: resp.id, error: { code: "native_outcome_unknown", message: "zcode create returned no sessionId" },
+    });
 
-    server.pendingSessions.delete(acpSid);
-    server.registerSession(acpSid, sid);
-    // session/create loads the session into this backend process.
-    server.markBackendLoaded(acpSid);
+    // Publish identity before task-index and other post-create work. A
+    // controller can now reconcile this allocation even if later work fails.
+    await retainIdentity(sid);
     // Keep durable aliases in sync so a later bridge restart can resume this
     // session via either the ACP locator or the native id exposed to harness
     // controllers.
-    recordMaterializedSession(acpSid, sid, pending.cwd);
-    recordMaterializedSession(sid, sid, pending.cwd);
     log(`session/new ${acpSid} → created ${sid} (lazy, on first use)`);
     server.ensureBackgroundListener(sid);
 
@@ -277,9 +326,15 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
   pending.creating = creating;
   try {
     return await creating;
+  } catch (error) {
+    if (isUnknownBackendOutcome(error)) {
+      pending.createOutcomeUnknown = error as Error;
+    }
+    throw error;
   } finally {
-    // Reset the in-flight marker (on success the sessionMap short-circuits
-    // later calls; on failure this lets the next use retry the create).
+    // Reset only the in-flight marker. Confirmed failures may retry; an
+    // outcome-unknown failure remains blocked above so it cannot allocate a
+    // second native session.
     pending.creating = undefined;
   }
 }
@@ -296,7 +351,7 @@ export async function listSessions(
   }
 
   const resp = await backend.request(server.nextId(), "session/list", zcParams, 15000);
-  if (resp.error) throw new Error(`zcode list failed: ${resp.error.message ?? ""}`);
+  if (resp.error) throw backendError("session/list", null, 15000, resp);
 
   const result = (resp.result ?? {}) as ZcodeListResult;
   const sessions = (result.sessions ?? []).map((s) => ({
@@ -683,7 +738,7 @@ export async function prompt(
       // is idempotent) and retrying the subscribe once; any other error, or
       // a second failure, propagates to the editor.
       const msg = e instanceof Error ? e.message : String(e);
-      if (!/session is not active/i.test(msg)) throw e;
+      if (turn.closed || !/session is not active/i.test(msg)) throw e;
       log(`prompt: session ${zcodeSid} no longer active in backend — reloading via session/resume`);
       await reloadBackendSession(server, params.sessionId, zcodeSid);
       // The pre-subscribe fetchMessages ran against the evicted session and
@@ -694,10 +749,11 @@ export async function prompt(
     }
     // A successful subscribe proves the resident runtime is live — refresh
     // the verification so concurrent/later entry points skip a reload.
-    server.markBackendLoaded(params.sessionId);
+    if (!turn.closed) server.markBackendLoaded(params.sessionId);
   } catch (e) {
     server.pendingTurns.delete(requestId);
     await emitTurnState(false);
+    if (turn.closed) return { stopReason: "cancelled" };
     throw e;
   }
   // subscribe() requests includeSnapshot:false (it only needs the eventSeq
@@ -728,6 +784,7 @@ export async function prompt(
         // A prior transient turn ended the backend turn; before re-sending,
         // reconcile the differ baseline so the retried turn's new messages
         // aren't treated as already-seen, surface a retry hint, then back off.
+        if (turn.closed) return { stopReason: "cancelled" };
         if (turn.cancelled) {
           stopBackendTurn(server, zcodeSid);
           return { stopReason: "cancelled" };
@@ -764,6 +821,7 @@ export async function prompt(
       const sendT0 = Date.now();
       let sendAttempt = 0;
       while (true) {
+        if (turn.closed) return { stopReason: "cancelled" };
         if (turn.cancelled) {
           stopBackendTurn(server, zcodeSid);
           return { stopReason: "cancelled" };
@@ -779,6 +837,7 @@ export async function prompt(
           (recentCancel !== undefined && Date.now() - recentCancel < SEND_RETRY_TIMEOUT_MS);
         if (expectBusy) {
           await sleep(SEND_RETRY_INTERVAL_MS);
+          if (turn.closed) return { stopReason: "cancelled" };
           if (turn.cancelled) {
             stopBackendTurn(server, zcodeSid);
             return { stopReason: "cancelled" };
@@ -798,7 +857,7 @@ export async function prompt(
           sendErrMsg.includes("already running");
         if (!isBusy) {
           // Non-busy error (auth, malformed, etc.) — don't retry, surface it.
-          throw new Error(`zcode send failed: ${sendResp.error.message ?? ""}`);
+          throw backendError("session/send", zcodeSid, 15000, sendResp);
         }
         if (Date.now() - sendT0 > SEND_RETRY_TIMEOUT_MS) {
           throw new Error(
@@ -842,6 +901,7 @@ export async function prompt(
 
         return result;
       } catch (e) {
+        if (turn.closed) return { stopReason: "cancelled" };
         // Only a transient TurnFailedError is retryable; everything else (send
         // failures, non-transient turn errors, exhausted retries, cancellation)
         // propagates to the caller.
@@ -868,8 +928,10 @@ export async function prompt(
     // session discoverable regardless of outcome (end_turn, cancelled, retries
     // exhausted). Also refresh the backend-loaded verification: the resident
     // runtime was demonstrably live through this turn.
-    server.markSessionActive(params.sessionId);
-    server.markBackendLoaded(params.sessionId);
+    if (!turn.closed) {
+      server.markSessionActive(params.sessionId);
+      server.markBackendLoaded(params.sessionId);
+    }
     // Report "running" only while no other turn for the session took over
     // (preempt): the preempting turn's own running:true must survive.
     const stillBusy = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
@@ -938,7 +1000,8 @@ export async function cancel(
       turn.cancelled = true;
       if (!turn.stopSent) {
         stopBackendTurn(server, zcodeSid);
-        turn.stopSent = true; stopSent = true;
+        turn.stopSent = true;
+        stopSent = true;
       }
       // Record cancel time so a prompt arriving in the backend's ~20s
       // model-connection recovery window can fast-fail instead of hanging.
@@ -1222,13 +1285,13 @@ function fileUriToPath(uri: string): string {
 }
 
 /**
- * Resume a zcode session with retry on transient timeouts.
+ * Resume a zcode session once and preserve an unknown native outcome.
  *
- * The backend drops RPCs issued during its cold-start window (between process
- * spawn and `startup.completed`). The first resume after a fresh backend spawn
- * can land in that gap and time out without the backend ever seeing it. A single
- * retry — issued after the startup window has elapsed — succeeds. Non-timeout
- * errors (Invalid params, session not found) fail fast.
+ * `session/resume` changes backend residency. A timeout or transport loss is
+ * therefore not evidence that the operation was not applied; issuing a second
+ * resume would create two uncorrelated native attempts. The backend client
+ * retains the original request correlation for its bounded grace window and
+ * exposes the structured timeout/death error to the caller for reconciliation.
  *
  * Returns the response's result object on success — callers extract the
  * backend-authoritative session workspace from it. Throws on failure.
@@ -1238,26 +1301,22 @@ async function resumeBackendSession(
   zcParams: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const backend = server.ensureBackend();
-  const MAX_ATTEMPTS = 2;
   const ATTEMPT_TIMEOUT_MS = 15_000;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const resp = await backend.request(
-      server.nextId(),
-      "session/resume",
-      zcParams,
-      ATTEMPT_TIMEOUT_MS,
-    );
-    if (!resp.error) return (resp.result ?? {}) as Record<string, unknown>;
-    const isTimeout = resp.error.message === "timeout";
-    if (!isTimeout || attempt === MAX_ATTEMPTS) {
-      throw new Error(`zcode resume failed: ${resp.error.message ?? ""}`);
-    }
-    log(
-      `session/resume attempt ${attempt}/${MAX_ATTEMPTS} timed out, retrying (backend cold-start window)`,
-    );
-    await sleep(1000);
+  const resp = await backend.request(
+    server.nextId(),
+    "session/resume",
+    zcParams,
+    ATTEMPT_TIMEOUT_MS,
+  );
+  if (resp.error) {
+    throw backendError("session/resume", String(zcParams.sessionId ?? ""), ATTEMPT_TIMEOUT_MS, resp);
   }
-  throw new Error("zcode resume failed: exhausted retries");
+  return (resp.result ?? {}) as Record<string, unknown>;
+}
+
+function isUnknownBackendOutcome(error: unknown): boolean {
+  const code = error && typeof error === "object" && "nativeCode" in error ? String(error.nativeCode) : "";
+  return ["native_timeout", "native_backend_dead", "native_backend_pipe_broken", "native_outcome_unknown"].includes(code);
 }
 
 /**
@@ -1295,6 +1354,9 @@ async function resumePreservingModel(
   try {
     return await resumeBackendSession(server, zcParams);
   } catch (err) {
+    // A transport timeout/death leaves the native effect unknown. The model
+    // overlay is itself another resume request and must not replay that effect.
+    if (isUnknownBackendOutcome(err)) throw err;
     const overlay = buildResumeRuntimeModel();
     if (overlay === null) throw err;
     warn(
@@ -1397,8 +1459,13 @@ async function runEventTurn(
   let turnStartedAt: number | null = null;
   let thinkingHintSent = false;
   const THINKING_HINT_DELAY_MS = 1200;
+  // dd-flow has a durable RUN lifecycle and must never treat an inferred idle
+  // snapshot as a terminal provider result. Interactive ACP clients retain the
+  // existing recovery behaviour for compatibility.
+  const managedTurn = Boolean(process.env.DD_FLOW_RUNTIME_OWNER);
 
   while (Date.now() - lastProgress < NO_PROGRESS_MS) {
+    if (turn.closed) return { stopReason: "cancelled" };
     // Drain + handle server→client requests (interaction/*). Refreshes the
     // no-progress timer when any are handled. Pass `turn` so interaction
     // requests become turn-cancel aware (user stop aborts pending popups).
@@ -1414,6 +1481,7 @@ async function runEventTurn(
       lastProgress = Date.now();
     }
 
+    if (turn.closed) return { stopReason: "cancelled" };
     if (turn.cancelled) {
       // Cancel requested: ensure stop was fired (cancel()/preempt normally do
       // this, but guard anyway). We do NOT silence subsequent events here — if
@@ -1430,6 +1498,7 @@ async function runEventTurn(
     }
 
     const ev = await listener.pollEvent(500);
+    if (turn.closed) return { stopReason: "cancelled" };
     if (ev === null) {
       // Thinking-phase hint: if the turn has started but produced no output
       // yet (no text/reasoning/tool streamed), and we've been silent longer
@@ -1478,6 +1547,10 @@ async function runEventTurn(
           }
           const proj2 = await monitor.pollOnce();
           if (proj2?.status === "idle" && !listener.hasQueuedEvents()) {
+            if (managedTurn) {
+              warn("managed turn has two idle snapshots but no terminal event; retaining unknown outcome");
+              continue;
+            }
             // Turn completed but the event was lost (double-confirmed).
             if (!emittedText) {
               const reply = await fetchLastReply(server, turn.zcodeSid, differ);

@@ -32,7 +32,18 @@ import type {
 interface PendingRequest {
   resolve: (resp: ZcodeResponse) => void;
   timer: ReturnType<typeof setTimeout>;
+  method: string;
+  requestId: number;
+  timedOut?: boolean;
+  observationEnded?: boolean;
+  onLateResponse?: (response: ZcodeResponse) => Promise<void> | void;
 }
+
+// A request deadline is an observation boundary. Keep the same correlation
+// entry briefly so a native reply that was already in flight can still finish
+// the operation. This avoids replaying allocation requests after a slow cold
+// start while keeping genuinely stuck calls bounded.
+const LATE_RESPONSE_GRACE_MS = 5_000;
 
 /** A server→client request that we must reply to. */
 export interface ServerRequest {
@@ -49,12 +60,14 @@ export interface EventListener {
 
 export class ZcodeBackend {
   readonly proc: ChildProcess;
+  private readonly lateResponseGraceMs: number;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly serverRequests: ServerRequest[] = [];
   // Per-session listener SET so a long-lived session listener (e.g. background
   // task monitor) can coexist with a per-turn EventStreamListener. Each event
   // is delivered to every registered listener for the session.
   private readonly listeners = new Map<string, Set<EventListener>>();
+  private readonly lateResponses = new Map<number, ZcodeResponse>();
   private readerDead = false;
   /** Monotonic id for fire-and-forget sends (send()). Uses a high range to
    *  avoid collisions with the server's request ids (low range). */
@@ -62,9 +75,11 @@ export class ZcodeBackend {
   /** Watchdog process that kills the zcode group if this bridge dies (SIGKILL). */
   private watchdog: ChildProcess | null = null;
 
-  constructor(argv: string[], env: NodeJS.ProcessEnv) {
+  constructor(argv: string[], env: NodeJS.ProcessEnv, options: { lateResponseGraceMs?: number } = {}) {
+    const grace = options.lateResponseGraceMs;
+    this.lateResponseGraceMs = Number.isFinite(grace) && grace !== undefined && grace >= 0 ? grace : LATE_RESPONSE_GRACE_MS;
     this.proc = spawn(argv[0]!, argv.slice(1), {
-      stdio: ["pipe", "pipe", "ignore"],
+      stdio: ["pipe", "pipe", "pipe"],
       env,
       detached: true, // own process group → kill(-pid) reaps the whole tree
     });
@@ -84,8 +99,11 @@ export class ZcodeBackend {
     // crashes with an unhandled 'error' event. Catch them here and mark the
     // reader dead so the rest of the bridge stops talking to a gone backend.
     this.proc.stdin?.on("error", (err) => {
-      this.readerDead = true;
-      warn(`backend: stdin error: ${err.message}`);
+      this.markReaderDead(`stdin error: ${err.message}`);
+    });
+    this.proc.stderr?.setEncoding("utf8").on("data", (chunk) => {
+      const text = String(chunk);
+      warn(`backend stderr: ${text.slice(0, 2000).trimEnd()}`);
     });
     this.startReader();
     this.startWatchdog();
@@ -169,8 +187,11 @@ export class ZcodeBackend {
       return;
     }
     if (id !== undefined && method !== undefined) {
-      // id + method: our pending response wins the race; else it's a server→client request.
-      if (this.pending.has(id)) {
+      // Most native responses omit `method`, but older app-server builds echo
+      // it. Only an exact method match may resolve our waiter; an unrelated
+      // method with the same numeric id is a server→client request.
+      const pending = this.pending.get(id);
+      if (pending && pending.method === method) {
         this.resolvePending(id, msg as unknown as ZcodeResponse);
       } else if (method === "session/requestRuntimePreferences") {
         // Newer app-servers block `session/create` until this handshake is
@@ -237,9 +258,21 @@ export class ZcodeBackend {
 
   private resolvePending(id: number, resp: ZcodeResponse): void {
     const p = this.pending.get(id);
-    if (!p) return;
+    if (!p) {
+      this.lateResponses.set(id, resp);
+      while (this.lateResponses.size > 128) this.lateResponses.delete(this.lateResponses.keys().next().value!);
+      warn(`backend: late response id=${id} (no waiter; native reply retained for diagnostics)`);
+      return;
+    }
     clearTimeout(p.timer);
     this.pending.delete(id);
+    if (p.timedOut) warn(`backend: response id=${id} arrived ${p.observationEnded ? "after observation ended" : "during timeout grace"} (${p.method})`);
+    if (p.observationEnded) {
+      void Promise.resolve().then(() => p.onLateResponse?.(resp)).catch((error) => {
+        warn(`backend: late response reconciliation failed id=${id} method=${p.method}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      return;
+    }
     p.resolve(resp);
   }
 
@@ -250,8 +283,8 @@ export class ZcodeBackend {
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
       p.resolve({
-        id: 0,
-        error: { message: "zcode backend reader exited (backend dead)" },
+        id: p.requestId,
+        error: { message: "zcode backend reader exited (backend dead)", code: "native_backend_dead" },
       });
     }
     this.pending.clear();
@@ -336,11 +369,17 @@ export class ZcodeBackend {
   send(method: string, params?: Record<string, unknown>): void {
     const stdin = this.proc.stdin;
     if (!stdin || stdin.destroyed) {
-      warn("backend: send dropped (stdin closed)");
-      return;
+      const error = Object.assign(new Error("zcode backend stdin is closed"), { code: "native_backend_pipe_broken" });
+      this.markReaderDead(error.message);
+      throw error;
     }
     const id = this.sendIdCounter++;
-    stdin.write(JSON.stringify({ id, method, params: params ?? {} }) + "\n");
+    try {
+      stdin.write(JSON.stringify({ id, method, params: params ?? {} }) + "\n");
+    } catch (error) {
+      this.markReaderDead(`backend pipe broken: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
   }
 
   /**
@@ -355,29 +394,45 @@ export class ZcodeBackend {
     method: string,
     params?: Record<string, unknown>,
     timeoutMs = 30000,
+    onLateResponse?: (response: ZcodeResponse) => Promise<void> | void,
   ): Promise<ZcodeResponse> {
     if (this.readerDead) {
-      return { id, error: { message: "zcode backend reader exited (backend dead)" } };
+      return { id, error: { message: "zcode backend reader exited (backend dead)", code: "native_backend_dead" } };
     }
     const promise = new Promise<ZcodeResponse>((resolve) => {
-      const timer = setTimeout(() => {
-        if (this.pending.delete(id)) {
-          resolve({ id, error: { message: "timeout" } });
-        }
-      }, timeoutMs);
-      this.pending.set(id, { resolve, timer });
+      let timer: ReturnType<typeof setTimeout>;
+      const timeout = () => {
+        const pending = this.pending.get(id);
+        if (!pending || pending.timedOut) return;
+        pending.timedOut = true;
+        // Keep the correlation slot while the native request may still be in
+        // flight. A late success resolves the original operation; only after
+        // the grace period do we expose native_timeout.
+        timer = setTimeout(() => {
+          if (this.pending.get(id) !== pending) return;
+          if (pending.onLateResponse) pending.observationEnded = true;
+          else this.pending.delete(id);
+            resolve({ id, error: { message: "timeout", code: "native_timeout", detail: { method, request_id: id, timeout_ms: timeoutMs, grace_ms: this.lateResponseGraceMs } } });
+        }, this.lateResponseGraceMs);
+        pending.timer = timer;
+      };
+      timer = setTimeout(timeout, timeoutMs);
+      this.pending.set(id, { resolve, timer, method, requestId: id, onLateResponse });
     });
     try {
       const stdin = this.proc.stdin;
       if (!stdin || stdin.destroyed) throw new Error("stdin closed");
       stdin.write(JSON.stringify({ id, method, params: params ?? {} }) + "\n");
     } catch (e) {
+      const pending = this.pending.get(id);
+      if (pending) clearTimeout(pending.timer);
       this.pending.delete(id);
-      this.readerDead = true;
+      this.markReaderDead(`backend pipe broken: ${e instanceof Error ? e.message : String(e)}`);
       return {
         id,
         error: {
           message: `zcode backend pipe broken: ${e instanceof Error ? e.message : String(e)}`,
+          code: "native_backend_pipe_broken",
         },
       };
     }
@@ -398,39 +453,64 @@ export class ZcodeBackend {
    */
   async close(): Promise<void> {
     const proc = this.proc;
-    if (!proc.pid) return;
-    try {
-      // Already exited?
-      if (proc.exitCode !== null || proc.signalCode) return;
-      try {
-        process.kill(-proc.pid, "SIGTERM");
-      } catch {
-        return; // group already gone
-      }
-      // Wait up to 3s for a clean exit.
-      const exited = await new Promise<boolean>((resolve) => {
-        let timer: ReturnType<typeof setTimeout>;
-        const done = () => {
-          clearTimeout(timer); // don't let the timeout keep the event loop alive
-          resolve(true);
-        };
-        proc.once("exit", done);
-        timer = setTimeout(() => {
-          proc.removeListener("exit", done);
-          resolve(false);
-        }, 3000);
-      });
-      if (exited) return;
-      // Still alive → SIGKILL the whole group.
-      try {
-        if (proc.pid && proc.exitCode === null) process.kill(-proc.pid, "SIGKILL");
-      } catch {
-        // already gone
-      }
-    } finally {
-      // Stop the watchdog — it would self-exit on its next tick once the zcode
-      // group is gone, but killing it here avoids the up-to-2s delay.
+    if (!proc.pid) {
       this.killWatchdog();
+      return;
+    }
+    const target = process.platform === "win32" ? proc.pid : -proc.pid;
+    const groupState = (): "gone" | "alive" | "unknown" => {
+      try {
+        process.kill(target, 0);
+        return "alive";
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return "gone";
+        if ((error as NodeJS.ErrnoException).code === "EPERM") return "unknown";
+        throw error;
+      }
+    };
+    const waitForExit = async (timeoutMs: number): Promise<boolean> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (groupState() === "gone") return true;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      return groupState() === "gone";
+    };
+    let settled = false;
+    try {
+      // The leader exiting is not a settlement receipt: its detached children
+      // can continue in the same process group. The backend owns this group,
+      // so use its liveness rather than ChildProcess.exitCode.
+      if (groupState() === "gone") {
+        settled = true;
+        return;
+      }
+      try {
+        process.kill(target, "SIGTERM");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+      if (!await waitForExit(3000)) {
+        // `-pid` remains the owned group target even if its leader already
+        // exited; a live group still has the original process-group identity.
+        try {
+          process.kill(target, "SIGKILL");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
+        if (!await waitForExit(3000)) {
+          const state = groupState();
+          const error = new Error(state === "unknown" ? "zcode process-group ownership cannot be confirmed" : "zcode process group did not stop");
+          (error as Error & { code?: string }).code = state === "unknown" ? "process_group_ownership_unknown" : "zcode_backend_stop_incomplete";
+          throw error;
+        }
+      }
+      settled = true;
+    } finally {
+      // On an unconfirmed stop leave the watchdog responsible for reaping the
+      // owned group after a bridge failure. It is stopped only with a physical
+      // group-exit receipt.
+      if (settled) this.killWatchdog();
     }
   }
 

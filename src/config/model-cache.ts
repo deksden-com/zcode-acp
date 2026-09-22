@@ -10,6 +10,7 @@
 import type * as acp from "@agentclientprotocol/sdk";
 
 import type { ZcodeReadResult } from "../backend/types.js";
+import { backendError } from "../backend/errors.js";
 import {
   DEFAULT_MODEL_ID,
   DEFAULT_PROVIDER_ID,
@@ -111,6 +112,6 @@ async function sessionRead(server: ZcodeAcpServer, zcodeSid: string): Promise<Zc
     { sessionId: zcodeSid },
     5000,
   );
-  if (resp.error) throw new Error(resp.error.message);
+  if (resp.error) throw backendError("session/read", zcodeSid, 5000, resp);
   return (resp.result ?? {}) as ZcodeReadResult;
 }

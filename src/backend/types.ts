@@ -28,7 +28,7 @@ export interface ZcodeNotification {
 export interface ZcodeResponse {
   id: number;
   result?: unknown;
-  error?: { message: string; code?: number | string; detail?: unknown };
+  error?: { message: string; code?: number | string; detail?: unknown; data?: unknown };
 }
 
 /** Any inbound message from the ZCode subprocess. */

@@ -35,6 +35,7 @@ import { randomUUID } from "node:crypto";
 import type * as acp from "@agentclientprotocol/sdk";
 
 import { RequestError } from "@agentclientprotocol/sdk";
+import { backendError } from "../backend/errors.js";
 import { applyModelSwitch } from "../config/runtime-model.js";
 import { emitConfigOptionUpdate } from "../config/options.js";
 import { formatMcpServers, loadMcpServers } from "../config/mcp-discovery.js";
@@ -209,7 +210,10 @@ export async function handleSlashCommand(
             { sessionId: zcodeSid, [dispatch.paramKey]: arg },
             15000,
           );
-        if (resp.error) throw new RequestError(-32603, `${cmd} failed: ${resp.error.message}`);
+        if (resp.error) {
+          const error = backendError(dispatch.method, zcodeSid, 15000, resp);
+          throw error;
+        }
         // Notify the editor UI: emit config_option_update (+ current_mode_update
         // for mode). Without this the dropdown / mode indicator never reflects
         // the change — slash commands return end_turn and bypass the turn-

@@ -35,8 +35,15 @@ vi.mock("../src/tasks-index.js", () => ({
 
 // In-memory durable alias store (src/lazy-sessions.ts persists this to
 // ~/.zcode/v2/acp-lazy-sessions.json — never touch real disk in tests).
-const mockStore = new Map<string, { cwd: string; zcodeSid?: string; createdAt: number }>();
+const mockStore = new Map<string, { cwd: string; zcodeSid?: string; createdAt: number; allocationPending?: boolean }>();
 vi.mock("../src/lazy-sessions.js", () => ({
+  beginSessionAllocation: (id: string, cwd: string) => {
+    if (mockStore.get(id)?.allocationPending) throw new Error("allocation pending");
+    mockStore.set(id, { cwd, createdAt: Date.now(), allocationPending: true });
+  },
+  finishSessionAllocation: (id: string, cwd: string, zcodeSid?: string) => {
+    mockStore.set(id, { cwd, createdAt: Date.now(), ...(zcodeSid ? { zcodeSid } : {}) });
+  },
   rememberLazySession: (acpSid: string, cwd: string) => {
     mockStore.set(acpSid, { cwd, createdAt: Date.now() });
   },
@@ -130,6 +137,43 @@ describe("session/new lazy creation", () => {
 });
 
 describe("ensureRealSession", () => {
+  it("persists post-timeout allocation without replay or background work", async () => {
+    const server = new ZcodeAcpServer();
+    const { sessionId } = await newSession(server, newSessionParams("/tmp/ws"));
+    const { backend, calls } = fakeBackend();
+    const original = backend.request.bind(backend);
+    let late: Parameters<ZcodeBackend["request"]>[4];
+    backend.request = async (id, method, params, timeout, observer) => {
+      if (method !== "session/create") return original(id, method, params, timeout);
+      calls.push({ method, params });
+      late = observer;
+      return { id, error: { code: "native_timeout", message: "timeout" } };
+    };
+    server.backend = backend;
+    const background = vi.spyOn(server, "ensureBackgroundListener");
+    await expect(ensureRealSession(server, sessionId)).rejects.toMatchObject({ data: { code: "native_timeout" } });
+    await late!({ id: 1, result: { session: { sessionId: "late-native" } } });
+    expect(server.resolveSid(sessionId)).toBe("late-native");
+    expect(background).not.toHaveBeenCalled();
+    const restarted = new ZcodeAcpServer();
+    restarted.backend = backend;
+    await expect(ensureRealSession(restarted, sessionId)).resolves.toBe("late-native");
+    expect(calls.filter((call) => call.method === "session/create")).toHaveLength(1);
+    expect(calls.some((call) => call.method === "session/send")).toBe(false);
+  });
+  it("retains allocated identity when its publication callback fails", async () => {
+    const server = new ZcodeAcpServer();
+    const { sessionId } = await newSession(server, newSessionParams("/tmp/ws"));
+    const { backend, calls } = fakeBackend();
+    server.backend = backend;
+    server.onSessionAllocated = async () => { throw new Error("publication failed"); };
+    await expect(ensureRealSession(server, sessionId)).rejects.toThrow("publication failed");
+    await expect(ensureRealSession(server, sessionId)).resolves.toBe("sess_lazy_1");
+    const restarted = new ZcodeAcpServer();
+    restarted.backend = backend;
+    await expect(ensureRealSession(restarted, sessionId)).resolves.toBe("sess_lazy_1");
+    expect(calls.filter((call) => call.method === "session/create")).toHaveLength(1);
+  });
   it("materializes the backend session once on first use and registers the mapping", async () => {
     const server = new ZcodeAcpServer();
     const resp = await newSession(server, newSessionParams("/tmp/ws"));
@@ -168,6 +212,28 @@ describe("ensureRealSession", () => {
     ]);
     expect(sidA).toBe(sidB);
     expect(calls.filter((c) => c.method === "session/create")).toHaveLength(1);
+  });
+
+  it("does not replay a create after its native outcome becomes unknown", async () => {
+    const server = new ZcodeAcpServer();
+    const resp = await newSession(server, newSessionParams("/tmp/ws"));
+    const calls: Array<{ method: string; params: unknown }> = [];
+    const backend = {
+      isDead: false,
+      request: async (id: number, method: string, params: unknown) => {
+        calls.push({ method, params });
+        if (method === "session/create") return { id, error: { code: "native_timeout", message: "timeout" } };
+        return { id, result: {} };
+      },
+    } as unknown as ZcodeBackend;
+    server.backend = backend;
+
+    await expect(ensureRealSession(server, resp.sessionId)).rejects.toMatchObject({ data: { code: "native_timeout" } });
+    await expect(ensureRealSession(server, resp.sessionId)).rejects.toMatchObject({ data: { code: "native_timeout" } });
+    const restarted = new ZcodeAcpServer();
+    restarted.backend = backend;
+    await expect(ensureRealSession(restarted, resp.sessionId)).rejects.toMatchObject({ data: { code: "native_outcome_unknown" } });
+    expect(calls.filter((call) => call.method === "session/create")).toHaveLength(1);
   });
 
   it("throws for unknown session ids", async () => {

@@ -34,11 +34,13 @@ interface StaleBackendControl {
   sendRequests: ReturnType<typeof vi.fn>;
   /** "advance": every session/read bumps contextUsed (live sub-agent). "frozen": never changes. */
   setWatermarkMode: (mode: "advance" | "frozen") => void;
+  setProjectionStatus: (status: "idle" | "running") => void;
 }
 
 function staleRunningBackend(): StaleBackendControl {
   const listeners = new Set<{ handleEvent: (event: ZcodeEvent) => void }>();
   let watermarkMode: "advance" | "frozen" = "frozen";
+  let projectionStatus: "idle" | "running" = "running";
   let contextUsed = 0;
   // Kept only to assert the goal channel is NEVER consulted again — it cannot
   // see turn liveness (verified against the real backend).
@@ -59,7 +61,7 @@ function staleRunningBackend(): StaleBackendControl {
           if (watermarkMode === "advance") contextUsed += 1000;
           return {
             result: {
-              projection: { status: "running", contextUsed, contextWindow: 1000000 },
+              projection: { status: projectionStatus, contextUsed, contextWindow: 1000000 },
               settings: {},
             },
           };
@@ -92,6 +94,9 @@ function staleRunningBackend(): StaleBackendControl {
     sendRequests,
     setWatermarkMode: (mode) => {
       watermarkMode = mode;
+    },
+    setProjectionStatus: (status) => {
+      projectionStatus = status;
     },
   };
 }
@@ -148,7 +153,33 @@ describe("stall termination policy (watermark-based)", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
   });
+
+  it("does not turn managed double-idle into a successful native outcome", async () => {
+    vi.stubEnv("DD_FLOW_RUNTIME_OWNER", '{"schema_id":"dd-flow/runtime-owner@1"}');
+    const control = staleRunningBackend();
+    const original = control.backend.request.bind(control.backend);
+    vi.spyOn(control.backend, "request").mockImplementation((id, method, ...args) =>
+      method === "session/close"
+        ? Promise.resolve({ id, result: { closed: true } })
+        : original(id, method, ...args),
+    );
+    control.setProjectionStatus("idle");
+    const server = setup(control.backend);
+    const turn = prompt(server, params, cx, 7);
+    let settled = false;
+    void turn.then(() => {
+      settled = true;
+    });
+    await waitForSend(control.sendRequests);
+
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(settled).toBe(false);
+    await closeSession(server, { sessionId: "sess_stale" });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(turn).resolves.toEqual({ stopReason: "cancelled" });
+  }, 30_000);
 
   it("keeps a silently-running sub-agent turn alive while the read watermark advances", async () => {
     // The user-visible bug: a sub-agent works behind a silent event stream for

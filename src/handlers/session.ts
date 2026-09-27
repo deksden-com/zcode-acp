@@ -777,7 +777,7 @@ export async function ensureRealSession(
       server.nextId(),
       "session/create",
       createParams,
-      15000,
+      90000,
       async (late) => {
         if (late.error) {
           if (!isUnknownBackendOutcome(late.error)) finishAllocation(acpSid, owner);

@@ -3331,6 +3331,7 @@ export async function runEventTurn(
   const backend = server.ensureBackend();
   const translator = new EventTranslator();
   differ.resetTurn();
+  const managedTurn = Boolean(process.env.DD_FLOW_RUNTIME_OWNER);
   const NO_PROGRESS_MS = 120_000;
   // Stall termination policy. Two candidate liveness signals were verified
   // against the Aug-28 app-server and both are unusable for kill decisions:
@@ -3714,7 +3715,12 @@ export async function runEventTurn(
           noteWatermark(proj2);
           await forwardAuthoritativeProgress();
           if (proj2?.status === "idle" && !listener.hasQueuedEvents()) {
-            // Turn completed but the event was lost (double-confirmed).
+            // Idle is not native terminal evidence. Managed RUNs must wait for
+            // turn.completed or prompt_completed rather than invent success.
+            if (managedTurn) {
+              warn("managed turn is idle without a terminal event; retaining unknown outcome");
+              continue;
+            }
             return await recoverLostTerminalTurn();
           }
           // Second probe says the backend is still working (or events arrived

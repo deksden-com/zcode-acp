@@ -120,6 +120,7 @@ describe("native recovery invariants", () => {
     );
     await expect(ensureRealSession(server, alias)).rejects.toThrow("unknown");
     expect(request.mock.calls.filter((call) => call[1] === "session/create")).toHaveLength(1);
+    expect(request.mock.calls.find((call) => call[1] === "session/create")?.[3]).toBe(90_000);
     await reconcile!({ id: 1, result: { session: { sessionId: "sess_late" } } });
     expect(server.resolveSid(alias)).toBe("sess_late");
     expect(readAllocation(alias)?.sessionId).toBe("sess_late");

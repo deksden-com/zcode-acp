@@ -26,3 +26,6 @@ coverage/
 *.tgz
 .zcode
 .tgrep/
+
+# Personal mise tool pins (project toolchain pin lives in .node-version)
+mise.local.toml

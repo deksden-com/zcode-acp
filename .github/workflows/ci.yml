@@ -1,5 +1,14 @@
 name: CI
 
+# release-please PRs change only CHANGELOG/README (covered by "**.md") plus
+# package.json and .release-please-manifest.json — ignoring those two keeps
+# such PRs from creating a CI run at all. Their GITHUB_TOKEN pull_request
+# delivery is suppressed by GitHub AFTER the run record is created, leaving a
+# dead 0-job "failure" that no in-workflow guard can prevent (verified
+# 2026-09-28: rerunning such a run evaluates the skip guards and concludes
+# "skipped"). The pure-bump merge commit then skips CI on main too; the
+# Release workflow's publish job runs build+test before npm publish, so
+# nothing ships untested.
 on:
   push:
     branches: [main]
@@ -8,6 +17,8 @@ on:
       - "docs/**"
       - "LICENSE"
       - "*.txt"
+      - ".release-please-manifest.json"
+      - "package.json"
   pull_request:
     branches: [main]
     paths-ignore:
@@ -15,16 +26,19 @@ on:
       - "docs/**"
       - "LICENSE"
       - "*.txt"
+      - ".release-please-manifest.json"
+      - "package.json"
 
 permissions:
   contents: read
 
 jobs:
   build-and-test:
-    # Release-please PRs are pushed by github-actions[bot] with GITHUB_TOKEN;
-    # GitHub suppresses workflow runs for such events (anti-recursion), leaving
-    # a dead 0-job "failure" record. Skip explicitly so the PR shows a clean
-    # intentional skip instead of a phantom red X.
+    # paths-ignore above already keeps bot-opened release PRs from creating a
+    # run (their suppressed delivery leaves a dead 0-job failure that job ifs
+    # never get to prevent). This guard covers the human-actor case: pushing
+    # to or reopening a release-please branch triggers CI normally — skip
+    # cleanly instead of building a version-bump-only diff.
     if: "!startsWith(github.head_ref, 'release-please--')"
     name: Build & Test
     runs-on: ubuntu-latest

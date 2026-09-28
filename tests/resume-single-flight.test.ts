@@ -228,6 +228,7 @@ describe("resume snapshot model-availability mining", () => {
         providerId: "account:bigmodel-individual-coding-plan",
         modelId: "GLM-5.2",
         defaultLevel: "high",
+        levels: ["low", "high"],
       },
     ]);
   });

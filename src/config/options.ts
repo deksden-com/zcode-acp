@@ -560,6 +560,18 @@ export async function buildConfigOptions(
       const tlAvail = (tlSet.available as Array<Record<string, string>>) ?? [];
       if (tlAvail.length > 0) {
         thoughtOptions = tlAvail.map((a) => ({ value: a.value, name: a.label ?? a.value }));
+        // setModel can leave the runtime briefly holding the PREVIOUS model's
+        // thoughtLevel (upstream clamps its own snapshot for the same reason —
+        // session-mapper.ts: "setModel 后 runtime 可能短暂保留上一个模型的
+        // thoughtLevel"). Never advertise a current outside the new model's
+        // list: the CLI would keep displaying — and re-sending — the old
+        // model's level (observed 2026-09-28 after switches between models
+        // with different level vocabularies).
+        const values = new Set(tlAvail.map((a) => a.value));
+        if (!values.has(currentThought)) {
+          const def = typeof tlSet.defaultLevel === "string" ? tlSet.defaultLevel : undefined;
+          currentThought = def && values.has(def) ? def : (tlAvail[0]?.value ?? currentThought);
+        }
       }
     } catch {
       // keep defaults

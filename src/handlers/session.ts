@@ -3060,6 +3060,9 @@ export function cacheModelAvailability(
       providerId: a.ref?.providerId,
       modelId: a.ref?.modelId,
       defaultLevel: a.reasoning?.defaultLevel ?? a.reasoning?.levels?.[0]?.value,
+      levels: (a.reasoning?.levels ?? [])
+        .map((l) => l.value)
+        .filter((v): v is string => typeof v === "string"),
     })),
   );
 }

@@ -44,7 +44,11 @@ fetch the matching tag), re-read `packages/shared/src/zcode-protocol/index.ts`
 for schema drift, and diff the behaviors Gotchas depends on (stop, provider
 bootstrap, runtime headers, compact, setModel strictness) against the source
 instead of the binary. Update `docs/BACKLOG.md` and the Gotchas bullets from
-source evidence (`file:line`), not bundle probes.
+source evidence (`file:line`), not bundle probes. The 3.14.3 commit was
+REWRITTEN upstream (2026-09-28: `328c1a0` → `29628c9`, same release; workflow
+runtime internals + bundled skills only — every protocol surface the Gotchas
+cite was byte-identical), so a non-fast-forward `pull` there means re-align
+with `git reset --hard origin/main`, not a local divergence.
 
 ## Commands
 
@@ -204,60 +208,76 @@ ZCode protocol types into ACP notifications directly — always translate.
   required for <p>/<m>") — the string form skips that check but carries no
   level. Provider ids must also be translated to the registry's spelling
   (`builtin:bigmodel-coding-plan` → `account:bigmodel-individual-coding-plan`,
-  `accountProviderIdFor`). `session/create` is the only response returning the
-  FULL `settings.model.available` list (with authoritative `reasoning.defaultLevel`);
-  `session/read` answers `"current"` only, so the create snapshot is cached in
-  `server.modelAvailability` for switch-time level resolution. `applyModelSwitch`
-  tries the modern shape then falls back once to the legacy overlay shape, so the
-  same bridge works on both builds. `workspace/updateProviderRegistry` is
-  GONE in 3.12+ (method-not-found) — the bridge logs it as a no-op, not a
-  failure. Also note `session.model_selection.persist_failed` ("FOREIGN KEY
-  constraint failed") — ROOT CAUSE found in source (2026-09-21): the
-  per-session model selection is a `session_entry` with a session FK, but
-  the session row is only created at FIRST INPUT (`ensureSessionPersisted`,
-  core events.ts) — so a setModel/setThoughtLevel BEFORE the first prompt
-  applies in-memory but cannot persist, and a session resumed without an
-  entry silently reverts to the workspace default
-  (`restorePersistedModelSelection` → `setSessionModelSelection(undefined)`)
-  while the editor dropdown keeps showing the user's choice ("displayed
-  default ≠ actually called", observed 2026-09-21). NOT a switch failure
-  itself (the following `session.model.updated` event is the success
-  signal); the bridge compensates: every switch path records the choice
-  (`server.sessionModelChoices` + `LazySessionRecord.modelChoice` in the
-  lazy-alias store, surviving bridge restarts; choices carry an `at` stamp —
-  store recovery is NEWER-WINS because two aliases can record the SAME
-  backend session) and `reassertModelChoice` re-applies it after EVERY
-  resume flight (silent, best-effort; model and thought re-applied
-  independently; `repairUnavailableModel` still wins for unavailable
-  models). A RESET (thought level absent/null) is remembered as an EMPTY
-  level — recording nothing would resurrect the old level on every resume.
-  Same-process
-  drafts self-heal: first-input persistence captures the runtime's then-
-  current selection. Don't chase persist_failed as a switching bug — chase
-  it as a stickiness bug only if the re-assert stops firing.
-  **Account turns
-  also need runtime headers**: the backend asks its host
-  `interaction/requestProviderRuntimeHeaders` before EVERY model request on a
-  `zhipu-account` provider and a `headersApplied:false` answer throws -32031
-  (every send on a GLM model dies in a retry loop — observed 2026-09-17 after
-  switching started working; the switch looked fine, sends never ran). The
-  bridge answers `headersApplied:true, requestAuth:{apiKey}` with the plan's
-  config.json key for individual coding plans
-  (`answerProviderRuntimeHeaders`, server-requests.ts) — the same key the
-  pre-3.12 `builtin:` provider used; start-plan stays declined (Aliyun
-  captcha, #123). **The answer is wired at frame ARRIVAL**
-  (`ZcodeBackend.providerRuntimeHeadersResponder`, set in ensureBackend), not
-  just the turn-loop queue: a headers ask that lands while no turn loop is
-  polling — compact's internal turn above all — used to sit unanswered until
-  the backend's 180s cap killed the generation as "Captcha verification
-  request timed out" (observed 2026-09-19: auto-compact "succeeded" per the
-  bridge for weeks while never compacting; backend log `~/.zcode/cli/log/`
-  carries the truth, `querySource: "compact"`). The backend's own
-  "standalone" self-signing channel needs
-  an identity credential pair in its ENCRYPTED store
-  (`account-provider:…:account:<uid>:api-key` exists but the `…:identity`
-  half was never written on the observed machine), so the bridge cannot rely
-  on it.
+  `accountProviderIdFor`). `session/create` AND `session/resume`/`fork` return the
+  FULL `settings.model.available` list (with authoritative `reasoning.defaultLevel`
+  - `reasoning.levels`); `session/read` answers `"current"` only, so the snapshot
+    is cached in `server.modelAvailability` (levels list included) for switch-time
+    level resolution. **Switch-time level resolution is a LADDER, not a single
+    shot** (2026-09-28): BOTH local files can lie — config.json is legacy-stale by
+    design, and even provider_config.json's own rule disagreed with the live
+    registry (`Reasoning effort "max" is not supported by <p>/<m>`, four
+    consecutive failed switches to one model). `candidateReasoningLevels` orders
+    candidates snapshot → personal rule (default = LAST value, the upstream
+    `values.at(-1)` rule, model-catalog-port.ts) → legacy config.json; a snapshot
+    hit declaring NO levels is FINAL (level-less — file variants are suppressed).
+    `applyModelSwitch` walks `[best, omit, rest]` (≤5 attempts), retrying ONLY on
+    the two level-shape rejections (`is not supported by` / `Reasoning level is
+required for`); any other error aborts. Display side, `buildConfigOptions`
+    CLAMPS the advertised thought current to the model's available list (upstream
+    session-mapper.ts does the same server-side: "setModel 后 runtime 可能短暂
+    保留上一个模型的 thoughtLevel") — without the clamp the CLI keeps showing
+    and re-sending the previous model's level. And a REBUILT dist does NOT
+    restart RUNNING bridges — CLI windows and the hub keep serving the old code
+    until restarted (the post-0.48.1 "deleted model still listed" report was
+    stale processes, not a fix regression). `workspace/updateProviderRegistry` is
+    GONE in 3.12+ (method-not-found) — the bridge logs it as a no-op, not a
+    failure. Also note `session.model_selection.persist_failed` ("FOREIGN KEY
+    constraint failed") — ROOT CAUSE found in source (2026-09-21): the
+    per-session model selection is a `session_entry` with a session FK, but
+    the session row is only created at FIRST INPUT (`ensureSessionPersisted`,
+    core events.ts) — so a setModel/setThoughtLevel BEFORE the first prompt
+    applies in-memory but cannot persist, and a session resumed without an
+    entry silently reverts to the workspace default
+    (`restorePersistedModelSelection` → `setSessionModelSelection(undefined)`)
+    while the editor dropdown keeps showing the user's choice ("displayed
+    default ≠ actually called", observed 2026-09-21). NOT a switch failure
+    itself (the following `session.model.updated` event is the success
+    signal); the bridge compensates: every switch path records the choice
+    (`server.sessionModelChoices` + `LazySessionRecord.modelChoice` in the
+    lazy-alias store, surviving bridge restarts; choices carry an `at` stamp —
+    store recovery is NEWER-WINS because two aliases can record the SAME
+    backend session) and `reassertModelChoice` re-applies it after EVERY
+    resume flight (silent, best-effort; model and thought re-applied
+    independently; `repairUnavailableModel` still wins for unavailable
+    models). A RESET (thought level absent/null) is remembered as an EMPTY
+    level — recording nothing would resurrect the old level on every resume.
+    Same-process
+    drafts self-heal: first-input persistence captures the runtime's then-
+    current selection. Don't chase persist_failed as a switching bug — chase
+    it as a stickiness bug only if the re-assert stops firing.
+    **Account turns
+    also need runtime headers**: the backend asks its host
+    `interaction/requestProviderRuntimeHeaders` before EVERY model request on a
+    `zhipu-account` provider and a `headersApplied:false` answer throws -32031
+    (every send on a GLM model dies in a retry loop — observed 2026-09-17 after
+    switching started working; the switch looked fine, sends never ran). The
+    bridge answers `headersApplied:true, requestAuth:{apiKey}` with the plan's
+    config.json key for individual coding plans
+    (`answerProviderRuntimeHeaders`, server-requests.ts) — the same key the
+    pre-3.12 `builtin:` provider used; start-plan stays declined (Aliyun
+    captcha, #123). **The answer is wired at frame ARRIVAL**
+    (`ZcodeBackend.providerRuntimeHeadersResponder`, set in ensureBackend), not
+    just the turn-loop queue: a headers ask that lands while no turn loop is
+    polling — compact's internal turn above all — used to sit unanswered until
+    the backend's 180s cap killed the generation as "Captcha verification
+    request timed out" (observed 2026-09-19: auto-compact "succeeded" per the
+    bridge for weeks while never compacting; backend log `~/.zcode/cli/log/`
+    carries the truth, `querySource: "compact"`). The backend's own
+    "standalone" self-signing channel needs
+    an identity credential pair in its ENCRYPTED store
+    (`account-provider:…:account:<uid>:api-key` exists but the `…:identity`
+    half was never written on the observed machine), so the bridge cannot rely
+    on it.
 - **Desktop 3.12+ writes user-added models to `provider_config.json` and legacy
   config.json has STOPPED syncing — the dropdown must union both, EXCEPT custom
   providers where the personal list is authoritative** (observed

@@ -453,15 +453,16 @@ export class ZcodeAcpServer {
   readonly modelCache = new Map<string, string>();
   /**
    * Per-session (zcodeSid) FULL model-availability list, captured from the
-   * `session/create` snapshot (`settings.model.available`). Only create/resume
-   * return the complete list with authoritative `reasoning.defaultLevel` —
-   * `session/read` answers `modelAvailability:"current"` (just the active
-   * model). Model switches need a target's default reasoning level, so this
-   * cache is the lookup; an entry that declares no levels simply has none.
+   * `session/create`/`resume` snapshot (`settings.model.available`). Only
+   * create/resume return the complete list with authoritative
+   * `reasoning.defaultLevel` — `session/read` answers
+   * `modelAvailability:"current"` (just the active model). Model switches
+   * resolve the target's reasoning level from this cache first; an entry that
+   * declares no levels simply has none (the backend's own "level-less" verdict).
    */
   readonly modelAvailability = new Map<
     string,
-    Array<{ providerId?: string; modelId?: string; defaultLevel?: string }>
+    Array<{ providerId?: string; modelId?: string; defaultLevel?: string; levels?: string[] }>
   >();
   /**
    * Per-session (zcodeSid) background-task listeners. Registered once when a

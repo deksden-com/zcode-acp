@@ -61,6 +61,12 @@ export interface RemoteUserConfig {
   hubPort?: number;
   hubHost?: string;
   bridgePort?: number;
+  /**
+   * Absolute path of a web-client build (`dist/`) for the hub to serve
+   * same-origin (empty/unset = static hosting off). The hub daemon's cwd is
+   * unpredictable, so a relative path would resolve differently per spawn.
+   */
+  webDir?: string;
   terminal?: TerminalPrefs;
 }
 
@@ -342,6 +348,14 @@ function parseRemoteSection(remote: Record<string, unknown>, file: string): Remo
   }
   if (typeof remote["hubHost"] === "string" && remote["hubHost"].trim()) {
     out.hubHost = remote["hubHost"].trim();
+  }
+  if (typeof remote["webDir"] === "string" && remote["webDir"].trim()) {
+    const webDir = remote["webDir"].trim();
+    if (path.isAbsolute(webDir)) {
+      out.webDir = webDir;
+    } else {
+      warn(`config: remote.webDir=${JSON.stringify(webDir)} is not an absolute path — ignoring`);
+    }
   }
   const terminal = remote["terminal"];
   if (isPlainObject(terminal)) {

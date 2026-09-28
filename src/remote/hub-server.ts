@@ -83,6 +83,14 @@ export interface HubOptions {
   port: number;
   host: string;
   token: string;
+  /**
+   * Absolute path of a web-client build (`dist/`) to serve same-origin: after
+   * every existing route, GET/HEAD paths resolve inside this tree (`/` →
+   * index.html; content-hashed `assets/` are immutable). Unset — or a
+   * missing/unreadable dir at startup (one warning, silent degradation) —
+   * disables the mount; static hits never extend the hub's idle lifetime.
+   */
+  webDir?: string;
   /** Registration TTL before an instance is pruned (default 30s). */
   heartbeatTimeoutMs?: number;
   /**
@@ -243,7 +251,9 @@ function authorized(req: IncomingMessage, url: URL, token: string): boolean {
 }
 
 function setCors(res: ServerResponse): void {
-  // The web UI is deployed as a separate origin; the token is the boundary.
+  // The web UI is deployed either as a separate origin (Netlify/Cloudflare
+  // Pages) or same-origin from the hub's own static mount (remote.webDir);
+  // the token is the boundary in both shapes.
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
@@ -279,6 +289,92 @@ function canonicalPath(p: string): string {
   } catch {
     return p;
   }
+}
+
+/** Minimal closed MIME set for the web client's build output (spec §5). */
+const STATIC_MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
+  ".json": "application/json; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
+};
+
+/**
+ * Resolve the webDir to a canonical serving root, or null (one warning) when
+ * it is missing/unreadable — the hub keeps serving its API either way.
+ */
+function resolveWebRoot(webDir: string): string | null {
+  try {
+    const real = realpathSync(webDir);
+    if (!statSync(real).isDirectory()) throw new Error("not a directory");
+    return real;
+  } catch (e) {
+    warn(
+      `hub: webDir ${webDir} unusable (${e instanceof Error ? e.message : String(e)}) — ` +
+        "static hosting disabled, API unaffected",
+    );
+    return null;
+  }
+}
+
+/**
+ * Serve one GET/HEAD path from the static root. Returns false (nothing
+ * written) for anything that is not a real file inside the root — the
+ * caller's terminal 404 then applies. Traversal defenses are layered: the
+ * URL parser neutralizes literal dot segments, decode + normalize + prefix
+ * check catches the encoded `%2e%2e%2f` spellings, and a realpath re-check
+ * pins the FINAL target inside the root so symlinked files cannot escape.
+ */
+async function serveStatic(
+  root: string,
+  pathname: string,
+  method: string,
+  res: ServerResponse,
+): Promise<boolean> {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return false; // malformed percent-encoding
+  }
+  if (decoded.includes("\0")) return false;
+  if (decoded === "/") decoded = "/index.html";
+  const target = path.normalize(path.join(root, `.${decoded}`));
+  if (target !== root && !target.startsWith(root + path.sep)) return false;
+  let real: string;
+  try {
+    real = realpathSync(target);
+  } catch {
+    return false;
+  }
+  if (real !== root && !real.startsWith(root + path.sep)) return false;
+  let body: Buffer;
+  try {
+    const st = await stat(real);
+    if (!st.isFile()) return false;
+    body = await readFile(real);
+  } catch {
+    return false; // vanished, or a stat race mid-build
+  }
+  const cacheControl = real.startsWith(root + path.sep + "assets" + path.sep)
+    ? "public, max-age=31536000, immutable"
+    : "no-cache";
+  res.writeHead(200, {
+    "Content-Type": STATIC_MIME[path.extname(real).toLowerCase()] ?? "application/octet-stream",
+    "Content-Length": body.length,
+    "Cache-Control": cacheControl,
+    "X-Content-Type-Options": "nosniff",
+  });
+  res.end(method === "HEAD" ? undefined : body);
+  return true;
 }
 
 function validSessions(raw: unknown): SessionSummary[] | null {
@@ -981,6 +1077,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     port,
     host,
     token,
+    webDir,
     heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
     probeGraceMs = PROBE_GRACE_MS,
     idleExitMs = IDLE_EXIT_MS,
@@ -1006,6 +1103,14 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
    */
   const hubFingerprint =
     options.hubFingerprint !== undefined ? options.hubFingerprint : readCodeFingerprint();
+
+  /**
+   * Canonical web-client root (realpath'd webDir) or null when static
+   * hosting is off/unusable. Frozen at startup on purpose: the tree is a
+   * build output; per-request re-resolution buys nothing and a mid-run
+   * disappearance must serve 404s, not warnings.
+   */
+  const webRoot = webDir ? resolveWebRoot(webDir) : null;
 
   const instances = new Map<string, InstanceEntry>();
   const proxyPairs = new Set<{ client: WebSocket; bridge: WebSocket }>();
@@ -2192,6 +2297,14 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         log("hub: newer-bridge vote ignored (restart cooldown after a recent restart)");
       }
       return;
+    }
+    // Same-origin web client (opt-in webDir): mounted AFTER every existing
+    // route, so API/WS precedence is untouched. Unauthenticated by design —
+    // public frontend bytes; the bearer token remains the /api/* boundary.
+    // Static hits deliberately never touch idleSince: a configured webDir
+    // must not by itself keep the idle-retire clock from firing.
+    if (webRoot !== null && (req.method === "GET" || req.method === "HEAD")) {
+      if (await serveStatic(webRoot, url.pathname, req.method ?? "GET", res)) return;
     }
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");

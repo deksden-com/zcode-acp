@@ -85,6 +85,7 @@ export async function main(): Promise<void> {
     port: config.hubPort,
     host: config.hubHost,
     token: config.token,
+    webDir: config.webDir,
     onIdleExit: () => process.exit(0),
     onRestart: respawnSelf,
   });

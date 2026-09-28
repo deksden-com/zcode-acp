@@ -121,11 +121,23 @@ describe("loadUserConfig", () => {
           bridgePort: "not-a-number",
           token: 42, // wrong type → ignored
           hubHost: "", // blank → ignored
+          webDir: "dist", // relative → ignored (hub cwd is unpredictable)
           terminal: { app: "  ", enabled: "yes" }, // blank app + wrong type
         },
       }),
     );
     expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ remote: { enabled: true } });
+  });
+
+  it("accepts an absolute webDir, trimmed; blank is dropped", () => {
+    writeConfig(
+      JSON.stringify({
+        remote: { enabled: true, webDir: "  /srv/web-dist  ", hubHost: " " },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      remote: { enabled: true, webDir: "/srv/web-dist" },
+    });
   });
 
   it("a non-object remote section is ignored wholesale", () => {

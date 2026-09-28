@@ -342,6 +342,53 @@ describe("stall termination policy (watermark-based)", () => {
     await expect(turn).resolves.toEqual({ stopReason: "end_turn" });
   });
 
+  it("does not infer a managed turn from a frozen watermark after output", async () => {
+    vi.stubEnv("DD_FLOW_RUNTIME_OWNER", '{"schema_id":"dd-flow/runtime-owner@1"}');
+    const control = staleRunningBackend();
+    const turn = prompt(setup(control.backend), params, cx, 8);
+    let settled = false;
+    void turn.then(() => {
+      settled = true;
+    });
+    await waitForSend(control.sendRequests);
+
+    control.emit({
+      type: "tool.updated",
+      payload: { kind: "started", toolCallId: "tool-done", toolName: "Read" },
+    });
+    control.emit({
+      type: "tool.updated",
+      payload: { kind: "result", toolCallId: "tool-done", result: { content: "done" } },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(700_000);
+
+    expect(settled).toBe(false);
+    expect(control.backend.send).not.toHaveBeenCalled();
+    control.emit({ type: "turn.completed", payload: { resultType: "success" } });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(turn).resolves.toEqual({ stopReason: "end_turn" });
+  });
+
+  it("does not stop a silent managed turn from a frozen watermark", async () => {
+    vi.stubEnv("DD_FLOW_RUNTIME_OWNER", '{"schema_id":"dd-flow/runtime-owner@1"}');
+    const control = staleRunningBackend();
+    const turn = prompt(setup(control.backend), params, cx, 9);
+    let settled = false;
+    void turn.then(() => {
+      settled = true;
+    });
+    await waitForSend(control.sendRequests);
+
+    await vi.advanceTimersByTimeAsync(700_000);
+
+    expect(settled).toBe(false);
+    expect(control.backend.send).not.toHaveBeenCalled();
+    control.emit({ type: "turn.completed", payload: { resultType: "success" } });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(turn).resolves.toEqual({ stopReason: "end_turn" });
+  });
+
   it("ends a watermark-frozen turn after the stale-freeze budget (no output → stop)", async () => {
     // PR #85's original goal stays: a projection stuck at `running` whose
     // watermark never advances must eventually converge instead of hanging

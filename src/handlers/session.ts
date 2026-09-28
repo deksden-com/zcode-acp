@@ -3573,6 +3573,14 @@ export async function runEventTurn(
             `  [stall] watermark advanced within the last ${Math.round(frozenMs / 1000)}s (activeTools=${activeTools}); deferring terminal decision`,
           );
           nextNoProgressDecisionAt = Date.now() + NO_PROGRESS_MS;
+        } else if (managedTurn) {
+          // A managed caller requires a native terminal outcome. A frozen
+          // projection is not proof of completion: the backend can still own
+          // the turn through a long, silent model request. Let the caller's
+          // bounded prompt deadline report an unknown outcome if it never
+          // receives turn.completed or prompt_completed.
+          log(`  [stall] managed turn has no terminal event; retaining unknown outcome`);
+          nextNoProgressDecisionAt = Date.now() + NO_PROGRESS_MS;
         } else if (emittedText || emittedOutput) {
           // Watermark frozen past the budget and something was already
           // delivered — treat as a completed-but-terminal-event-lost turn

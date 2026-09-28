@@ -272,8 +272,9 @@ editor still has it open).
     |   watermark moved   | -> forward throttled usage -> defer (alive)
     |   active tool       | -> refresh in_progress -> defer (alive)
     |   frozen < 10 min   | -> defer decision
-    |   frozen >= 10 min  | -> fetch reply -> end_turn
+    |   frozen >= 10 min  | -> interactive: fetch reply -> end_turn
     |                       |   no reply, no output -> max_turn_requests
+    |                       | -> managed: wait for native terminal/deadline
     | manual cancel        | -> cancelled
     +---------------------+
 ```
@@ -297,8 +298,11 @@ watermark frozen for 10 minutes (STALE_FREEZE_MS) still marks the projection as
 truly stale unless a known foreground tool remains nonterminal. An active tool
 is direct lifecycle evidence that the turn has not completed, so the bridge
 keeps waiting and refreshing its existing card. Without an active tool, the
-turn ends gently (reply fetch first, bounded stop only when nothing was ever
-delivered). Already-queued events win the deadline race and are consumed first.
+interactive turn ends gently (reply fetch first, bounded stop only when nothing
+was ever delivered). Managed turns never infer success or stop from a frozen
+watermark: the backend may still own a silent model request, so only native
+terminal evidence or the caller's bounded prompt deadline settles them.
+Already-queued events win the deadline race and are consumed first.
 
 ### Tool lifecycle
 

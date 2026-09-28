@@ -487,9 +487,11 @@ ZCode protocol types into ACP notifications directly — always translate.
   (contextUsed/totalTokenCount/turnCount/currentTurnId) for minutes with
   zero stream events — killing a silently running turn on a lock probe
   murdered live sub-agent turns once (PR #85). `runEventTurn` therefore
-  defers the terminal decision while the watermark moves and only ends a
-  turn after the watermark has been frozen for STALE_FREEZE_MS (10 min) —
-  reply-fetch first, bounded stop as the last resort.
+  defers the terminal decision while the watermark moves. Interactive turns
+  can still end after a freeze of STALE_FREEZE_MS (10 min), reply-fetch first;
+  managed turns (`DD_FLOW_RUNTIME_OWNER`) must instead wait for a native
+  terminal event or the caller's bounded deadline. A frozen watermark is not
+  completion evidence: a live model request has remained active past it.
 - **The backend rejects JSON-RPC frames carrying a `jsonrpc` field** (strict
   zod: "Unrecognized key: jsonrpc", code -32600). The bridge's backend
   client never sends one — keep it that way when hand-probing

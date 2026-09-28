@@ -267,8 +267,18 @@ export function loadAllModels(): ModelRef[] {
       if (pinned && pid !== pinned) continue;
       if (!providerSelectable(pid, p)) continue;
       const providerName = p.name ?? pid;
-      const ids = new Set(Object.keys(p.models ?? {}));
-      for (const modelId of personal?.modelsByProvider.get(pid) ?? []) ids.add(modelId);
+      // Custom providers: once the personal config tracks the provider's
+      // models, THAT list is authoritative. Additions AND deletions land only
+      // there (config.json stopped syncing), and the backend registry knows no
+      // other source for the provider's models — a config.json-only entry is a
+      // deleted-model ghost that fails on switch (observed 2026-09-28). Builtin
+      // providers keep the union: their catalog comes from the account
+      // snapshot, and a personal rule is an override, not a complete list.
+      const personalIds = personal?.modelsByProvider.get(pid);
+      const ids =
+        personalIds !== undefined && !isBuiltinProvider(pid)
+          ? new Set(personalIds)
+          : new Set([...Object.keys(p.models ?? {}), ...(personalIds ?? [])]);
       for (const modelId of ids) {
         out.push({ providerId: pid, providerName, modelId });
       }

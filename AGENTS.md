@@ -250,15 +250,26 @@ ZCode protocol types into ACP notifications directly — always translate.
   half was never written on the observed machine), so the bridge cannot rely
   on it.
 - **Desktop 3.12+ writes user-added models to `provider_config.json` and legacy
-  config.json has STOPPED syncing — the dropdown must union both** (observed
+  config.json has STOPPED syncing — the dropdown must union both, EXCEPT custom
+  providers where the personal list is authoritative** (observed
   2026-09-20: a model added in the app landed only in
   `~/.zcode/v2/provider_config.json` `modelConfigRules.providerModelRules`,
   config.json's mtime stayed days stale, and the dropdown built from
   `loadAllModels()` never showed it while the backend registry accepted the
-  model fine). `loadAllModels` (src/config/options.ts) merges: config.json
-  stays authoritative for enablement/credentials; the personal config
-  contributes model ids per provider plus WHOLE providers config.json lacks
-  (same `providerSelectable` rule applied to the rule's own
+  model fine. Observed 2026-09-28: DELETIONS behave the same way — a model
+  removed in the app vanishes from the personal file only, config.json keeps
+  it, and the union resurrected it in the dropdown. The desktop also mirrors
+  the full custom-provider list into
+  `providerConfigRules.providerRules[].config.personalModelIds`, and the
+  backend registry knows custom-provider models from NO source but the
+  personal file — a config.json-only entry is a deleted-model ghost that would
+  fail on switch). `loadAllModels` (src/config/options.ts) therefore merges:
+  config.json stays authoritative for enablement/credentials; for CUSTOM
+  providers (non-`builtin:`) with ≥1 personal model rule the personal list
+  REPLACES config.json's models; for builtin providers the union holds (their
+  catalog comes from the account snapshot — a personal rule is an override,
+  not a complete list); the personal config also contributes WHOLE providers
+  config.json lacks (same `providerSelectable` rule applied to the rule's own
   `config.access.apiKey` / `config.api.baseUrl`). Shapes that bite: personal
   rule ids use the REGISTRY spelling (`account:…` — normalize through
   `configProviderIdFor` before matching config.json's `builtin:*` keys), the

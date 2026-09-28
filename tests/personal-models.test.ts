@@ -4,9 +4,12 @@
  * The desktop app (3.12+) writes user-added providers/models to its personal
  * provider_config.json and has stopped syncing legacy config.json — a dropdown
  * built from config.json alone never showed them (observed 2026-09: a model
- * added in the app was invisible in the editor). These tests lock the union:
- * config.json stays authoritative for enablement/credentials, the personal
- * config contributes model ids per provider plus whole new providers.
+ * added in the app was invisible in the editor). For CUSTOM providers the
+ * personal model list is authoritative (replaces, not unions): deletions also
+ * land only there, so a config.json-only entry is a deleted-model ghost
+ * (observed 2026-09-28). config.json stays authoritative for
+ * enablement/credentials and for builtin providers' catalogs, where a personal
+ * rule is an override rather than a complete list.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -137,18 +140,34 @@ beforeEach(() => {
 });
 
 describe("loadAllModels with provider_config.json", () => {
-  it("shows a model that only exists in the personal config", () => {
+  it("treats the personal model list as authoritative for custom providers", () => {
     const models = loadAllModels();
     expect(models).toContainEqual({
       providerId: "uuid-provider",
       providerName: "OcGo",
       modelId: "step-5-preview",
     });
-    // config.json models of the same provider stay put.
+    // Models that survive only in legacy config.json were deleted in the
+    // desktop app (deletions write provider_config.json only) — they must not
+    // come back through the merge, and the registry would reject them anyway.
+    const uuidModels = models.filter((m) => m.providerId === "uuid-provider").map((m) => m.modelId);
+    expect(uuidModels).toEqual(["step-5-preview"]);
+  });
+
+  it("keeps the union for builtin providers (personal rules are overrides)", () => {
+    const models = loadAllModels();
+    // GLM-5.3 lives only in config.json while the personal account: rule adds
+    // GLM-5.3-Flash — both stay: the builtin catalog is not tracked by the
+    // personal model list.
     expect(models).toContainEqual({
-      providerId: "uuid-provider",
-      providerName: "OcGo",
-      modelId: "deepseek-v4.1-flash",
+      providerId: "builtin:bigmodel-coding-plan",
+      providerName: "BigModel",
+      modelId: "GLM-5.3",
+    });
+    expect(models).toContainEqual({
+      providerId: "builtin:bigmodel-coding-plan",
+      providerName: "BigModel",
+      modelId: "GLM-5.3-Flash",
     });
   });
 

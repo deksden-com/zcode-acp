@@ -10,6 +10,7 @@ import { basename } from "node:path";
 
 const h = vi.hoisted(() => ({
   cfg: null as { contentDetail: "full" | "minimal"; notify?: Record<string, boolean> } | null,
+  diary: [] as string[],
 }));
 vi.mock("../src/push/config.js", async (orig) => {
   const actual = await orig<typeof import("../src/push/config.js")>();
@@ -17,6 +18,13 @@ vi.mock("../src/push/config.js", async (orig) => {
     ...actual,
     pushActive: () => h.cfg !== null,
     pushConfig: () => h.cfg,
+  };
+});
+vi.mock("../src/crash-guards.js", async (orig) => {
+  const actual = await orig<typeof import("../src/crash-guards.js")>();
+  return {
+    ...actual,
+    appendDiary: (line: string) => h.diary.push(line),
   };
 });
 
@@ -36,6 +44,7 @@ const sent: string[] = [];
 
 beforeEach(() => {
   h.cfg = null;
+  h.diary.length = 0;
   sent.length = 0;
   setPushSenderForTests({
     sendText: async (c) => {
@@ -179,6 +188,40 @@ describe("pushSourceLabel", () => {
     expect(bare).toBe(basename(process.cwd())); // projectCwd() falls back to cwd
     server.sessionTitles.set("s1", "fix auth flow");
     expect(pushSourceLabel(server, "s1")).toBe(`${bare} / fix auth flow`);
+  });
+});
+
+describe("push diary trail (delivery evidence survives the window)", () => {
+  const tick = () => new Promise((r) => setTimeout(r, 0)); // dispatch resolves in a .then
+
+  it("diaries a delivered line on a successful pushSettled", async () => {
+    h.cfg = { contentDetail: "full", notify: { turn: true, goal: true, run: true, task: true } };
+    const server = new ZcodeAcpServer();
+    pushSettled(server, { kind: "turn", label: "proj / s", title: "turn completed" });
+    await tick();
+    expect(h.diary).toEqual([`push: turn "turn completed" delivered via WeCom`]);
+  });
+
+  it("diaries a delivered line on a successful pushIfOffline", async () => {
+    h.cfg = { contentDetail: "full" };
+    const server = new ZcodeAcpServer();
+    pushIfOffline(server, { kind: "permission", title: "Approval requested" });
+    await tick();
+    expect(h.diary).toEqual([`push: permission "Approval requested" delivered via WeCom`]);
+  });
+
+  it("writes nothing when suppressed or inactive", async () => {
+    h.cfg = { contentDetail: "full", notify: { turn: false, goal: true, run: true, task: true } };
+    const server = new ZcodeAcpServer();
+    pushSettled(server, { kind: "turn", title: "turn completed" });
+    await tick();
+    expect(h.diary).toEqual([]);
+  });
+
+  it("diaries the §7 test push on success", async () => {
+    h.cfg = { contentDetail: "full" };
+    await sendTestPush("Hi");
+    expect(h.diary).toEqual([`push: test "Hi" delivered via WeCom`]);
   });
 });
 

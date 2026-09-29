@@ -8,6 +8,7 @@
 
 import path from "node:path";
 
+import { appendDiary } from "../crash-guards.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { log, warn } from "../utils.js";
 import { pushConfig, type PushConfig } from "./config.js";
@@ -85,7 +86,13 @@ export function renderPushContent(
 function dispatchPush(cfg: PushConfig, s: WeComSender, data: PushEventData): void {
   const content = renderPushContent(cfg, data);
   s.sendText(content).then(
-    () => log(`push: ${data.kind} "${data.title}" sent via WeCom`),
+    () => {
+      log(`push: ${data.kind} "${data.title}" sent via WeCom`);
+      // The success trail must outlive stderr (a closed window eats log()):
+      // "did the push leave this bridge?" is the first question a
+      // missed-notification report asks (observed 2026-09-29).
+      appendDiary(`push: ${data.kind} "${data.title}" delivered via WeCom`);
+    },
     (e: unknown) => warn(`push: WeCom send failed: ${e instanceof Error ? e.message : String(e)}`),
   );
 }
@@ -162,6 +169,7 @@ export async function sendTestPush(
   if (!cfg || !s) return { ok: false, error: "push_disabled" };
   try {
     await s.sendText(renderPushContent(cfg, { kind: "test", title }));
+    appendDiary(`push: test "${title}" delivered via WeCom`);
     return { ok: true, sent: 1 };
   } catch (e) {
     return {

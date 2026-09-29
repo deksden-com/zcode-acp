@@ -28,7 +28,8 @@
  *                                   tried in order before going headless)
  *     ZCODE_ACP_HUB_TERMINAL_COMMAND=<sh> shell command template ({script})
  *     ZCODE_ACP_WEB_DIR=<abs path>  web-client dist for same-origin hosting
- *                                   (file `remote.webDir` wins; empty = off)
+ *                                   (file `remote.webDir` wins; empty = off;
+ *                                   a leading ~ is expanded to the home dir)
  *   3. Built-in defaults.
  *
  * Process-role plumbing stays env-only by design (never file-configurable):
@@ -37,7 +38,7 @@
  *   ZCODE_ACP_RESUME_SESSION=<id>  per-request boot-resume target (ADR-0017)
  */
 
-import { loadUserConfig, type TerminalPrefs } from "../config/user-config.js";
+import { expandHomePath, loadUserConfig, type TerminalPrefs } from "../config/user-config.js";
 import { warn } from "../utils.js";
 
 export interface RemoteConfig {
@@ -98,7 +99,7 @@ function mergeCommon(env: NodeJS.ProcessEnv): {
     bridgePort:
       file.bridgePort ??
       parsePort(env.ZCODE_ACP_REMOTE_PORT, DEFAULT_BRIDGE_PORT, "ZCODE_ACP_REMOTE_PORT"),
-    webDir: file.webDir ?? (env.ZCODE_ACP_WEB_DIR ?? "").trim(),
+    webDir: file.webDir ?? expandHomePath((env.ZCODE_ACP_WEB_DIR ?? "").trim()),
   };
 }
 

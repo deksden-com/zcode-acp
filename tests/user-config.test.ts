@@ -5,7 +5,7 @@
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -138,6 +138,22 @@ describe("loadUserConfig", () => {
     expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
       remote: { enabled: true, webDir: "/srv/web-dist" },
     });
+  });
+
+  it("expands a leading ~ in webDir to the home dir; ~otheruser stays relative", () => {
+    writeConfig(
+      JSON.stringify({
+        remote: { enabled: true, webDir: "  ~/web-dist  " },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      remote: { enabled: true, webDir: path.join(homedir(), "web-dist") },
+    });
+    writeConfig(JSON.stringify({ remote: { enabled: true, webDir: "~" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch }).remote?.webDir).toBe(homedir());
+    // Only the CURRENT user's home is knowable without a lookup — rejected.
+    writeConfig(JSON.stringify({ remote: { enabled: true, webDir: "~root/dist" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ remote: { enabled: true } });
   });
 
   it("a non-object remote section is ignored wholesale", () => {

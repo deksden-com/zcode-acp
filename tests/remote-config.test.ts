@@ -7,7 +7,7 @@
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -121,9 +121,11 @@ describe("parseRemoteConfig (env fallback — no config file)", () => {
     });
   });
 
-  it("reads webDir from env and trims it", () => {
+  it("reads webDir from env, trims it, and expands a leading ~", () => {
     const config = parseRemoteConfig(env({ ...BASE_ENV, ZCODE_ACP_WEB_DIR: "  /srv/web-dist  " }));
     expect(config?.webDir).toBe("/srv/web-dist");
+    const tilded = parseRemoteConfig(env({ ...BASE_ENV, ZCODE_ACP_WEB_DIR: "~/env-dist" }));
+    expect(tilded?.webDir).toBe(path.join(homedir(), "env-dist"));
   });
 
   it("reads the hub-incubation overrides (origin, cwd pin) — ADR-0016", () => {

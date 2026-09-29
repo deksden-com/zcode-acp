@@ -38,6 +38,18 @@ function warn(msg: string): void {
   process.stderr.write(`[zcode-acp] ${msg}\n`);
 }
 
+/**
+ * Expand a leading `~`/`~/` to the user's home dir. Users naturally write
+ * paths in shell terms; `~` is home-relative (cwd-independent), unlike other
+ * relative spellings, so it is unambiguous to accept. `~otheruser/…` stays
+ * untouched (only the current user's home is knowable without a lookup).
+ */
+export function expandHomePath(p: string): string {
+  if (p === "~") return homedir();
+  if (p.startsWith("~/")) return path.join(homedir(), p.slice(2));
+  return p;
+}
+
 /** Terminal incubation preferences for remote session-create (ADR-0016). */
 export interface TerminalPrefs {
   /** false → remote session-create stays headless (no visible window). */
@@ -63,8 +75,9 @@ export interface RemoteUserConfig {
   bridgePort?: number;
   /**
    * Absolute path of a web-client build (`dist/`) for the hub to serve
-   * same-origin (empty/unset = static hosting off). The hub daemon's cwd is
-   * unpredictable, so a relative path would resolve differently per spawn.
+   * same-origin (empty/unset = static hosting off). A leading `~`/`~/` is
+   * expanded to the home dir; anything else relative is rejected — the hub
+   * daemon's cwd is unpredictable, so it would resolve differently per spawn.
    */
   webDir?: string;
   terminal?: TerminalPrefs;
@@ -350,7 +363,7 @@ function parseRemoteSection(remote: Record<string, unknown>, file: string): Remo
     out.hubHost = remote["hubHost"].trim();
   }
   if (typeof remote["webDir"] === "string" && remote["webDir"].trim()) {
-    const webDir = remote["webDir"].trim();
+    const webDir = expandHomePath(remote["webDir"].trim());
     if (path.isAbsolute(webDir)) {
       out.webDir = webDir;
     } else {

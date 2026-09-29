@@ -51,7 +51,10 @@ describe("ZcodeBackend reader routing (unit)", () => {
     const b = makeRoutingSubject();
     b.proc.stdin?.destroy();
     const resp = await b.request(3, "ping", {}, 5000);
-    expect(resp.error?.message).toBe("zcode backend pipe broken: stdin closed");
+    expect(resp.error).toMatchObject({
+      code: "native_backend_pipe_broken",
+      data: { method: "ping", reason: "pipe broken: Error: stdin closed" },
+    });
     // readerDead was set by the pipe-broken path: the next request must
     // fast-fail instead of burning another full timeout window.
     const again = await b.request(4, "ping", {}, 5000);

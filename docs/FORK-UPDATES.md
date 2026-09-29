@@ -53,7 +53,7 @@ separately; these rules do not assert that enforcement is already enabled.
 ## Artifact identity
 
 Current overlays retain upstream package name/version (`zcode-acp-server`,
-`0.46.7` for the current candidate); full downstream commit and artifact checksum
+`0.52.0` for the current candidate); full downstream commit and artifact checksum
 are therefore mandatory. Do not present this artifact as unmodified upstream.
 For future separately published packages, use a distinct downstream identity
 such as `dd-zcode-acp` and a downstream suffix such as `0.43.2-dd.1`; this policy

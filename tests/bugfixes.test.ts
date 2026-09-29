@@ -13,7 +13,7 @@ import { describe, expect, it, vi } from "vitest";
 import { EventStreamListener } from "../src/backend/listener.js";
 import { ZcodeBackend } from "../src/backend/client.js";
 import { ProjectionDiffer } from "../src/translators/projection-differ.js";
-import { flattenTodos } from "../src/handlers/session.js";
+import { cancel, flattenTodos } from "../src/handlers/session.js";
 import {
   buildConfigOptions,
   formatModelValue,

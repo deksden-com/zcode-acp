@@ -342,6 +342,22 @@ describe("applyModelSwitch level candidates (file sources)", () => {
     },
   });
 
+  it("never retries the level ladder after an unknown setModel outcome", async () => {
+    fakePersonal = personalWith(["high", "max"]);
+    try {
+      const { server, calls } = bootScripted([
+        { error: { code: "native_timeout", message: "Reasoning level is required for model" } },
+        { result: {} },
+      ]);
+      await expect(applyModelSwitch(server, SID, VALUE)).rejects.toThrow(
+        "Reasoning level is required",
+      );
+      expect(calls.filter((call) => call.method === "session/setModel")).toHaveLength(1);
+    } finally {
+      fakePersonal = null;
+    }
+  });
+
   it("prefers the personal config's default (LAST value) over legacy config.json", async () => {
     // config.json is legacy-stale by design (3.12+ stopped syncing it); the
     // personal file is the registry's input. Default = values.at(-1), the

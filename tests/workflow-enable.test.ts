@@ -16,7 +16,10 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeMessage } from "../src/backend/types.js";
@@ -138,8 +141,15 @@ function makeServer(): {
   return { server, calls };
 }
 
+let allocationHome: string;
 beforeEach(() => {
+  allocationHome = mkdtempSync(path.join(tmpdir(), "zacp-workflow-allocation-"));
+  vi.stubEnv("ZCODE_HOME", path.join(allocationHome, ".zcode"));
   mockStore.clear();
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(allocationHome, { recursive: true, force: true });
 });
 
 describe("dynamic-workflow flag injection (gate enabled)", () => {

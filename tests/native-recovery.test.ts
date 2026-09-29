@@ -30,7 +30,9 @@ describe("native recovery invariants", () => {
     });
     try {
       await backend.close();
+      await Promise.all([backend.close(), backend.close()]);
       expect(kill).toHaveBeenCalledWith(-12345678, "SIGTERM");
+      expect(kill.mock.calls.filter((call) => call[1] === "SIGTERM")).toHaveLength(1);
       expect(present).toBe(false);
     } finally {
       kill.mockRestore();

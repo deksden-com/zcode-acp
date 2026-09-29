@@ -249,7 +249,7 @@ export abstract class JsonRpcChild implements BackendAdapter {
         error: {
           code,
           message: `${this.name} backend reader exited (backend dead)`,
-          data: { method: p.method },
+          data: { method: p.method, reason },
         },
       });
     }
@@ -365,7 +365,10 @@ export abstract class JsonRpcChild implements BackendAdapter {
     if (this.readerDead) {
       return {
         id,
-        error: { code: "native_backend_dead", message: `${this.name} backend reader exited (backend dead)` },
+        error: {
+          code: "native_backend_dead",
+          message: `${this.name} backend reader exited (backend dead)`,
+        },
       };
     }
     if (this.pending.has(id)) throw new Error(`Duplicate native request id ${id}`);
@@ -381,7 +384,11 @@ export abstract class JsonRpcChild implements BackendAdapter {
         } else this.pending.delete(id);
         resolve({
           id,
-          error: { code: "native_timeout", message: "timeout", data: { method, timeout_ms: timeoutMs } },
+          error: {
+            code: "native_timeout",
+            message: "timeout",
+            data: { method, timeout_ms: timeoutMs },
+          },
         });
       }, timeoutMs);
       this.pending.set(id, { resolve, timer, method, onLateResponse });

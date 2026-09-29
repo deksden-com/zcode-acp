@@ -31,7 +31,7 @@ it("stamps provenance without upstream refs and rejects a stale upstream pin", (
     const identity = JSON.parse(readFileSync(join(root, "dist/dd-harness-build.json"), "utf8"));
     expect(identity).toMatchObject({
       source_commit: git("rev-parse", "HEAD"),
-      upstream_commit: "230dcdf74aa021f37dd6d8e69023e7e2a77aed2a",
+      upstream_commit: "1ca2b5503f5cff6a28bf4dc283759b4806555529",
       dirty: false,
     });
     writeFileSync(

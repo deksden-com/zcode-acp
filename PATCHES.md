@@ -1,8 +1,8 @@
 # Downstream patch inventory
 
-## Current candidate: upstream v0.46.7
+## Current candidate: upstream v0.52.0
 
-Base: `230dcdf74aa021f37dd6d8e69023e7e2a77aed2a` (`v0.46.7`).
+Base: `1ca2b5503f5cff6a28bf4dc283759b4806555529` (`v0.52.0`).
 Integration branch: `main`. Contract: `dd-zcode-harness@2`.
 
 - Native inspection/control is isolated in `src/handlers/harness.ts`; registration
@@ -28,15 +28,18 @@ The old experiment was reviewed by behavior, not transplanted by file:
 
 | Retained behavior | Implementation / regression | Upstream removal condition |
 | --- | --- | --- |
-| Bidirectional RPC correlation, causal errors and bounded late observation | `backend/client.ts`, `backend/errors.ts`, `native-recovery.test.ts` | Equivalent routing and serialized errors, including pipe death and late create |
+| Bidirectional RPC correlation, causal errors and bounded late observation | `backend/jsonrpc-child.ts`, `backend/errors.ts`, `native-recovery.test.ts` | Equivalent routing and serialized errors, including pipe death and late create |
 | No duplicate allocation after unknown outcome or restart | `session-allocation.ts`, `ensureRealSession`, native-recovery/session-lazy tests | Native idempotency key or equivalent durable reconciliation |
 | No resume replay or model overlay on unknown outcome | Shared error classifier, existing resume single-flight; native-recovery tests | Equivalent outcome-aware native recovery |
 | Confirmed close settles only the captured turns, without stop/revival | harness close + PendingTurn flag, native-recovery tests | Equivalent upstream close primitive and turn settlement |
-| Cleanup checks process group, not just exited leader | backend close; native-recovery test | Equivalent owned-group teardown |
+| Cleanup checks process group, not just exited leader; idempotent teardown | shared transport close; native-recovery test | Equivalent owned-group teardown |
+| Native create has a 90-second budget and bounded late identity observation | `ensureRealSession`; native-recovery tests | Equivalent cold-start and outcome-safe create handling |
+| Managed silent turns stay unknown without native terminal evidence | `runEventTurn`; stale-running-recovery tests | Equivalent completion semantics, including frozen watermarks |
 | Distinguish inferred/failed completion from success | `_meta.zcodeCompletionEvidence`; stale-running-recovery tests | Standard completion-evidence representation |
 
-The adapter decides whether inferred completion is acceptable; the bridge has
-no `DD_FLOW_RUNTIME_OWNER` branch. Allocation notifications go only to the
+The adapter decides whether inferred completion is acceptable. For managed turns,
+the bridge retains an unknown outcome until native terminal evidence arrives;
+unmanaged editor recovery remains upstream-owned. Allocation notifications go only to the
 requesting resolve client. Late allocation updates identity, never starts a
 listener/model switch/prompt. The response-observation window is bounded to
 60 seconds after timeout; unresolved durable intents have no automatic expiry.
@@ -53,6 +56,22 @@ Original experiment: archive tag `archive/zcode-0.13.1-native-recovery`, commit
 `c1d26da`. It is unqualified historical evidence, not an active development
 branch. Original dirty checkout files remain untouched. Integration checks do
 not substitute for native tuple qualification.
+
+### v0.52.0 port review
+
+The upgrade branch starts at the exact tag above. Retained commits were
+cherry-picked from the v0.46.7 fork (the `cherry picked from` trailers preserve
+their source). Recovery moved to upstream's shared `JsonRpcChild`, not back into
+the ZCode dialect. The idempotent-close change from `c0eeed7` is included there
+with the recovery port. Async backend creation is awaited by every harness
+extension. Model-level fallback retains upstream's ladder, but never retries
+an unknown native outcome. Resume likewise dispatches only once on timeout.
+
+Removed as upstream-equivalent: our endpoint `startedAt` override. Upstream
+`processStartTime` preserves actual process birth, and hub registration retains
+the first finite value; remote-endpoint/hub tests cover this behavior. The
+obsolete unconditional background-stop patch remains omitted. No dirty changes
+from the old main checkout are included.
 
 ## Historical v0.43.2 overlay
 

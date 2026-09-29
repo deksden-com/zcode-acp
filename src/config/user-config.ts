@@ -142,6 +142,37 @@ export interface SandboxUserConfig {
   enabled?: boolean;
 }
 
+/** The `relay` sub-section of `push`: static-IP proxy for the WeCom API. */
+export interface PushRelayUserConfig {
+  /** Base URL — the push client calls `${url}/cgi-bin/…` through it. */
+  url?: string;
+  /** Shared secret sent as `x-relay-token` on every relayed call. */
+  token?: string;
+}
+
+/** The `notify` sub-section of `push`: per-kind settled-event switches. */
+export interface PushNotifyUserConfig {
+  turn?: boolean;
+  goal?: boolean;
+  run?: boolean;
+  task?: boolean;
+}
+
+/** The `push` section: offline WeCom notifications (push-backend-requirements §8). */
+export interface PushUserConfig {
+  /** true = push ACTIVE once credentials are complete (default false). */
+  enabled?: boolean;
+  corpId?: string;
+  agentId?: number;
+  secret?: string;
+  /** WeCom message recipient (user id, "@all", or a |-joined list). Default "@all". */
+  toUser?: string;
+  /** "minimal" strips business strings from bodies (content transits Tencent). */
+  contentDetail?: "full" | "minimal";
+  relay?: PushRelayUserConfig;
+  notify?: PushNotifyUserConfig;
+}
+
 export interface UserConfig {
   remote?: RemoteUserConfig;
   quota?: QuotaUserConfig;
@@ -155,6 +186,7 @@ export interface UserConfig {
   interaction?: InteractionUserConfig;
   sandbox?: SandboxUserConfig;
   tui?: TuiUserConfig;
+  push?: PushUserConfig;
 }
 
 /** Resolve the config file path: $XDG_CONFIG_HOME/zcode-acp or ~/.config/zcode-acp. */
@@ -311,8 +343,65 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
     const stats = body["stats"];
     if (stats === undefined) return {};
     if (typeof stats === "string") return { stats };
-    warn(`config: ${label}.stats=${JSON.stringify(stats)} in ${file} is not a string — ignoring`);
+    warn(`config: ${label}.stats=${JSON.stringify(stats)} is not a string — ignoring`);
     return {};
+  });
+
+  result.push = parseSection(parsed, "push", file, (body, label) => {
+    const p: PushUserConfig = {};
+    if (body["enabled"] === undefined) {
+      // absent — fine
+    } else if (typeof body["enabled"] === "boolean") {
+      p.enabled = body["enabled"];
+    } else {
+      warn(
+        `config: ${label}.enabled=${JSON.stringify(body["enabled"])} is not a boolean — ignoring`,
+      );
+    }
+    for (const key of ["corpId", "secret", "toUser"] as const) {
+      const v = body[key];
+      if (typeof v === "string" && v.trim()) p[key] = v.trim();
+    }
+    const agentId = parseIntField(body["agentId"], 1, `${label}.agentId`, file);
+    if (agentId !== undefined) p.agentId = agentId;
+    const detail = body["contentDetail"];
+    if (detail !== undefined) {
+      if (detail === "full" || detail === "minimal") p.contentDetail = detail;
+      else
+        warn(
+          `config: ${label}.contentDetail=${JSON.stringify(detail)} is not "full"/"minimal" — ignoring`,
+        );
+    }
+    const relay = body["relay"];
+    if (relay !== undefined) {
+      if (!isPlainObject(relay)) {
+        warn(`config: ${label}.relay in ${file} is not an object — ignoring`);
+      } else {
+        const r: PushRelayUserConfig = {};
+        for (const key of ["url", "token"] as const) {
+          const v = relay[key];
+          if (typeof v === "string" && v.trim()) r[key] = v.trim();
+        }
+        if (Object.keys(r).length > 0) p.relay = r;
+      }
+    }
+    const notify = body["notify"];
+    if (notify !== undefined) {
+      if (!isPlainObject(notify)) {
+        warn(`config: ${label}.notify in ${file} is not an object — ignoring`);
+      } else {
+        const n: PushNotifyUserConfig = {};
+        for (const key of ["turn", "goal", "run", "task"] as const) {
+          const v = notify[key];
+          if (v === undefined) continue;
+          if (typeof v === "boolean") n[key] = v;
+          else
+            warn(`config: ${label}.notify.${key}=${JSON.stringify(v)} is not a boolean — ignoring`);
+        }
+        if (Object.keys(n).length > 0) p.notify = n;
+      }
+    }
+    return p;
   });
 
   // Drop the empty section shells so consumers' `??` fallbacks stay honest.

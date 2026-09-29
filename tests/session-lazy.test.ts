@@ -76,7 +76,7 @@ vi.mock("../src/lazy-sessions.js", () => ({
 let allocationHome: string;
 beforeEach(() => {
   allocationHome = mkdtempSync(path.join(tmpdir(), "zacp-allocation-test-"));
-  vi.stubEnv("ZCODE_HOME", allocationHome);
+  vi.stubEnv("ZCODE_HOME", path.join(allocationHome, ".zcode"));
   mockStore.clear();
   // Keep the create-mode assertions deterministic on a machine that exports
   // ZCODE_ACP_MODE; the per-test stub below still overrides this.

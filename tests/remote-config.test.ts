@@ -7,7 +7,7 @@
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -83,6 +83,7 @@ describe("parseRemoteConfig (env fallback — no config file)", () => {
       hubPort: DEFAULT_HUB_PORT,
       hubHost: DEFAULT_HUB_HOST,
       bridgePort: DEFAULT_BRIDGE_PORT,
+      webDir: "",
       origin: "editor",
       pinCwd: false,
     });
@@ -114,9 +115,17 @@ describe("parseRemoteConfig (env fallback — no config file)", () => {
       hubPort: 9000,
       hubHost: "0.0.0.0",
       bridgePort: 9001,
+      webDir: "",
       origin: "editor",
       pinCwd: false,
     });
+  });
+
+  it("reads webDir from env, trims it, and expands a leading ~", () => {
+    const config = parseRemoteConfig(env({ ...BASE_ENV, ZCODE_ACP_WEB_DIR: "  /srv/web-dist  " }));
+    expect(config?.webDir).toBe("/srv/web-dist");
+    const tilded = parseRemoteConfig(env({ ...BASE_ENV, ZCODE_ACP_WEB_DIR: "~/env-dist" }));
+    expect(tilded?.webDir).toBe(path.join(homedir(), "env-dist"));
   });
 
   it("reads the hub-incubation overrides (origin, cwd pin) — ADR-0016", () => {
@@ -154,6 +163,7 @@ describe("parseRemoteConfig (config file > env)", () => {
         hubPort: 9001,
         hubHost: "10.0.0.1",
         bridgePort: 9002,
+        webDir: "/srv/file-dist",
       },
     });
     const config = parseRemoteConfig(
@@ -162,6 +172,7 @@ describe("parseRemoteConfig (config file > env)", () => {
         ZCODE_ACP_HUB_PORT: "9000",
         ZCODE_ACP_HUB_HOST: "0.0.0.0",
         ZCODE_ACP_REMOTE_PORT: "9003",
+        ZCODE_ACP_WEB_DIR: "/srv/env-dist",
       }),
     );
     expect(config).toEqual({
@@ -169,6 +180,7 @@ describe("parseRemoteConfig (config file > env)", () => {
       hubPort: 9001,
       hubHost: "10.0.0.1",
       bridgePort: 9002,
+      webDir: "/srv/file-dist",
       origin: "editor",
       pinCwd: false,
     });

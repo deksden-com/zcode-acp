@@ -118,3 +118,64 @@ describe("model configOptions uniqueness", () => {
     expect(loadAllModels()).toHaveLength(2);
   });
 });
+
+describe("thought option display clamp", () => {
+  it("never advertises a current outside the model's available levels (stale after setModel)", async () => {
+    // The runtime can briefly keep the PREVIOUS model's thoughtLevel after a
+    // setModel (upstream clamps its own snapshot for the same reason). The
+    // bridge must not relay the stale value: the CLI would display — and
+    // re-send — the old model's level.
+    const server = new ZcodeAcpServer();
+    server.backend = {
+      isDead: false,
+      request: async () => ({
+        result: {
+          settings: {
+            mode: { current: "build" },
+            model: { current: { providerId: "builtin:zai-coding-plan", modelId: "GLM-5.3" } },
+            thoughtLevel: {
+              current: "max", // stale: the previous model's level
+              defaultLevel: "high",
+              available: [
+                { value: "low", label: "Low" },
+                { value: "high", label: "High" },
+              ],
+            },
+          },
+        },
+      }),
+    } as unknown as NonNullable<ZcodeAcpServer["backend"]>;
+
+    const options = await buildConfigOptions(server, "zc-clamp-1");
+    const thought = options.find((option) => option.id === "thought");
+    expect(thought?.currentValue).toBe("high");
+    expect(thought?.options.map((option) => option.value)).toEqual(["low", "high"]);
+  });
+
+  it("falls back to the first available level when the default is also outside the list", async () => {
+    const server = new ZcodeAcpServer();
+    server.backend = {
+      isDead: false,
+      request: async () => ({
+        result: {
+          settings: {
+            mode: { current: "build" },
+            model: { current: { providerId: "builtin:zai-coding-plan", modelId: "GLM-5.3" } },
+            thoughtLevel: {
+              current: "max",
+              defaultLevel: "max", // stale too
+              available: [
+                { value: "enabled", label: "Enabled" },
+                { value: "off", label: "Off" },
+              ],
+            },
+          },
+        },
+      }),
+    } as unknown as NonNullable<ZcodeAcpServer["backend"]>;
+
+    const options = await buildConfigOptions(server, "zc-clamp-2");
+    const thought = options.find((option) => option.id === "thought");
+    expect(thought?.currentValue).toBe("enabled");
+  });
+});

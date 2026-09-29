@@ -38,6 +38,16 @@ import {
 const TOKEN = "test-hub-token";
 const BASE_PORT = 18400; // bridge ports start here; ephemeral hub uses port 0
 
+// This file spawns real child processes and binds real ports, and the shutdown
+// tests wait on SIGTERM'd children to actually exit. Under full-suite parallel
+// load that scheduling can outrun vitest's 5s default, and an inner withTimeout
+// equal to the outer budget can never win against it — the failure then blames
+// the inner step instead of the load.
+vi.setConfig({ testTimeout: 20_000 });
+
+/** Inner wait budget: the same 20s as the file timeout, so it can fire first. */
+const STEP_MS = 20_000;
+
 const cleanups: Array<() => Promise<void> | void> = [];
 
 function track<T>(value: T, stop: (v: T) => Promise<void> | void): T {
@@ -174,6 +184,37 @@ describe("hub discovery API", () => {
     });
     expect(badPayload.status).toBe(400);
     expect((await listInstances(hub)).status === 200).toBe(true);
+  });
+
+  it("takes the registrant's own startedAt over its own clock", async () => {
+    // The tie-break that decides which bridge wins a shared session ranks by
+    // start time. Stamping the hub's `Date.now()` at first register instead
+    // would rank by when the register ARRIVED, and a bridge whose cold start
+    // was slow (provider sync) would beat one that really started later — the
+    // wrong bridge wins and clients attach where nothing is live.
+    const hub = await startTestHub();
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ startedAt: 1_700_000_000_000 })),
+    });
+    expect(res.status).toBe(200);
+    const list = (await (await listInstances(hub)).json()) as Array<{ startedAt: number }>;
+    expect(list[0]!.startedAt).toBe(1_700_000_000_000);
+  });
+
+  it("falls back to its own clock when the register omits startedAt", async () => {
+    // Older bridges never sent it; the entry still needs a usable timestamp.
+    const hub = await startTestHub();
+    const before = Date.now();
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody()),
+    });
+    expect(res.status).toBe(200);
+    const list = (await (await listInstances(hub)).json()) as Array<{ startedAt: number }>;
+    expect(list[0]!.startedAt).toBeGreaterThanOrEqual(before);
   });
 
   it("preserves startedAt across heartbeats and removes on unregister", async () => {
@@ -662,6 +703,98 @@ describe("hub session rename proxy", () => {
   });
 });
 
+describe("hub backend restart proxy", () => {
+  /** Register a bridge under the canonical test instance id. */
+  async function registerBridge(hub: HubHandle, port: number): Promise<void> {
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port })),
+    });
+    expect(res.status).toBe(200);
+  }
+
+  /**
+   * Fake bridge loopback server accepting the restart the settings endpoint
+   * exposes at `POST /settings/backend/restart`. The hub's documented spelling
+   * omits the `/settings/` segment, so what is under test is the rewrite.
+   */
+  function startRestartBridge(): Promise<{ server: Server; port: number; seen: string[] }> {
+    return new Promise((resolve) => {
+      const seen: string[] = [];
+      const server = createServer((req, res) => {
+        seen.push(`${req.method} ${req.url ?? ""}`);
+        if (req.method === "POST" && req.url === "/settings/backend/restart") {
+          req.resume();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end('{"ok":true,"cancelledTurns":2}');
+        } else {
+          req.resume();
+          res.writeHead(404, { "Content-Type": "text/plain" });
+          res.end("not found");
+        }
+      });
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        resolve({
+          server,
+          port: typeof addr === "object" && addr ? addr.port : 0,
+          seen,
+        });
+      });
+    });
+  }
+
+  it("routes the documented instance restart spelling to the bridge", async () => {
+    const hub = await startTestHub();
+    const bridge = track(
+      await startRestartBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await registerBridge(hub, bridge.port);
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/backend/restart`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, cancelledTurns: 2 });
+    // The hub rewrites the documented path onto the bridge's settings route.
+    expect(bridge.seen).toEqual(["POST /settings/backend/restart"]);
+  });
+
+  it("guards the restart route and answers 404 for an unknown instance", async () => {
+    const hub = await startTestHub();
+    const call = (token: string | null, id = "inst-1") =>
+      fetch(`http://127.0.0.1:${hub.port}/api/instances/${id}/backend/restart`, {
+        method: "POST",
+        ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+      });
+    expect((await call(null)).status).toBe(401);
+    expect((await call("wrong")).status).toBe(401);
+    expect((await call(TOKEN)).status).toBe(404);
+    // A GET is not a restart — it must not reach the bridge.
+    const get = await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/backend/restart`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(get.status).toBe(404);
+  });
+
+  it("also serves the per-instance /settings/ spelling", async () => {
+    const hub = await startTestHub();
+    const bridge = track(
+      await startRestartBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await registerBridge(hub, bridge.port);
+    const res = await fetch(
+      `http://127.0.0.1:${hub.port}/api/instances/inst-1/settings/backend/restart`,
+      { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } },
+    );
+    expect(res.status).toBe(200);
+    expect(bridge.seen).toEqual(["POST /settings/backend/restart"]);
+  });
+});
+
 describe("hub idle exit", () => {
   it("exits after the idle window with no instances and no proxies", async () => {
     let exited = false;
@@ -751,16 +884,18 @@ describe("hub instance shutdown", () => {
     const { child, pid } = await startDummyBridge();
     await registerInstance(hub, pid, { origin: "serve" });
 
+    // Attach the listener BEFORE the kill: SIGTERM lands in ~0ms, so an
+    // `await shutdown()` first would let the dummy die and replay nothing for a
+    // late `once("exit")` — the test then hangs until timeout even though the
+    // shutdown worked exactly as intended.
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+
     const res = await shutdown(hub);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
 
     // SIGTERM'd → the process exits and the instance leaves the registry.
-    await withTimeout(
-      new Promise<void>((resolve) => child.once("exit", () => resolve())),
-      5000,
-      "dummy bridge exit",
-    );
+    await withTimeout(exited, STEP_MS, "dummy bridge exit");
     const list = await (await listInstances(hub)).json();
     expect(list).toHaveLength(0);
   });
@@ -801,24 +936,24 @@ describe("hub instance shutdown", () => {
     const res = await shutdown(hub);
     expect(res.status).toBe(200);
 
-    await withTimeout(cliExited, 5000, "tui cli exit");
-    await withTimeout(bridgeExited, 5000, "bridge exit");
+    await withTimeout(cliExited, STEP_MS, "tui cli exit");
+    await withTimeout(bridgeExited, STEP_MS, "bridge exit");
     const list = await (await listInstances(hub)).json();
     expect(list).toHaveLength(0);
-  }, 15_000);
+  });
 
   it("kills an editor-origin bridge that carries an incubation nonce", async () => {
     const hub = await startTestHub();
     const { child, pid } = await startDummyBridge();
     await registerInstance(hub, pid, { origin: "editor", nonce: "nonce-1" });
 
+    // Before the kill, for the same reason as the serve-origin case above: a
+    // late `once("exit")` misses an event the kernel already delivered.
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+
     expect((await shutdown(hub)).status).toBe(200);
-    await withTimeout(
-      new Promise<void>((resolve) => child.once("exit", () => resolve())),
-      5000,
-      "dummy bridge exit",
-    );
-  }, 15_000);
+    await withTimeout(exited, STEP_MS, "dummy bridge exit");
+  });
 
   it("refuses an editor-origin bridge without a nonce (403)", async () => {
     const hub = await startTestHub();

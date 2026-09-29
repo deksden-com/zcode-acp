@@ -7,8 +7,8 @@
  * removed them in favor of the v4 conversation API, so the bridge dropped
  * them. The bridge's own `session/updateRuntimeModelConfig` passthrough was
  * removed 2026-09: the method is absent from the 0.16.9 enum — every call
- * answered -32601 — and `applyModelSwitch` already speaks the modern
- * `session/setModel` shape with a legacy fallback.)
+ * answered -32601 — and `applyModelSwitch` already speaks the strict modern
+ * `session/setModel` shape.)
  *
  * These share a near-identical shape (resolve sid → build params → forward →
  * check error). Only the genuine per-method differences are spelled out:
@@ -32,6 +32,7 @@ import { recordMaterializedSession } from "../lazy-sessions.js";
 import { ProjectionDiffer } from "../translators/projection-differ.js";
 import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
+import { emitSessionTurnState } from "./io.js";
 import { cacheModelAvailability, ensureRealSession } from "./session.js";
 
 /** Build the zcode `target` object from ACP params (checkpoint or latest). */
@@ -62,7 +63,7 @@ type Result = Record<string, unknown>;
 /** session/fork → zcode session/fork: branch a new session from a checkpoint. */
 export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
   const zcodeSid = await resolveSidOrThrow(server, params);
-  const backend = server.ensureBackend();
+  const backend = await server.ensureBackend();
   const resp = await backend.request(
     server.nextId(),
     "session/fork",
@@ -91,7 +92,7 @@ export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Pro
       server.sessionCwds.set(result.forkedSessionId, cwd);
       recordMaterializedSession(result.forkedSessionId, result.forkedSessionId, cwd);
     }
-    server.ensureBackgroundListener(result.forkedSessionId);
+    await server.ensureBackgroundListener(result.forkedSessionId);
   }
   log(`session/fork → ${result.forkedSessionId ?? "?"}`);
   return result;
@@ -105,9 +106,9 @@ export async function goal(server: ZcodeAcpServer, params: ExtensionParams): Pro
   if ((action === "set" || action === "replace") && params.objective !== undefined) {
     zcParams.objective = params.objective;
   }
-  const resp = await server
-    .ensureBackend()
-    .request(server.nextId(), "session/goal", zcParams, 15000);
+  const resp = await (
+    await server.ensureBackend()
+  ).request(server.nextId(), "session/goal", zcParams, 15000);
   if (resp.error) throw backendError("session/goal", resp, zcodeSid);
   // set/replace start an internal AI turn → wait for the prompt lock to release.
   if (action === "set" || action === "replace") {
@@ -125,7 +126,19 @@ export async function goal(server: ZcodeAcpServer, params: ExtensionParams): Pro
   return (resp.result ?? {}) as Result;
 }
 
-/** session/compact → zcode session/compact + wait for the internal AI turn. */
+/**
+ * session/compact → zcode session/compact + wait for the internal AI turn.
+ *
+ * The compaction window is reported as BUSY to EVERY client, not just the
+ * caller's: without the raise below, a manual /compact (or a direct
+ * session/compact call) left the session reading idle for the whole internal
+ * AI turn — clients offered Send, the prompt hit the backend's compact lock
+ * (-32010), and the busy-retry died as "backend still busy" instead of
+ * queueing. Registering the same in-flight flag auto-compact uses also puts
+ * manual compactions inside the prompt path's hold (runPrompt's
+ * waitForAutoCompactIdle), so even a client that sends anyway gets the
+ * queued-notice semantics, never the error.
+ */
 export async function compact(
   server: ZcodeAcpServer,
   params: ExtensionParams,
@@ -133,6 +146,29 @@ export async function compact(
 ): Promise<Result> {
   const acpSid = params.sessionId;
   const zcodeSid = await resolveSidOrThrow(server, params);
+  server.autoCompactInFlight.add(zcodeSid);
+  await emitSessionTurnState(server, acpSid, true);
+  try {
+    return await runCompact(server, params, cx, acpSid, zcodeSid);
+  } finally {
+    // Both releases are safe to be last-write-wins: the lock the compaction
+    // held is gone by the time we get here, and an auto-compact caller that
+    // raised its own flag settles again in its own finally (idempotent
+    // running:false; a prompt held at the gate follows with its own
+    // running:true within one UI frame).
+    server.autoCompactInFlight.delete(zcodeSid);
+    await emitSessionTurnState(server, acpSid, false);
+  }
+}
+
+/** The compact body, separated so the busy raise/settle above cannot be bypassed. */
+async function runCompact(
+  server: ZcodeAcpServer,
+  params: ExtensionParams,
+  cx: acp.AgentContext,
+  acpSid: string,
+  zcodeSid: string,
+): Promise<Result> {
   // `/compact <focus>` (or a direct ACP call) forwards the focus text as
   // compact instructions (0.16.9 params: {sessionId, inputId?, instructions?,
   // expectedRevision?}).
@@ -140,9 +176,9 @@ export async function compact(
   const instructions = typeof params.instructions === "string" ? params.instructions.trim() : "";
   if (instructions) zcParams.instructions = instructions;
   const startedAt = Date.now();
-  const resp = await server
-    .ensureBackend()
-    .request(server.nextId(), "session/compact", zcParams, 30000);
+  const resp = await (
+    await server.ensureBackend()
+  ).request(server.nextId(), "session/compact", zcParams, 30000);
   if (resp.error) throw backendError("session/compact", resp, zcodeSid);
   const ack = ((resp.result ?? {}) as { compact?: { state?: string } }).compact?.state;
   const alreadyRunning = ack === "already_running";
@@ -206,14 +242,14 @@ export async function cancelBackgroundTask(
   const zcodeSid = await resolveSidOrThrow(server, params);
   const taskId = String(params.taskId ?? "");
   if (!taskId) throw new Error("cancelBackgroundTask requires taskId");
-  const resp = await server
-    .ensureBackend()
-    .request(
-      server.nextId(),
-      "session/cancelBackgroundTask",
-      { sessionId: zcodeSid, taskId },
-      15000,
-    );
+  const resp = await (
+    await server.ensureBackend()
+  ).request(
+    server.nextId(),
+    "session/cancelBackgroundTask",
+    { sessionId: zcodeSid, taskId },
+    15000,
+  );
   if (resp.error) throw backendError("session/cancelBackgroundTask", resp, zcodeSid);
   // Reflect the cancellation on the ACP tool card (status:failed + cancelled
   // flag) and clear the background listener's local tracking. Best-effort.
@@ -236,9 +272,9 @@ export async function setThoughtLevel(
   // default). Forward it only when present so a reset call isn't rejected.
   const zcParams: Record<string, unknown> = { sessionId: zcodeSid };
   if (params.thoughtLevel !== undefined) zcParams.thoughtLevel = params.thoughtLevel;
-  const resp = await server
-    .ensureBackend()
-    .request(server.nextId(), "session/setThoughtLevel", zcParams, 15000);
+  const resp = await (
+    await server.ensureBackend()
+  ).request(server.nextId(), "session/setThoughtLevel", zcParams, 15000);
   if (resp.error) throw backendError("session/setThoughtLevel", resp, zcodeSid);
   log("session/setThoughtLevel → ok");
   // Remember for the post-resume re-assert (the backend's own selection
@@ -255,8 +291,8 @@ export async function setThoughtLevel(
   return (resp.result ?? {}) as Result;
 }
 
-/** session/setModel → applyModelSwitch (modern session/setModel shape first,
- * legacy overlay fallback for pre-3.12 builds). */
+/** session/setModel → applyModelSwitch (the strict modern shape — 0.16.9
+ * rejects the legacy overlay keys outright, so no fallback exists). */
 export async function setModel(
   server: ZcodeAcpServer,
   params: ExtensionParams,
@@ -290,9 +326,9 @@ export async function setMode(
   // -32601 when it wasn't routed, so both normalize here.
   const mode = params.mode ?? params.modeId;
   if (!mode) throw new Error("setMode requires mode");
-  const resp = await server
-    .ensureBackend()
-    .request(server.nextId(), "session/setMode", { sessionId: zcodeSid, mode }, 15000);
+  const resp = await (
+    await server.ensureBackend()
+  ).request(server.nextId(), "session/setMode", { sessionId: zcodeSid, mode }, 15000);
   if (resp.error) throw backendError("session/setMode", resp, zcodeSid);
   log(`session/setMode → ${mode}`);
   // Re-build configOptions (settings.mode.current is now updated) and emit
@@ -333,7 +369,7 @@ export async function waitForTurnIdle(
   expectLock: boolean,
   graceMs = 30_000,
 ): Promise<boolean> {
-  const backend = server.ensureBackend();
+  const backend = await server.ensureBackend();
   const t0 = Date.now();
   let lockSeen = !expectLock;
   let probeCount = 0;

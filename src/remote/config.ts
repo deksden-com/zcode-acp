@@ -27,6 +27,9 @@
  *                                   (file `remote.terminal.terminals` wins;
  *                                   tried in order before going headless)
  *     ZCODE_ACP_HUB_TERMINAL_COMMAND=<sh> shell command template ({script})
+ *     ZCODE_ACP_WEB_DIR=<abs path>  web-client dist for same-origin hosting
+ *                                   (file `remote.webDir` wins; empty = off;
+ *                                   a leading ~ is expanded to the home dir)
  *   3. Built-in defaults.
  *
  * Process-role plumbing stays env-only by design (never file-configurable):
@@ -35,7 +38,7 @@
  *   ZCODE_ACP_RESUME_SESSION=<id>  per-request boot-resume target (ADR-0017)
  */
 
-import { loadUserConfig, type TerminalPrefs } from "../config/user-config.js";
+import { expandHomePath, loadUserConfig, type TerminalPrefs } from "../config/user-config.js";
 import { warn } from "../utils.js";
 
 export interface RemoteConfig {
@@ -50,6 +53,11 @@ export interface RemoteConfig {
    * instances per workspace and label them for remote clients.
    */
   origin: "editor" | "serve";
+  /**
+   * Absolute path of a web-client build the hub serves same-origin
+   * ("" = static hosting off; consumed by the hub only).
+   */
+  webDir: string;
   /**
    * Pin every session root to the process cwd (serveMode for the bridge).
    * Set by the hub when it incubates a REPL in a visible terminal
@@ -74,12 +82,13 @@ function parsePort(raw: string | undefined, fallback: number, envName: string): 
   return port;
 }
 
-/** Shared file>env merge for token/ports/host (already validated by the loader). */
+/** Shared file>env merge for token/ports/host/webDir (already validated by the loader). */
 function mergeCommon(env: NodeJS.ProcessEnv): {
   token: string;
   hubPort: number;
   hubHost: string;
   bridgePort: number;
+  webDir: string;
 } {
   const file = loadUserConfig(env).remote ?? {};
   return {
@@ -90,13 +99,14 @@ function mergeCommon(env: NodeJS.ProcessEnv): {
     bridgePort:
       file.bridgePort ??
       parsePort(env.ZCODE_ACP_REMOTE_PORT, DEFAULT_BRIDGE_PORT, "ZCODE_ACP_REMOTE_PORT"),
+    webDir: file.webDir ?? expandHomePath((env.ZCODE_ACP_WEB_DIR ?? "").trim()),
   };
 }
 
 /** Parse remote config; null = disabled (or misconfigured → warned). */
 export function parseRemoteConfig(env: NodeJS.ProcessEnv = process.env): RemoteConfig | null {
   if (!remoteEnabledLive(env)) return null;
-  const { token, hubPort, hubHost, bridgePort } = mergeCommon(env);
+  const { token, hubPort, hubHost, bridgePort, webDir } = mergeCommon(env);
   if (!token) {
     warn(
       "remote: enabled but no token (config file or ZCODE_ACP_REMOTE_TOKEN) — " +
@@ -109,6 +119,7 @@ export function parseRemoteConfig(env: NodeJS.ProcessEnv = process.env): RemoteC
     hubPort,
     hubHost,
     bridgePort,
+    webDir,
     origin: (env.ZCODE_ACP_REMOTE_ORIGIN ?? "").trim() === "serve" ? "serve" : "editor",
     pinCwd: (env.ZCODE_ACP_REMOTE_PIN_CWD ?? "").trim() === "1",
   };
@@ -129,7 +140,7 @@ export function remoteEnabledLive(env: NodeJS.ProcessEnv = process.env): boolean
 
 /** Parse hub-side config for the standalone hub entry (`zcode-acp hub`). */
 export function parseHubConfig(env: NodeJS.ProcessEnv = process.env): RemoteConfig | null {
-  const { token, hubPort, hubHost, bridgePort } = mergeCommon(env);
+  const { token, hubPort, hubHost, bridgePort, webDir } = mergeCommon(env);
   if (!token) {
     warn("hub: no token (config file or ZCODE_ACP_REMOTE_TOKEN) — refusing to start without auth");
     return null;
@@ -139,6 +150,7 @@ export function parseHubConfig(env: NodeJS.ProcessEnv = process.env): RemoteConf
     hubPort,
     hubHost,
     bridgePort,
+    webDir,
     origin: "editor",
     pinCwd: false,
   };

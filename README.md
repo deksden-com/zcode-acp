@@ -4,7 +4,7 @@
 
 This is [deksden-com/zcode-acp](https://github.com/deksden-com/zcode-acp), based on
 [william0wang/zcode-acp](https://github.com/william0wang/zcode-acp). This candidate
-incorporates upstream **v0.46.7** and exposes `dd-zcode-harness@2` native evidence
+incorporates upstream **v0.52.0** and exposes `dd-zcode-harness@2` native evidence
 through `src/handlers/harness.ts`. Usage accounting and integration policy live
 in the consumer adapter. The upstream badges below do not certify our fork.
 
@@ -303,7 +303,7 @@ Thanks to everyone who has contributed (updated automatically from the
 <a href="https://github.com/william0wang/zcode-acp/graphs/contributors">
   <!-- release-please re-stamps &v= on every release: the new URL busts the
        contrib.rocks and GitHub camo image caches. -->
-  <img src="https://contrib.rocks/image?repo=william0wang/zcode-acp&v=0.46.7" alt="Contributors" /> <!-- x-release-please-version -->
+  <img src="https://contrib.rocks/image?repo=william0wang/zcode-acp&v=0.52.0" alt="Contributors" /> <!-- x-release-please-version -->
 </a>
 
 ## Related Projects

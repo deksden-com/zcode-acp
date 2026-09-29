@@ -16,7 +16,8 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import { ZCODE_CREDS_PATH } from "../src/utils.js";
+import { ZcodeAcpServer } from "../src/server.js";
+import { ZCODE_CREDS_PATH, zcodePersonalProviderPath } from "../src/utils.js";
 
 /**
  * Fake config.json. Enabled builtins carry their plan token in options.apiKey
@@ -104,24 +105,40 @@ const FAKE_CONFIG = {
 /** Swapped by tests that need a different config.json (see #156 fallback). */
 let fakeConfig: unknown = FAKE_CONFIG;
 
+/** Swapped by tests that need a personal provider_config.json; null = absent. */
+let fakePersonal: unknown = null;
+
 vi.mock("node:fs", async () => {
   const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
   return {
     ...actual,
     readFileSync: (p: string) => {
       if (p === ZCODE_CREDS_PATH) return JSON.stringify(fakeConfig);
+      if (p === zcodePersonalProviderPath() && fakePersonal !== null) {
+        return JSON.stringify(fakePersonal);
+      }
       return actual.readFileSync(p);
     },
   };
 });
 
 // Import AFTER vi.mock is set up.
-const { loadAllModels, modelContextWindow, parseModelValue, formatModelValue, buildRuntimeModel } =
-  await import("../src/config/options.js").then(async () => {
-    const opts = await import("../src/config/options.js");
-    const rm = await import("../src/config/runtime-model.js");
-    return { ...opts, buildRuntimeModel: rm.buildRuntimeModel };
-  });
+const {
+  loadAllModels,
+  modelContextWindow,
+  parseModelValue,
+  formatModelValue,
+  buildRuntimeModel,
+  applyModelSwitch,
+} = await import("../src/config/options.js").then(async () => {
+  const opts = await import("../src/config/options.js");
+  const rm = await import("../src/config/runtime-model.js");
+  return {
+    ...opts,
+    buildRuntimeModel: rm.buildRuntimeModel,
+    applyModelSwitch: rm.applyModelSwitch,
+  };
+});
 
 describe("loadAllModels", () => {
   it("collects enabled builtins + active custom providers", () => {
@@ -285,5 +302,129 @@ describe("buildRuntimeModel", () => {
 
     const modelIds = rm.provider.models.map((m) => m.modelId);
     expect(modelIds).toEqual(["model-a", "model-b"]);
+  });
+});
+
+describe("applyModelSwitch level candidates (file sources)", () => {
+  const VALUE = "custom-provider-alpha\\alpha-1";
+  const SID = "zc-alpha-1";
+
+  /** Fake backend answering session/setModel from a scripted sequence. */
+  function bootScripted(responses: Array<Record<string, unknown>>) {
+    let attempt = 0;
+    const server = new ZcodeAcpServer();
+    const calls: Array<Record<string, unknown>> = [];
+    server.backend = {
+      isDead: false,
+      request: async (_id: number, method: string, params: Record<string, unknown>) => {
+        calls.push({ method, params });
+        if (method !== "session/setModel") return { result: {} };
+        return attempt < responses.length
+          ? (responses[attempt++] ?? { result: {} })
+          : { result: {} };
+      },
+    } as unknown as NonNullable<ZcodeAcpServer["backend"]>;
+    return { server, calls };
+  }
+  const levelOf = (params: Record<string, unknown>): string | undefined =>
+    ((params["model"] as { options?: { reasoningLevel?: string } })?.options ?? {}).reasoningLevel;
+  const personalWith = (values: string[]) => ({
+    config: {
+      modelConfigRules: {
+        providerModelRules: [
+          {
+            providerId: "custom-provider-alpha",
+            modelId: "alpha-1",
+            config: { optionSpecs: { reasoningLevel: { values } } },
+          },
+        ],
+      },
+    },
+  });
+
+  it("never retries the level ladder after an unknown setModel outcome", async () => {
+    fakePersonal = personalWith(["high", "max"]);
+    try {
+      const { server, calls } = bootScripted([
+        { error: { code: "native_timeout", message: "Reasoning level is required for model" } },
+        { result: {} },
+      ]);
+      await expect(applyModelSwitch(server, SID, VALUE)).rejects.toThrow(
+        "Reasoning level is required",
+      );
+      expect(calls.filter((call) => call.method === "session/setModel")).toHaveLength(1);
+    } finally {
+      fakePersonal = null;
+    }
+  });
+
+  it("prefers the personal config's default (LAST value) over legacy config.json", async () => {
+    // config.json is legacy-stale by design (3.12+ stopped syncing it); the
+    // personal file is the registry's input. Default = values.at(-1), the
+    // upstream rule (model-catalog-port.ts).
+    fakeConfig = {
+      provider: {
+        "custom-provider-alpha": {
+          ...FAKE_CONFIG.provider["custom-provider-alpha"]!,
+          models: {
+            "alpha-1": {
+              reasoning: {
+                enabled: true,
+                variants: ["stale-level", "high"],
+                defaultVariant: "stale-level",
+              },
+            },
+          },
+        },
+      },
+    };
+    fakePersonal = personalWith(["high", "max", "low"]);
+    try {
+      const { server, calls } = bootScripted([{ result: {} }]);
+      await expect(applyModelSwitch(server, SID, VALUE)).resolves.toBe(true);
+      const first = calls.find((c) => c.method === "session/setModel")!;
+      expect(levelOf(first.params)).toBe("low");
+    } finally {
+      fakeConfig = FAKE_CONFIG;
+      fakePersonal = null;
+    }
+  });
+
+  it("recovers when a stale config.json default is rejected by the registry", async () => {
+    // The observed 2026-09-28 failure shape: config.json says defaultVariant
+    // "max", the live registry def has no such level. Ladder: max → rejected,
+    // omission → level-required, remaining variant "high" → accepted.
+    fakeConfig = {
+      provider: {
+        "custom-provider-alpha": {
+          ...FAKE_CONFIG.provider["custom-provider-alpha"]!,
+          models: {
+            "alpha-1": {
+              reasoning: { enabled: true, variants: ["high"], defaultVariant: "max" },
+            },
+          },
+        },
+      },
+    };
+    try {
+      const { server, calls } = bootScripted([
+        {
+          error: {
+            message: 'Reasoning effort "max" is not supported by custom-provider-alpha/alpha-1',
+          },
+        },
+        { error: { message: "Reasoning level is required for custom-provider-alpha/alpha-1" } },
+        { result: {} },
+      ]);
+      await expect(applyModelSwitch(server, SID, VALUE)).resolves.toBe(true);
+      const setModels = calls.filter((c) => c.method === "session/setModel");
+      expect(setModels).toHaveLength(3);
+      expect(levelOf(setModels[0]!.params)).toBe("max");
+      expect(levelOf(setModels[1]!.params)).toBeUndefined();
+      expect(levelOf(setModels[2]!.params)).toBe("high");
+    } finally {
+      fakeConfig = FAKE_CONFIG;
+      fakePersonal = null;
+    }
   });
 });

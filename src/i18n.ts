@@ -205,6 +205,8 @@ export interface Messages {
   /** Editor slash-command menu: localized descriptions for the static
    *  commands (names and argument hints stay as-is — they are tokens). */
   slashCommandDescriptions: Record<string, string>;
+  /** /workflow · /workflows with the dynamic-workflow gate disabled/pending. */
+  workflowDisabled: string;
   /** Auto-compaction status lines. */
   autoCompactStart: (used: string, threshold: string) => string;
   autoCompactTimeout: string;
@@ -214,8 +216,13 @@ export interface Messages {
    *  session_compact_failed/cancelled) — fed into autoCompactFailed. */
   autoCompactBackendFailed: string;
   /** Prompt rejection notice: a detached auto-compact is running, the message
-   * was NOT sent — resend after the ✓ compressed line. */
+   *  was NOT sent — resend after the ✓ compressed line. Now only the bounded
+   *  fallback (a compaction that outlived its settle cap) answers this. */
   autoCompactBusy: string;
+  /** Prompt hold notice: a detached auto-compact is running, the message is
+   *  QUEUED and goes out by itself once the compaction settles — the session
+   *  stays "executing" and the user has nothing to resend. */
+  autoCompactHeld: string;
   /** Goal-loop wait note: a compaction holds the lock, the round resumes by
    * itself once it settles (no user action needed). */
   autoCompactGoalWait: string;
@@ -355,15 +362,19 @@ const zh: Messages = {
     resume: "在当前线程接续一个历史会话（弹窗选择）",
     mcp: "列出可用的 MCP 服务器",
     init: "创建或更新工作区 AGENTS.md 指令",
+    workflow: "描述一个动态多步工作流，交给模型执行",
+    workflows: "列出已保存的工作流与最近的运行",
   },
+  workflowDisabled: "⚠ 工作流功能当前未开放",
   autoCompactStart: (used, threshold) =>
     `🔄 自动压缩: 上下文用量 ${used} ≥ 阈值 ${threshold},正在压缩…`,
   autoCompactTimeout: "⚠ 自动压缩超时（300s）——后端可能仍在处理",
   autoCompactDone: "✓ 自动压缩: 上下文已压缩",
   autoCompactFailed: (err) => `⚠ 自动压缩失败: ${err}`,
   autoCompactBackendFailed: "后端报告压缩失败（session_compact_failed）",
-  autoCompactBusy: "🔄 自动压缩进行中，这条消息未发送；看到“✓ 自动压缩”提示后请重新发送。",
-  autoCompactGoalWait: "⏳ 自动压缩进行中，auto 任务将在压缩结束后自动继续…",
+  autoCompactBusy: "🔄 压缩进行中，这条消息未发送；压缩完成后请重新发送。",
+  autoCompactHeld: "🔄 压缩进行中，这条消息已排队，压缩完成后会自动发送。",
+  autoCompactGoalWait: "⏳ 压缩进行中，auto 任务将在压缩结束后自动继续…",
   popupTitleExitPlan: "可以开始编码了吗？",
   popupTitleToolPermission: (tool) => `工具权限 (${tool})`,
   popupTitleInteraction: "交互",
@@ -505,7 +516,10 @@ const en: Messages = {
     resume: "Resume a past session into this thread (picker popup)",
     mcp: "List available MCP servers",
     init: "Create or update workspace AGENTS.md instructions",
+    workflow: "Describe a dynamic multi-step workflow for the model to run",
+    workflows: "List saved workflows and recent runs",
   },
+  workflowDisabled: "⚠ Dynamic workflows are not available on this account yet",
   autoCompactStart: (used, threshold) =>
     `🔄 auto-compact: context usage ${used} ≥ threshold ${threshold}, compressing…`,
   autoCompactTimeout: "⚠ auto-compact timed out (300s) — backend may still be processing",
@@ -513,9 +527,11 @@ const en: Messages = {
   autoCompactFailed: (err) => `⚠ auto-compact failed: ${err}`,
   autoCompactBackendFailed: "backend reported compaction failed (session_compact_failed)",
   autoCompactBusy:
-    '🔄 auto-compact in progress — this message was NOT sent; resend it after the "✓ auto-compact" notice.',
+    "🔄 compaction in progress — this message was NOT sent; resend it once the compaction finishes.",
+  autoCompactHeld:
+    "🔄 compaction in progress — this message is queued and will be sent automatically once it finishes.",
   autoCompactGoalWait:
-    "⏳ auto-compact in progress — the auto run continues automatically once it finishes…",
+    "⏳ compaction in progress — the auto run continues automatically once it finishes…",
   popupTitleExitPlan: "Ready to code?",
   popupTitleToolPermission: (tool) => `tool permission (${tool})`,
   popupTitleInteraction: "interaction",

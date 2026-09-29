@@ -5,7 +5,7 @@
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -121,10 +121,38 @@ describe("loadUserConfig", () => {
           bridgePort: "not-a-number",
           token: 42, // wrong type → ignored
           hubHost: "", // blank → ignored
+          webDir: "dist", // relative → ignored (hub cwd is unpredictable)
           terminal: { app: "  ", enabled: "yes" }, // blank app + wrong type
         },
       }),
     );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ remote: { enabled: true } });
+  });
+
+  it("accepts an absolute webDir, trimmed; blank is dropped", () => {
+    writeConfig(
+      JSON.stringify({
+        remote: { enabled: true, webDir: "  /srv/web-dist  ", hubHost: " " },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      remote: { enabled: true, webDir: "/srv/web-dist" },
+    });
+  });
+
+  it("expands a leading ~ in webDir to the home dir; ~otheruser stays relative", () => {
+    writeConfig(
+      JSON.stringify({
+        remote: { enabled: true, webDir: "  ~/web-dist  " },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      remote: { enabled: true, webDir: path.join(homedir(), "web-dist") },
+    });
+    writeConfig(JSON.stringify({ remote: { enabled: true, webDir: "~" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch }).remote?.webDir).toBe(homedir());
+    // Only the CURRENT user's home is knowable without a lookup — rejected.
+    writeConfig(JSON.stringify({ remote: { enabled: true, webDir: "~root/dist" } }));
     expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ remote: { enabled: true } });
   });
 
@@ -196,5 +224,58 @@ describe("loadUserConfig", () => {
       }),
     );
     expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ sandbox: { enabled: false } });
+  });
+
+  it("parses the push section incl. the relay sub-section (trimmed, blanks dropped)", () => {
+    writeConfig(
+      JSON.stringify({
+        push: {
+          enabled: true,
+          corpId: " ww-corp ",
+          agentId: 1000009,
+          secret: " s ",
+          toUser: " william ",
+          contentDetail: "minimal",
+          relay: { url: " https://relay.example.com/wecom/ ", token: " relay-tok ", junk: 1 },
+        },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      push: {
+        enabled: true,
+        corpId: "ww-corp",
+        agentId: 1000009,
+        secret: "s",
+        toUser: "william",
+        contentDetail: "minimal",
+        relay: { url: "https://relay.example.com/wecom/", token: "relay-tok" },
+      },
+    });
+  });
+
+  it("non-object push.relay drops with the rest of push intact", () => {
+    writeConfig(JSON.stringify({ push: { enabled: true, relay: "junk" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ push: { enabled: true } });
+  });
+
+  it("parses push.notify switches; non-booleans drop, siblings survive", () => {
+    writeConfig(
+      JSON.stringify({
+        push: {
+          enabled: true,
+          quietMs: 5000,
+          notify: { turn: false, goal: true, run: "yes", task: false, compact: true },
+        },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      push: {
+        enabled: true,
+        quietMs: 5000,
+        notify: { turn: false, goal: true, task: false, compact: true },
+      },
+    });
+    writeConfig(JSON.stringify({ push: { enabled: true, notify: "junk" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ push: { enabled: true } });
   });
 });

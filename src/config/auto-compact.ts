@@ -23,6 +23,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 
 import { compact } from "../handlers/extensions.js";
 import { messages } from "../i18n.js";
+import { pushSettled, pushSourceLabel } from "../push/push.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { log, warn } from "../utils.js";
 import { sendTextChunk } from "../handlers/io.js";
@@ -52,7 +53,7 @@ export async function maybeAutoCompact(
     // only consumer here is `projection.contextUsed`.
     let used = 0;
     try {
-      const backend = server.ensureBackend();
+      const backend = await server.ensureBackend();
       const resp = await backend.request(
         server.nextId(),
         "session/read",
@@ -70,6 +71,11 @@ export async function maybeAutoCompact(
     if (used < threshold) return;
 
     log(`auto-compact: contextUsed=${used} >= threshold=${threshold}, compacting…`);
+    // The busy window (running:true to every client, settle at the end) is
+    // owned by compact() itself — the single raise point for manual AND auto
+    // compactions alike, so the window is reported identically wherever the
+    // compaction was started from. Until it raises, the in-flight flag this
+    // run's detached wrapper already set holds any prompt that arrives.
     const m = messages();
     await sendTextChunk(
       cx,
@@ -83,18 +89,48 @@ export async function maybeAutoCompact(
       __lockTimeout?: boolean;
       __compactFailed?: boolean;
     };
+    // The phone mirrors the outcome the client sees (§5.2 settled kind
+    // `compact` — this is the AUTO path only; a manual /compact is
+    // user-initiated and watched, so it never pushes). The arming turn's own
+    // `turn` push already fired at its settle — this lands ~minutes later as
+    // the "everything settled" signal.
     if (result.__lockTimeout) {
       await sendTextChunk(cx, acpSid, m.autoCompactTimeout, msgId);
+      pushSettled(server, {
+        kind: "compact",
+        label: pushSourceLabel(server, acpSid),
+        title: "auto-compact timed out",
+      });
     } else if (result.__compactFailed) {
       // The backend swallowed the failure into a state.updated notification —
       // without this check the user saw "✓ compressed" while nothing shrank.
       await sendTextChunk(cx, acpSid, m.autoCompactFailed(m.autoCompactBackendFailed), msgId);
+      pushSettled(server, {
+        kind: "compact",
+        label: pushSourceLabel(server, acpSid),
+        title: "auto-compact failed",
+        body: m.autoCompactBackendFailed,
+      });
     } else {
       await sendTextChunk(cx, acpSid, m.autoCompactDone, msgId);
+      pushSettled(server, {
+        kind: "compact",
+        label: pushSourceLabel(server, acpSid),
+        title: "auto-compact completed",
+      });
     }
     log("auto-compact: done");
   } catch (e) {
     warn(`auto-compact: compact failed (${e instanceof Error ? e.message : String(e)})`);
+    // Push BEFORE the outcome chunk: a dead client makes the chunk itself
+    // throw (the send chain rejects), and one push per settle beats a
+    // push-less settle.
+    pushSettled(server, {
+      kind: "compact",
+      label: pushSourceLabel(server, acpSid),
+      title: "auto-compact failed",
+      body: e instanceof Error ? e.message : String(e),
+    });
     await sendTextChunk(
       cx,
       acpSid,
@@ -132,10 +168,12 @@ export const AUTO_COMPACT_SETTLE_MS = 330_000;
 
 /**
  * Bounded wait until no detached auto-compact is in flight for the session.
- * For flows with no user to resend (goal-loop rounds, sandbox continuations):
- * prompts are REJECTED during a compaction — their subscribed listener would
- * accumulate the compaction's internal-turn stream as residue — whereas a
- * caller that waits BEFORE subscribing is residue-free by construction.
+ * Callers MUST wait before subscribing their event listener: a subscribed
+ * listener would accumulate the compaction's internal-turn stream as residue
+ * and dispatch it as the waiting prompt's own output. Waiting before the
+ * subscribe is residue-free by construction, so the prompt path (user
+ * messages), the goal-loop driver, and sandbox continuations all use this same
+ * pre-subscribe hold.
  * Resolves false on timeout (the compaction may legitimately still run).
  */
 export async function waitForAutoCompactIdle(

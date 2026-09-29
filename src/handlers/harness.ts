@@ -34,9 +34,9 @@ async function inspectSession(
 ): Promise<Result> {
   const zcodeSid = await resolveSidOrThrow(server, params);
   const { sessionId: _adapterSessionId, ...options } = params;
-  const resp = await server
-    .ensureBackend()
-    .request(server.nextId(), method, { ...options, sessionId: zcodeSid }, 15000);
+  const resp = await (
+    await server.ensureBackend()
+  ).request(server.nextId(), method, { ...options, sessionId: zcodeSid }, 15000);
   if (resp.error) nativeFailure(method, zcodeSid, resp);
   return (resp.result ?? {}) as Result;
 }
@@ -55,9 +55,9 @@ export async function retainedSubagents(
   const nativeId = server.resolveSid(params.sessionId) ?? params.sessionId;
   if (!nativeId.startsWith("sess_"))
     throw new Error("Retained topology requires a native Session identity");
-  const response = await server
-    .ensureBackend()
-    .request(server.nextId(), "session/subagents", { sessionId: nativeId }, 15000);
+  const response = await (
+    await server.ensureBackend()
+  ).request(server.nextId(), "session/subagents", { sessionId: nativeId }, 15000);
   if (response.error) nativeFailure("session/subagents", nativeId, response);
   return { sessionId: nativeId, topology: response.result ?? null };
 }
@@ -76,9 +76,9 @@ export async function closeSession(
   const zcodeSid = server.resolveSid(params.sessionId);
   if (!zcodeSid) throw new Error("session/close requires an already resolved Session");
   const turns = [...server.pendingTurns.values()].filter((turn) => turn.zcodeSid === zcodeSid);
-  const response = await server
-    .ensureBackend()
-    .request(server.nextId(), "session/close", { sessionId: zcodeSid }, 15000);
+  const response = await (
+    await server.ensureBackend()
+  ).request(server.nextId(), "session/close", { sessionId: zcodeSid }, 15000);
   if (response.error) nativeFailure("session/close", zcodeSid, response);
   if ((response.result as Result | undefined)?.closed === true) {
     for (const [alias, nativeId] of server.sessionMap) {
@@ -104,9 +104,9 @@ export async function residentSession(
   const nativeId = server.resolveSid(params.sessionId) ?? params.sessionId;
   if (!nativeId.startsWith("sess_"))
     throw new Error("Residency inspection requires a native Session identity");
-  const response = await server
-    .ensureBackend()
-    .request(server.nextId(), "session/read", { sessionId: nativeId }, 15000);
+  const response = await (
+    await server.ensureBackend()
+  ).request(server.nextId(), "session/read", { sessionId: nativeId }, 15000);
   if (response.error?.code === -32004) return { sessionId: nativeId, resident: false };
   if (response.error) nativeFailure("session/read", nativeId, response);
   return {

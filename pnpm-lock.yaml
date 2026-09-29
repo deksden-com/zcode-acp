@@ -15,8 +15,8 @@ importers:
         specifier: ^8.21.3
         version: 8.21.3
       zcode-acp-martty:
-        specifier: 0.2.39-zcode.5
-        version: 0.2.39-zcode.5
+        specifier: 0.2.39-zcode.6
+        version: 0.2.39-zcode.6
     devDependencies:
       '@eslint/js':
         specifier: ^9.0.0
@@ -736,6 +736,7 @@ packages:
   eslint@9.39.4:
     resolution: {integrity: sha512-XoMjdBOwe/esVgEvLmNsD3IRHkm7fbKIUGvrleloJXUZgDHig2IPWNniv+GwjyJXzuNqVjlr5+4yVUZjycJwfQ==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
+    deprecated: This version is no longer supported. Please see https://eslint.org/version-support for other options.
     hasBin: true
     peerDependencies:
       jiti: '*'
@@ -1151,8 +1152,8 @@ packages:
     resolution: {integrity: sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q==}
     engines: {node: '>=10'}
 
-  zcode-acp-martty@0.2.39-zcode.5:
-    resolution: {integrity: sha512-vuavheYIlF5ttagUf2N/lBQYyFIsmNlEtRuV6CJFABy+tyym7R6iN9hxTTbtRTgbhehANDvDcl0evPavduTS0g==}
+  zcode-acp-martty@0.2.39-zcode.6:
+    resolution: {integrity: sha512-tQuJyKlyTqa626PVOnoj/BGaVZ5An9rOG3vrkv3wuGAiJoV3FZU3hJvMEBfI32QaCNMvEQ7dnOawXVCe4vz29g==}
     engines: {node: '>=18'}
     hasBin: true
 
@@ -2105,7 +2106,7 @@ snapshots:
 
   yocto-queue@0.1.0: {}
 
-  zcode-acp-martty@0.2.39-zcode.5:
+  zcode-acp-martty@0.2.39-zcode.6:
     dependencies:
       '@deepseek-ai/cordis': 4.0.2
       '@lobehub/icons-static-svg': 1.95.0

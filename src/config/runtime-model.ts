@@ -124,9 +124,17 @@ export function buildResumeRuntimeModel(): unknown | null {
  * form REQUIRES `options.reasoningLevel` for models that declare levels
  * ("Reasoning level is required for <p>/<m>"); the string form that skips that
  * check exists only inside the app facade and is unreachable over the
- * protocol. We therefore send the target model's own default level, read from
- * the captured create/resume snapshot when we have it, and fall back to
- * omitting `options` for level-less models.
+ * protocol.
+ *
+ * The reasoning level is attempted down a LADDER (best candidate first, then
+ * omission, then the remaining candidates): setModel validates the selection
+ * against the live registry BEFORE anything is stopped or created, so a
+ * rejected attempt is a cheap pre-flight — but a stale local file naming a
+ * level the registry doesn't know hard-failed EVERY switch to the model
+ * (observed 2026-09-28: config.json said "max", the registry def had no such
+ * level, four consecutive switches to the same model died with
+ * `Reasoning effort "max" is not supported by …`). Level-unrelated errors
+ * abort the ladder immediately.
  *
  * Provider ids are translated to the registry's own spelling: config.json says
  * `builtin:bigmodel-coding-plan` while the registry exposes
@@ -139,52 +147,86 @@ export async function applyModelSwitch(
   value: string,
 ): Promise<boolean> {
   const { providerId, modelId } = parseModelValue(value);
-  const backend = server.ensureBackend();
+  const backend = await server.ensureBackend();
   const registryProviderId = accountProviderIdFor(providerId);
-  const model: Record<string, unknown> = { providerId: registryProviderId, modelId };
-  // The object form requires the level for level-bearing models; resolve the
-  // target's authoritative default from the captured create/resume snapshot.
-  const level = resolveDefaultReasoningLevel(server, zcodeSid, registryProviderId, modelId);
-  if (level) model.options = { reasoningLevel: level };
-  const resp = await backend.request(
-    server.nextId(),
-    "session/setModel",
-    { sessionId: zcodeSid, model, persistAsWorkspaceLastUsed: false },
-    15000,
-  );
-  if (resp.error) {
-    if (isUnknownBackendOutcome(resp.error)) throw backendError("session/setModel", resp, zcodeSid);
-    warn(`runtime-model: switch failed: ${resp.error.message}`);
-    return false;
+  const candidates = candidateReasoningLevels(server, zcodeSid, registryProviderId, modelId);
+  // [best, omit, rest]: omission second so a level-less registry def succeeds
+  // on attempt two even when local files claim the model has levels.
+  const attempts: Array<string | undefined> = [];
+  const seenAttempts = new Set<string>();
+  for (const attempt of [candidates[0], undefined, ...candidates.slice(1)]) {
+    const key = attempt ?? "\u0000omit";
+    if (seenAttempts.has(key)) continue;
+    seenAttempts.add(key);
+    attempts.push(attempt);
+    if (attempts.length >= 5) break;
   }
-  invalidateModelCache(server, zcodeSid);
-  return true;
+  let lastError = "unknown error";
+  for (let i = 0; i < attempts.length; i++) {
+    const level = attempts[i];
+    const model: Record<string, unknown> = { providerId: registryProviderId, modelId };
+    if (level) model.options = { reasoningLevel: level };
+    const resp = await backend.request(
+      server.nextId(),
+      "session/setModel",
+      { sessionId: zcodeSid, model, persistAsWorkspaceLastUsed: false },
+      15000,
+    );
+    if (!resp.error) {
+      invalidateModelCache(server, zcodeSid);
+      return true;
+    }
+    if (isUnknownBackendOutcome(resp.error)) throw backendError("session/setModel", resp, zcodeSid);
+    lastError = resp.error.message ?? lastError;
+    // Only level-shape rejections are ladder-recoverable; anything else
+    // (provider/model not found, busy, schema) fails the switch outright.
+    if (!LEVEL_REJECTED.test(lastError) && !LEVEL_REQUIRED.test(lastError)) break;
+    log(`runtime-model: level attempt "${level ?? "<omitted>"}" rejected: ${lastError}`);
+  }
+  warn(`runtime-model: switch failed: ${lastError}`);
+  return false;
 }
 
+/** setModel rejections that mean "this LEVEL is wrong", not "this switch is wrong". */
+const LEVEL_REJECTED = /Reasoning effort ".*" is not supported by/u;
+const LEVEL_REQUIRED = /Reasoning level is required for/u;
+
 /**
- * The reasoning level a switch should start the model at.
+ * Reasoning-level candidates for a switch, most-trustworthy first:
  *
- * The object form REQUIRES a level for level-bearing models
- * ("Reasoning level is required for <p>/<m>"), so one must be supplied. The
- * backend's own answer is the only correct source: config.json's
- * `reasoning.variants` go stale (observed 2026-09 — a third-party model
- * configured `off/high/max` actually ran `low/high/max`). `session/create`'s
- * captured availability list (server.modelAvailability) carries the
- * authoritative `defaultLevel`; models that declare no levels yield null and
- * callers omit `options` so they accept the switch.
+ * 1. The create/resume snapshot (`server.modelAvailability`) — the registry's
+ *    own def at capture time. A hit that declares NO levels is final: the
+ *    backend already said the model is level-less, and file-declared variants
+ *    are exactly the stale-fiction that broke switches.
+ * 2. The personal provider config (`provider_config.json`) — the registry's
+ *    INPUT file for 3.12+ custom models. Default = LAST value, mirroring the
+ *    upstream default rule (`values.at(-1)`, model-catalog-port.ts).
+ * 3. Legacy config.json — stale by design since 3.12 stopped syncing it.
  */
-function resolveDefaultReasoningLevel(
+function candidateReasoningLevels(
   server: ZcodeAcpServer,
   zcodeSid: string,
   providerId: string,
   modelId: string,
-): string | null {
+): string[] {
+  const out: string[] = [];
+  const push = (v: string | undefined): void => {
+    if (v && !out.includes(v)) out.push(v);
+  };
   const cached = server.modelAvailability.get(zcodeSid) ?? [];
   const hit = cached.find((a) => a.providerId === providerId && a.modelId === modelId);
-  if (hit?.defaultLevel) return hit.defaultLevel;
-  if (hit) return null; // present but level-less — omit options
-  // Not in the captured list (a model the registry gained after create):
-  // fall back to config.json's declaration rather than sending no level.
+  if (hit) {
+    if (!hit.defaultLevel && !hit.levels?.length) return [];
+    push(hit.defaultLevel);
+    for (const level of hit.levels ?? []) push(level);
+  }
+  try {
+    const values = personalModelSpec(providerId, modelId)?.reasoningValues ?? [];
+    push(values.at(-1));
+    for (const v of values) push(v);
+  } catch {
+    // unreadable personal config — fall through
+  }
   try {
     const p = findProviderConfig(providerId);
     const entry = (
@@ -197,25 +239,13 @@ function resolveDefaultReasoningLevel(
     )?.[modelId];
     const reasoning = entry?.reasoning;
     if (reasoning && reasoning.enabled !== false) {
-      if (reasoning.defaultVariant) return reasoning.defaultVariant;
-      if (reasoning.variants?.length) return reasoning.variants[0]!;
+      push(reasoning.defaultVariant);
+      for (const v of reasoning.variants ?? []) push(v);
     }
   } catch {
-    // unreadable config — try the personal config below
+    // unreadable config.json — whatever we already have is the list
   }
-  // In config.json neither — a model the desktop added to its personal
-  // provider config after this session was created. The rule carries the
-  // level vocabulary (`optionSpecs.reasoningLevel`); its declared default or
-  // first value is the best-effort level (omitting `options` would hard-fail
-  // a level-bearing switch).
-  try {
-    const spec = personalModelSpec(providerId, modelId);
-    const values = spec?.reasoningValues;
-    if (values?.length) return values[0]!;
-  } catch {
-    // unreadable personal config — omit options
-  }
-  return null;
+  return out;
 }
 
 /** Invalidate the session-level model cache after a switch. */

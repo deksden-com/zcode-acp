@@ -18,6 +18,7 @@ import { realpathSync } from "node:fs";
 import type * as acp from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
 
+import { backendCapabilities } from "../backend/adapter.js";
 import type { ZcodeBackend } from "../backend/client.js";
 import { backendError, isUnknownBackendOutcome } from "../backend/errors.js";
 import {
@@ -51,10 +52,12 @@ import {
   scheduleQuotaDockBackstop,
   startQuotaRefresher,
 } from "../quota/live.js";
+import { noteUserActivity, pushSettled, pushSourceLabel } from "../push/push.js";
 import { buildProviderRegistry } from "../config/provider-registry.js";
-import { pushAccountProviderConfig } from "../config/account-provider.js";
+import { configProviderIdFor, pushAccountProviderConfig } from "../config/account-provider.js";
 import { initialSessionMode } from "../config/settings.js";
 import { applyModelSwitch, buildResumeRuntimeModel } from "../config/runtime-model.js";
+import { filterWorkflowCommands, rememberGate, workflowGateNow } from "../config/workflow-gate.js";
 import { messages } from "../i18n.js";
 import {
   lookupLazySession,
@@ -76,7 +79,13 @@ import type { InternalEvent } from "../translators/index.js";
 import { clientConnectionRoot, log, warn } from "../utils.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { dispatchEvent } from "./dispatch.js";
-import { sendSessionUpdate, sendTextChunk, withReplayBatch } from "./io.js";
+import {
+  emitSessionTurnState,
+  sendAvailableCommandsDeferred,
+  sendSessionUpdate,
+  sendTextChunk,
+  withReplayBatch,
+} from "./io.js";
 import type { FetchMessagesOptions, ReplaySlice } from "./replay.js";
 import {
   EDIT_DIFF_READ_LIMIT,
@@ -102,6 +111,71 @@ import { handleServerRequests } from "./server-requests.js";
 function workspaceFor(cwd?: string): { workspacePath: string; workspaceKey: string } {
   const p = cwd || process.cwd();
   return { workspacePath: p, workspaceKey: p };
+}
+
+/**
+ * Dynamic-workflow session flag (desktop-host parity, server.backendWorkflowGate):
+ * `{dynamicWorkflowEnabled:true}` rides every session/create·resume when the
+ * gate resolved enabled; otherwise NOTHING is written — the backend's zod
+ * schemas are strict, and the flag-absent default is exactly fail-closed.
+ * Awaiting the gate on the hot path is free (the verdict resolved at backend
+ * spawn); the cold-path bound is the gate fetch's 6s timeout, well under a
+ * backend boot. Fork and sub-agent sessions copy the flag inside the backend
+ * — no bridge-side injection point for those.
+ */
+async function workflowFlag(
+  server: ZcodeAcpServer,
+): Promise<{ dynamicWorkflowEnabled: true } | Record<string, never>> {
+  const promise = server.backendWorkflowGate;
+  if (!promise) return {};
+  const gate = await promise;
+  // Belt-and-braces vs captureGate (ensureBackend): an awaited verdict becomes
+  // synchronously readable immediately, so the send-time menu filter that runs
+  // right after create/resume sees it on its FIRST call.
+  rememberGate(promise, gate);
+  return gate.enabled ? { dynamicWorkflowEnabled: true } : {};
+}
+
+/**
+ * Cold-bridge menu catch-up: the `/` menu snapshot sent at session/new is
+ * filtered against the workflow gate, and on a COLD bridge (lazy session/new,
+ * no backend yet) that snapshot was taken while the gate was still
+ * pending/absent — the two workflow commands get dropped for that whole
+ * session. By the time a lazy session MATERIALIZES the gate has necessarily
+ * settled (create/resume params awaited it), so re-send the menu here.
+ * Overwrite semantics + the deferred helper's timer cancellation make this
+ * idempotent and correctly ordered (a late settle supersedes the stale send).
+ */
+export function resendMenuAfterGateSettled(server: ZcodeAcpServer, acpSid: string): void {
+  if (!server.allCommands || !workflowGateNow(server)?.enabled) return;
+  for (const sid of server.sessionAliases(acpSid)) {
+    sendAvailableCommandsDeferred(
+      server.clients,
+      sid,
+      filterWorkflowCommands(server, server.allCommands),
+    );
+  }
+}
+
+/**
+ * Shared `session/resume` params builder: {sessionId, workspace} + optional
+ * session-lifetime mcpServers + the conditional dynamic-workflow flag. Every
+ * resume construction site (session/resume, /resume adoption, session/load,
+ * eviction/respawn reload) goes through here so the param shape cannot drift.
+ */
+async function resumeParams(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+  cwd: string,
+  mcpServers?: acp.McpServer[],
+): Promise<Record<string, unknown>> {
+  const params: Record<string, unknown> = {
+    sessionId: zcodeSid,
+    workspace: workspaceFor(cwd),
+    ...(await workflowFlag(server)),
+  };
+  if (mcpServers) params.mcpServers = mcpServers;
+  return params;
 }
 
 /**
@@ -187,7 +261,7 @@ async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promis
     // models the user's config selects never reach `settings.model.available`
     // (verified 2026-09 — switches then fail with "Provider Registry 中不存在
     // Model"). Pushing the snapshot restores desktop parity. Best-effort.
-    await pushAccountProviderConfig(server.ensureBackend(), () => server.nextId());
+    await pushAccountProviderConfig(await server.ensureBackend(), () => server.nextId());
     const registry = buildProviderRegistry();
     if (registry.providers.length === 0) {
       // Every configured provider lacks models (or none are configured). The
@@ -198,14 +272,14 @@ async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promis
       log("provider-registry: no usable providers — skipping sync");
       return;
     }
-    const resp = await server
-      .ensureBackend()
-      .request(
-        server.nextId(),
-        "workspace/updateProviderRegistry",
-        { workspace: workspaceFor(cwd), registry },
-        10000,
-      );
+    const resp = await (
+      await server.ensureBackend()
+    ).request(
+      server.nextId(),
+      "workspace/updateProviderRegistry",
+      { workspace: workspaceFor(cwd), registry },
+      10000,
+    );
     if (resp.error) {
       // 3.12+ removed the method (the registry is built from the bundled table,
       // personal config, and the account snapshot) — a no-op, not a failure.
@@ -299,7 +373,10 @@ export async function newSession(
   // connection is martty. Identity is per-connection — recorded at the
   // connection's own initialize (server.ts), never the sticky process flag,
   // so a phone app's session/new must not become a quota-dock target.
-  if (server.marttyConnectionRoots.has(clientConnectionRoot(client))) {
+  if (
+    backendCapabilities(server.backendKind).quota &&
+    server.marttyConnectionRoots.has(clientConnectionRoot(client))
+  ) {
     startQuotaRefresher(server);
   }
   // Hub session-create binding (remote create, ADR-0016): adopt the hub's
@@ -338,7 +415,13 @@ export async function newSession(
     // Same banner handshake as boot-resume: the TUI's auto-submitted trigger
     // (DSH_TUI_AUTOPROMPT) drops martty's welcome banner so the window shows
     // the shared conversation instead of waiting for local input.
-    if (isMarttyClient(server)) {
+    // Per-connection martty identity, NOT the sticky process flag: the phone
+    // claims this same bind below, and a sticky-gated arm re-pointed the
+    // handshake at the phone — the TUI's trigger then reached the model.
+    if (
+      backendCapabilities(server.backendKind).bootResumeHandshake &&
+      server.marttyConnectionRoots.has(bindRoot)
+    ) {
       server.bootResumeTriggerConnection = bindRoot;
     }
     const modes = await buildModes(server, null);
@@ -376,9 +459,15 @@ export async function newSession(
       // into its transcript. The chunks sit BEHIND martty's welcome banner
       // until text is submitted — the DSH_TUI_AUTOPROMPT handshake armed
       // below drops the banner for the user.
-      if (isMarttyClient(server)) {
+      if (
+        backendCapabilities(server.backendKind).bootResumeHandshake &&
+        server.marttyConnectionRoots.has(clientConnectionRoot(client))
+      ) {
         // Scope the handshake to THIS connection: a phone app attached to the
         // same bridge may prompt during the boot window and must not disarm it.
+        // Per-connection martty identity, NOT the sticky process flag — an
+        // attaching phone's session/new can win the race for the env; it must
+        // neither arm for itself nor leave a wrong arm for the TUI's trigger.
         server.bootResumeTriggerConnection = clientConnectionRoot(client);
         // Targeted replay — the booting TUI's own connection, never broadcast
         // (see the loadSession comment above).
@@ -463,7 +552,7 @@ function emitBootUsageUpdate(server: ZcodeAcpServer, acpSid: string): void {
         const zcodeSid = server.resolveSid(acpSid);
         let used = 0;
         if (zcodeSid) {
-          const backend = server.ensureBackend();
+          const backend = await server.ensureBackend();
           const resp = await backend.request(
             server.nextId(),
             "session/read",
@@ -473,7 +562,10 @@ function emitBootUsageUpdate(server: ZcodeAcpServer, acpSid: string): void {
             5000,
           );
           const proj = ((resp.result ?? {}) as { projection?: ZcodeProjection }).projection;
-          used = proj?.contextUsed || proj?.totalTokenCount || 0;
+          // Occupancy only (#228): never substitute totalTokenCount (lifetime
+          // consumption) for the meter — boot shows size first, used stays 0
+          // until the backend reports real occupancy.
+          used = proj?.contextUsed ?? 0;
         }
         let providerId = loadAllModels()[0]?.providerId ?? DEFAULT_PROVIDER_ID;
         let modelId = loadAllModels()[0]?.modelId ?? DEFAULT_MODEL_ID;
@@ -615,6 +707,9 @@ export async function ensureRealSession(
       if (opts.ensureResident !== false) {
         await ensureBackendResident(server, acpSid, record.zcodeSid);
       }
+      // Materialization (resume flight) settled the gate — refresh a menu
+      // snapshot that may predate the verdict (see resendMenuAfterGateSettled).
+      resendMenuAfterGateSettled(server, acpSid);
       return record.zcodeSid;
     }
     if (record) {
@@ -633,7 +728,7 @@ export async function ensureRealSession(
   // The create body runs synchronously up to its first await, so the `creating`
   // promise is stored before any concurrent caller can observe the entry.
   const creating = (async () => {
-    const backend = server.ensureBackend();
+    const backend = await server.ensureBackend();
     // Push the provider registry BEFORE session/create: the backend resolves
     // the session's default model against the registry, and without the
     // provider's reasoning/model definitions it falls back to the bare
@@ -653,6 +748,9 @@ export async function ensureRealSession(
       // ZCODE_ACP_MODE; the default stays "yolo" (unrestricted), which is
       // what the bridge always used.
       mode: initialSessionMode(),
+      // Dynamic-workflow enable rides create only when the gate says so —
+      // workflowFlag writes nothing otherwise (strict zod).
+      ...(await workflowFlag(server)),
     };
     if (pending.mcpServers && pending.mcpServers.length > 0) {
       createParams.mcpServers = pending.mcpServers;
@@ -723,7 +821,10 @@ export async function ensureRealSession(
     // session/create loads the session into this backend process.
     server.markBackendLoaded(acpSid);
     log(`session/new ${acpSid} → created ${sid} (lazy, on first use)`);
-    server.ensureBackgroundListener(sid);
+    await server.ensureBackgroundListener(sid);
+    // Cold-bridge catch-up: the session/new menu snapshot was filtered on a
+    // pending gate; the create above settled it — re-send for this session.
+    resendMenuAfterGateSettled(server, acpSid);
 
     // Sync to the App's tasks-index.sqlite so the App UI shows this session.
     // Best-effort; failures are logged inside upsertSessionTask and swallowed.
@@ -753,7 +854,7 @@ export async function listSessions(
   server: ZcodeAcpServer,
   params: acp.ListSessionsRequest,
 ): Promise<acp.ListSessionsResponse> {
-  const backend = server.ensureBackend();
+  const backend = await server.ensureBackend();
   const zcParams: Record<string, unknown> = {};
   // Serve mode (ADR-0014) pins the workspace: a remote client must not use a
   // client-supplied cwd to enumerate the machine's sessions in OTHER projects
@@ -794,7 +895,7 @@ async function adoptStoredTitle(
 ): Promise<void> {
   if (server.sessionTitles.has(acpSid)) return;
   try {
-    const backend = server.ensureBackend();
+    const backend = await server.ensureBackend();
     const resp = await backend.request(server.nextId(), "session/list", {}, 15000);
     if (resp.error) return;
     const result = (resp.result ?? {}) as ZcodeListResult;
@@ -972,17 +1073,17 @@ export async function resumeSession(
     // the faithful resume fails outright). The params deliberately carry NO
     // apiKey either (the backend's schema rejects it; it resolves auth from
     // its own config/OAuth store).
-    const zcParams: Record<string, unknown> = {
-      sessionId: zcodeSid,
-      workspace: workspaceFor(cwd),
-    };
     // ACP session/resume may also carry mcpServers; the backend's resume
     // schema accepts the same array shape (verified: an unknown key would be
     // rejected before the session lookup). Remembered as session-lifetime
     // state so later reloads keep re-sending them (#193).
     rememberSessionMcpServers(server, acpSid, params.mcpServers);
-    const storedMcp = server.sessionMcpServers.get(acpSid);
-    if (storedMcp) zcParams.mcpServers = storedMcp;
+    const zcParams = await resumeParams(
+      server,
+      zcodeSid,
+      cwd,
+      server.sessionMcpServers.get(acpSid),
+    );
     // Push the provider registry BEFORE resume: a resumed session may carry a
     // third-party model in its history, and the backend needs the provider
     // registered to even process the resume turn.
@@ -1016,7 +1117,7 @@ export async function resumeSession(
   // above); without this, a loaded session has no readable root.
   server.sessionCwds.set(acpSid, cwd);
   log(`session/resume -> ${zcodeSid}`);
-  server.ensureBackgroundListener(zcodeSid);
+  await server.ensureBackgroundListener(zcodeSid);
   await adoptStoredTitle(server, acpSid, zcodeSid);
   // Martty's /resume rides session/resume (no history by ACP design) and only
   // folds updates addressed to a session id it has already adopted — i.e.
@@ -1090,7 +1191,7 @@ export async function resumeIntoSession(
       // Materialized but empty: discard the orphan backend session and the
       // stale mappings before adopting the target.
       try {
-        server.ensureBackend().send("session/close", { sessionId: current });
+        (await server.ensureBackend()).send("session/close", { sessionId: current });
       } catch (e) {
         log(
           `/resume: closing empty session ${current} failed (ignored): ` +
@@ -1121,14 +1222,11 @@ export async function resumeIntoSession(
   let settledHistory: ZcodeMessage[] | undefined;
   try {
     await syncProviderRegistry(server, cwd);
-    const outcome = await resumePreservingModel(server, {
-      sessionId: zcodeTarget,
-      workspace: workspaceFor(cwd),
+    const outcome = await resumePreservingModel(
+      server,
       // Session-lifetime MCP set keeps riding every resume (#193).
-      ...(server.sessionMcpServers.get(acpSid)
-        ? { mcpServers: server.sessionMcpServers.get(acpSid) }
-        : {}),
-    });
+      await resumeParams(server, zcodeTarget, cwd, server.sessionMcpServers.get(acpSid)),
+    );
     settledHistory = outcome.history;
     server.markBackendLoaded(acpSid);
     await repairUnavailableModel(server, zcodeTarget);
@@ -1137,7 +1235,7 @@ export async function resumeIntoSession(
     const finalCwd = backendWs && !server.serveMode ? backendWs : cwd;
     server.sessionCwds.set(acpSid, finalCwd);
     recordMaterializedSession(acpSid, zcodeTarget, finalCwd);
-    server.ensureBackgroundListener(zcodeTarget);
+    await server.ensureBackgroundListener(zcodeTarget);
     await adoptStoredTitle(server, acpSid, zcodeTarget);
   } catch (e) {
     warn(`/resume: adopting ${zcodeTarget} failed (${e instanceof Error ? e.message : String(e)})`);
@@ -1209,15 +1307,15 @@ export async function loadSession(
   let settledHistory: ZcodeMessage[] | undefined;
 
   if (!alreadyLive) {
-    const zcParams: Record<string, unknown> = {
-      sessionId: zcodeSid,
-      workspace: workspaceFor(cwd),
-    };
     // Same mcpServers contract as resume: the client may re-declare them on
     // load; a stored set keeps riding along when it doesn't (#193).
     rememberSessionMcpServers(server, acpSid, params.mcpServers);
-    const storedMcp = server.sessionMcpServers.get(acpSid);
-    if (storedMcp) zcParams.mcpServers = storedMcp;
+    const zcParams = await resumeParams(
+      server,
+      zcodeSid,
+      cwd,
+      server.sessionMcpServers.get(acpSid),
+    );
     // Push the provider registry BEFORE resume: a loaded session may carry a
     // third-party model in its history, and the backend needs the provider
     // registered to process it.
@@ -1248,7 +1346,7 @@ export async function loadSession(
   // Same as resumeSession: backend-authoritative session root for file access.
   server.sessionCwds.set(acpSid, cwd);
   log(`session/load → ${zcodeSid}`);
-  server.ensureBackgroundListener(zcodeSid);
+  await server.ensureBackgroundListener(zcodeSid);
   await adoptStoredTitle(server, acpSid, zcodeSid);
 
   // Goal-loop restart recovery (ADR-0022 §6): surface a recovery hint at most
@@ -1381,6 +1479,10 @@ export async function prompt(
   requestId: number | string,
   client?: acp.AgentContext,
 ): Promise<acp.PromptResponse> {
+  // USER entry point: stamp presence for the push quiet window. The sandbox
+  // continuation loop below must NOT re-stamp (bridge-internal rounds are not
+  // the user being at the desk).
+  noteUserActivity(server);
   let result = await runPrompt(server, params, cx, requestId, false, client);
   // Sandbox-allow continuation chaining, BOUNDED: each batched restart
   // cancels the in-flight round and queues a continuation for prompt() to
@@ -1424,6 +1526,7 @@ export async function prompt(
         messages().sandboxContinuationFailed(err),
         randomUUID(),
       ).catch(() => undefined);
+      await emitSessionTurnState(server, params.sessionId, false, cx);
       // A leftover continuation for THIS cancelled round is now orphaned —
       // drop it rather than let a later cancelled prompt adopt it.
       server.sandboxContinuations.delete(params.sessionId);
@@ -1485,20 +1588,7 @@ export async function runOneTurn(
   // server.sessionAliases) so a client holding this conversation under a
   // different ACP id opens its live turn too. Best-effort: a dead client must
   // not fail the turn.
-  const emitTurnState = async (running: boolean): Promise<void> => {
-    const results = await Promise.allSettled(
-      server
-        .sessionAliases(acpSid)
-        .map((sid) => cx.notify("$/zcode/turnState", { sessionId: sid, running })),
-    );
-    for (const r of results) {
-      if (r.status === "rejected") {
-        log(
-          `turnState notify failed: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
-        );
-      }
-    }
-  };
+  const emitTurnState = (running: boolean) => emitSessionTurnState(server, acpSid, running, cx);
 
   let listener = new EventStreamListener(backend, zcodeSid);
   let monitor = new TurnMonitor(backend, zcodeSid, () => server.nextId());
@@ -1583,7 +1673,7 @@ export async function runOneTurn(
         // reconcile the differ baseline so the retried turn's new messages
         // aren't treated as already-seen, surface a retry hint, then back off.
         if (turn.cancelled) {
-          stopBackendTurn(server, zcodeSid, turn);
+          void stopBackendTurn(server, zcodeSid, turn);
           return { stopReason: "cancelled" };
         }
         differ.markSeen(await fetchMessagesSinceAnchor(server, zcodeSid, differ.historyAnchor));
@@ -1660,7 +1750,7 @@ export async function runOneTurn(
       let queuedNoticeSent = false;
       while (true) {
         if (turn.cancelled) {
-          stopBackendTurn(server, zcodeSid, turn);
+          void stopBackendTurn(server, zcodeSid, turn);
           return { stopReason: "cancelled" };
         }
         if (turn.closed) return { stopReason: "cancelled" };
@@ -1680,7 +1770,7 @@ export async function runOneTurn(
         if (expectBusy) {
           await sleep(SEND_RETRY_INTERVAL_MS);
           if (turn.cancelled) {
-            stopBackendTurn(server, zcodeSid, turn);
+            void stopBackendTurn(server, zcodeSid, turn);
             return { stopReason: "cancelled" };
           }
         }
@@ -1764,6 +1854,11 @@ export async function runOneTurn(
         // this turn's listener unregister in the finally, and
         // turn.compactRejected lets the goal-loop driver (no user to resend)
         // wait the compaction out and retry the round.
+        //
+        // This is the RACE fallback, not the normal path: runPrompt holds a
+        // prompt that meets a compaction already running, so reaching here
+        // means the compaction armed between the hold and this send (or
+        // outlived the hold's settle cap).
         if (isBusy && server.autoCompactInFlight.has(zcodeSid)) {
           // Goal rounds get no user-directed notice: the driver retries them
           // automatically — a "resend" instruction would point at an internal
@@ -1887,7 +1982,7 @@ export async function runOneTurn(
               );
           }
           try {
-            backend = server.ensureBackend();
+            backend = await server.ensureBackend();
             listener = new EventStreamListener(backend, zcodeSid);
             monitor = new TurnMonitor(backend, zcodeSid, () => server.nextId());
             await reloadBackendSession(server, acpSid, zcodeSid);
@@ -1988,7 +2083,7 @@ async function runPrompt(
   // respawns under the profile and the subscribe-recovery path reloads the
   // session. No-op unless the config appeared mid-run.
   await server.applySandboxFlip();
-  const backend = server.ensureBackend();
+  const backend = await server.ensureBackend();
 
   // Extract prompt text + image attachments from ACP ContentBlock[].
   const text = extractPromptText(params.prompt);
@@ -2007,17 +2102,41 @@ async function runPrompt(
   // connection submitting anything else first means the auto-submit was
   // lost — disarm so the trigger text typed manually later stays a normal
   // prompt.
+  const promptRoot = clientConnectionRoot(client);
+  const ackBootResumeTrigger = async (): Promise<acp.PromptResponse> => {
+    await sendTextChunk(cx, params.sessionId, messages().bootResumeAck, randomUUID());
+    log("session/prompt: boot-resume banner handshake acknowledged");
+    await emitSessionTurnState(server, params.sessionId, false, cx);
+    return { stopReason: "end_turn" };
+  };
   if (
     server.bootResumeTriggerConnection !== null &&
-    clientConnectionRoot(client) === server.bootResumeTriggerConnection
+    promptRoot === server.bootResumeTriggerConnection
   ) {
     server.bootResumeTriggerConnection = null;
     if (text === BOOT_RESUME_TRIGGER) {
-      await sendTextChunk(cx, params.sessionId, messages().bootResumeAck, randomUUID());
-      log("session/prompt: boot-resume banner handshake acknowledged");
-      return { stopReason: "end_turn" };
+      return await ackBootResumeTrigger();
     }
+  } else if (
+    // Unarmed fallback: the boot-resume env was consumed by a NON-martty
+    // first session/new (an attaching phone can win the race against the
+    // TUI's boot), so no arm exists for the TUI — its auto-submitted trigger
+    // still needs the ack or it reaches the model (observed from the mobile
+    // app, 2026-09-23). A MARTTY connection's first prompt matching the
+    // trigger verbatim is that handshake; a phone typing the same words is
+    // real input (marttyConnectionRoots does not contain it) and goes to the
+    // model as typed.
+    backendCapabilities(server.backendKind).bootResumeHandshake &&
+    server.bootResumeTriggerConnection === null &&
+    text === BOOT_RESUME_TRIGGER &&
+    server.marttyConnectionRoots.has(promptRoot) &&
+    !server.connectionPromptSeen.has(promptRoot)
+  ) {
+    return await ackBootResumeTrigger();
   }
+  // First-prompt bookkeeping for the unarmed fallback above: only a martty
+  // connection's FIRST prompt is a handshake candidate.
+  if (promptRoot !== undefined) server.connectionPromptSeen.add(promptRoot);
 
   // Materialize a lazy session/new placeholder on first use. Placed after the
   // empty-prompt check so an invalid request doesn't create a backend session.
@@ -2026,7 +2145,7 @@ async function runPrompt(
   // titles): a mid-session backend respawn (sandbox flip, dynamic allow
   // batches, dead-reader recovery) replaces the instance the listeners were
   // registered on — ensureBackgroundListener re-registers on the current one.
-  server.ensureBackgroundListener(zcodeSid);
+  await server.ensureBackgroundListener(zcodeSid);
 
   // Slash-command interception: dispatches directly to ZCode methods and
   // returns end_turn without entering the turn loop. Known passthrough
@@ -2043,7 +2162,10 @@ async function runPrompt(
     text,
     client,
   );
-  if (intercepted) return intercepted;
+  if (intercepted) {
+    await emitSessionTurnState(server, params.sessionId, false, cx);
+    return intercepted;
+  }
 
   // Wire text for the backend: unknown `/x` prompts (not advertised commands)
   // are neutralized so the backend's command resolver never sees them — an
@@ -2077,12 +2199,44 @@ async function runPrompt(
   // same lock). Slash commands /auto pause|resume|stop|status were
   // intercepted above, so anything reaching here is conversational input.
   let parked: Promise<acp.PromptResponse> | undefined;
-  // Set when the compaction gate below rejected this prompt.
+  // Set when the compaction wait below outlived its settle cap: the prompt is
+  // rejected rather than held forever (the bounded fallback path).
   let compactBusy = false;
-  // A sandbox continuation has no user watching to resend it: wait the
-  // compaction out instead of hitting the rejection gate. The wait happens
-  // BEFORE any subscribe, so it is residue-free by construction.
+  // Compaction hold. A detached auto-compact holds the backend prompt lock for
+  // minutes; queueing BEHIND the lock is fatal for a subscribed listener (the
+  // compaction's internal-turn stream would be dispatched as THIS prompt's
+  // output, its turn.completed ending the turn before the real reply starts).
+  // So the wait happens HERE — before the turn registers, before the listener
+  // subscribes — where it is residue-free by construction: the prompt then
+  // proceeds through the normal send path, and the send-retry loop absorbs the
+  // tail of the lock window if the compaction is still winding down. This is
+  // the same pre-subscribe shape the goal-loop driver and the sandbox
+  // continuations already use; a user-facing prompt now gets it too instead of
+  // being rejected with "resend after the ✓ line" — the message the user typed
+  // is delivered, the session keeps showing as executing, and there is nothing
+  // to resend. Never wait while holding the preempt lock: a long wait would
+  // block other sessions' register/preempt critical sections.
+  if (server.autoCompactInFlight.has(zcodeSid)) {
+    // Tell the user BEFORE the wait, not after: the wait can run for minutes,
+    // and silence for that long is exactly what made the old rejection read as
+    // "my message vanished". Announced here the client shows the hold notice
+    // while the spinner stays live (the turn is not registered yet, so the
+    // notice is the only feedback during the window).
+    await sendTextChunk(cx, params.sessionId, messages().autoCompactHeld, randomUUID());
+    const { waitForAutoCompactIdle } = await import("../config/auto-compact.js");
+    const settled = await waitForAutoCompactIdle(server, zcodeSid);
+    if (!settled) {
+      // The compaction outlived AUTO_COMPACT_SETTLE_MS. Sending anyway would
+      // hit the busy-reject inside runOneTurn and land in the same trap; reject
+      // so the user can resend against a known-settled session.
+      compactBusy = true;
+    } else {
+      log("session/prompt: held for a detached auto-compact, now sending");
+    }
+  }
   if (continuationRound && server.autoCompactInFlight.has(zcodeSid)) {
+    // A second compaction armed while this continuation waited out the first:
+    // wait again (still pre-subscribe, still residue-free).
     const { waitForAutoCompactIdle } = await import("../config/auto-compact.js");
     await waitForAutoCompactIdle(server, zcodeSid);
   }
@@ -2092,25 +2246,17 @@ async function runPrompt(
       parked = goalLoop.parkPrompt(sendText);
       return;
     }
-    // Compaction gate: a detached auto-compact holds the backend prompt lock
-    // for minutes. NEVER queue behind it — this prompt's listener subscribes
-    // before the send, so waiting out the compaction would accumulate its
-    // whole internal-turn stream in our queue and dispatch it as THIS
-    // prompt's output once the lock releases (its turn.completed even ends
-    // the turn before the real reply starts). Reject with a resend notice;
-    // runOneTurn's busy-reject fallback covers the arm race between this
-    // check and the send.
-    if (server.autoCompactInFlight.has(zcodeSid)) {
-      compactBusy = true;
-      return;
-    }
     server.pendingTurns.set(requestId, turn);
     preempted = preemptInFlightTurn(server, zcodeSid, requestId);
   });
   if (parked) return parked;
   if (compactBusy) {
+    // Only reachable when the compaction outlived AUTO_COMPACT_SETTLE_MS: the
+    // hold above refused to wait indefinitely. The message was never queued, so
+    // the user resends against a session the compaction has (by now) settled.
     await sendTextChunk(cx, params.sessionId, messages().autoCompactBusy, randomUUID());
-    log("session/prompt: rejected — a detached auto-compact is in flight");
+    log("session/prompt: rejected — a detached auto-compact outlived its settle cap");
+    await emitSessionTurnState(server, params.sessionId, false, cx);
     return { stopReason: "max_turn_requests" };
   }
   // Discovery: the session is live the moment its turn STARTS — mark it active
@@ -2158,34 +2304,41 @@ async function runPrompt(
   // alias (see server.sessionAliases) so a client holding this conversation
   // under a different ACP id opens its live turn too. Best-effort: a dead
   // client must not fail the turn.
-  const emitTurnState = async (running: boolean): Promise<void> => {
-    const results = await Promise.allSettled(
-      server
-        .sessionAliases(params.sessionId)
-        .map((sid) => cx.notify("$/zcode/turnState", { sessionId: sid, running })),
-    );
-    for (const r of results) {
-      if (r.status === "rejected") {
-        log(
-          `turnState notify failed: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
-        );
-      }
-    }
-  };
-  await emitTurnState(true);
+  await emitSessionTurnState(server, params.sessionId, true, cx);
 
-  return runOneTurn(server, {
-    backend,
-    cx,
-    acpSid: params.sessionId,
-    zcodeSid,
-    requestId,
-    turn,
-    preempted,
-    sendText,
-    attachments,
-    continuationRound,
-  });
+  // Settled-event push (§5.2): one notification per user turn. Client presence
+  // is deliberately irrelevant — the turn ending IS the "come back" signal.
+  // Goal-loop rounds never reach here (parked prompts resolve via the driver;
+  // loop stops push their own `goal` notification at endLoop).
+  try {
+    const result = await runOneTurn(server, {
+      backend,
+      cx,
+      acpSid: params.sessionId,
+      zcodeSid,
+      requestId,
+      turn,
+      preempted,
+      sendText,
+      attachments,
+      continuationRound,
+    });
+    pushSettled(server, {
+      kind: "turn",
+      label: pushSourceLabel(server, params.sessionId),
+      title:
+        result.stopReason === "end_turn" ? "turn completed" : `turn ended (${result.stopReason})`,
+    });
+    return result;
+  } catch (e) {
+    pushSettled(server, {
+      kind: "turn",
+      label: pushSourceLabel(server, params.sessionId),
+      title: "turn failed",
+      body: e instanceof Error ? e.message : String(e),
+    });
+    throw e;
+  }
 }
 
 /** How long after a cancel a new prompt's attribution gate stays armed (the
@@ -2269,6 +2422,9 @@ export async function cancel(
   server: ZcodeAcpServer,
   params: acp.CancelNotification,
 ): Promise<void> {
+  // ESC is the user at the keyboard — stamp presence for the push quiet
+  // window (the "turn ended (cancelled)" settle right after must not ping).
+  noteUserActivity(server);
   const zcodeSid = server.resolveSid(params.sessionId);
   if (!zcodeSid) return;
   // Cancel ALL matching turns for this session (not just the first). While a
@@ -2283,7 +2439,7 @@ export async function cancel(
       matched = true;
       turn.cancelled = true;
       if (!turn.stopSent) {
-        stopBackendTurn(server, zcodeSid, turn);
+        void stopBackendTurn(server, zcodeSid, turn);
         turn.stopSent = true;
       }
       // Record cancel time so a prompt arriving in the backend's ~20s
@@ -2405,7 +2561,11 @@ export function isBackendLostRequestError(e: unknown): boolean {
  * backend's prompt lock releases when ITS finalisation completes — that,
  * not any bridge-side signal, is what the next prompt's send-retry waits on.
  */
-function stopBackendTurn(server: ZcodeAcpServer, zcodeSid: string, turn: PendingTurn): void {
+async function stopBackendTurn(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+  turn: PendingTurn,
+): Promise<void> {
   if (turn.closed) return;
   const foregroundExecutionId = turn.foregroundExecutionId;
   // A turn whose send was NEVER accepted owns no generation of its own; while
@@ -2423,7 +2583,8 @@ function stopBackendTurn(server: ZcodeAcpServer, zcodeSid: string, turn: Pending
     return;
   }
   try {
-    server.ensureBackend().send("session/stop", { sessionId: zcodeSid });
+    const backend = await server.ensureBackend();
+    backend.send("session/stop", { sessionId: zcodeSid });
   } catch (e) {
     log(
       `  [stop] session/stop send failed (ignored): ${e instanceof Error ? e.message : String(e)}`,
@@ -2441,7 +2602,8 @@ function stopBackendTurn(server: ZcodeAcpServer, zcodeSid: string, turn: Pending
   // at cancel time, letting the backend guard against stopping a newer one.
   // Omitted when unknown, targeting whatever is currently foreground.
   try {
-    server.ensureBackend().send("v4/command", {
+    const backend = await server.ensureBackend();
+    backend.send("v4/command", {
       commandId: randomUUID(),
       clientId: "zcode-acp-server",
       sessionId: zcodeSid,
@@ -2472,9 +2634,10 @@ function stopBackendTurn(server: ZcodeAcpServer, zcodeSid: string, turn: Pending
  * history). Callers reload the session on next use — prompt()'s subscribe
  * recovery and the drain gate's reload both handle the closed window.
  */
-function closeBackendSession(server: ZcodeAcpServer, zcodeSid: string): void {
+async function closeBackendSession(server: ZcodeAcpServer, zcodeSid: string): Promise<void> {
   try {
-    server.ensureBackend().send("session/close", { sessionId: zcodeSid });
+    const backend = await server.ensureBackend();
+    backend.send("session/close", { sessionId: zcodeSid });
     log(`  [stop] session/close fired for ${zcodeSid} (backend ignores session/stop)`);
   } catch (e) {
     log(
@@ -2536,7 +2699,7 @@ export async function drainBackendAfterCancel(
   let escalated = false;
   while (Date.now() - drainT0 < DRAIN_TIMEOUT_MS) {
     if (turn.cancelled) {
-      stopBackendTurn(server, zcodeSid, turn);
+      void stopBackendTurn(server, zcodeSid, turn);
       return "cancelled";
     }
     const proj = await monitor.pollOnce();
@@ -2558,7 +2721,7 @@ export async function drainBackendAfterCancel(
     if (proj.status === "idle") break;
     if (proj.status === "running" && !escalated && Date.now() - drainT0 > escalateAfterMs) {
       escalated = true;
-      closeBackendSession(server, zcodeSid);
+      void closeBackendSession(server, zcodeSid);
     }
     if (!noticed) {
       noticed = true;
@@ -2651,7 +2814,7 @@ export function preemptInFlightTurn(
     if (turn.goalLoop) continue;
     turn.cancelled = true; // signal the old turn to stop its retry loops
     if (!turn.stopSent) {
-      stopBackendTurn(server, zcodeSid, turn);
+      void stopBackendTurn(server, zcodeSid, turn);
       turn.stopSent = true;
     }
     // Record cancel time so the prompt()'s send-retry can use the recovery
@@ -2821,7 +2984,7 @@ async function resumeBackendSession(
   server: ZcodeAcpServer,
   zcParams: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  const backend = server.ensureBackend();
+  const backend = await server.ensureBackend();
   const resp = await backend.request(server.nextId(), "session/resume", zcParams, 30_000);
   if (resp.error) throw backendError("session/resume", resp, String(zcParams.sessionId));
   return (resp.result ?? {}) as Record<string, unknown>;
@@ -2840,17 +3003,13 @@ export async function reloadBackendSession(
   zcodeSid: string,
 ): Promise<void> {
   const cwd = server.sessionCwds.get(acpSid) ?? process.cwd();
-  const zcParams: Record<string, unknown> = {
-    sessionId: zcodeSid,
-    workspace: workspaceFor(cwd),
-  };
   // Eviction/respawn reload: the backend lost the per-load mcpServers runtime
   // config with its resident session — re-send or the tools vanish (#193).
   const reloadMcp = server.sessionMcpServers.get(acpSid);
   if (reloadMcp) {
-    zcParams.mcpServers = reloadMcp;
     log(`session/resume (reload) carrying ${reloadMcp.length} client MCP server(s)`);
   }
+  const zcParams = await resumeParams(server, zcodeSid, cwd, reloadMcp);
   // Same pre-resume steps as the ACP resume/load handlers: register the
   // provider registry (a resumed session's history references a model the
   // fresh backend can't process until its provider is registered — sends
@@ -2962,6 +3121,9 @@ export function cacheModelAvailability(
       providerId: a.ref?.providerId,
       modelId: a.ref?.modelId,
       defaultLevel: a.reasoning?.defaultLevel ?? a.reasoning?.levels?.[0]?.value,
+      levels: (a.reasoning?.levels ?? [])
+        .map((l) => l.value)
+        .filter((v): v is string => typeof v === "string"),
     })),
   );
 }
@@ -3163,13 +3325,16 @@ async function fetchMessagesForReplay(
  * After a faithful resume the session keeps its own last model; when that
  * model no longer belongs to an enabled provider in config.json (deleted or
  * revoked elsewhere), the first send would fail with the backend's
- * stale-history-model error. Repair proactively: switch to the default
- * (first enabled) model. Best-effort — a failed check leaves the model
- * untouched.
+ * stale-history-model error. Repair proactively: switch to the configured
+ * pin (ZCODE_PROVIDER/ZCODE_MODEL) or the first enabled model. Best-effort —
+ * a failed check leaves the model untouched.
  */
-async function repairUnavailableModel(server: ZcodeAcpServer, zcodeSid: string): Promise<void> {
+export async function repairUnavailableModel(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+): Promise<void> {
   try {
-    const backend = server.ensureBackend();
+    const backend = await server.ensureBackend();
     const resp = await backend.request(
       server.nextId(),
       "session/read",
@@ -3187,8 +3352,23 @@ async function repairUnavailableModel(server: ZcodeAcpServer, zcodeSid: string):
     const cur = settings?.model?.current;
     if (!cur?.providerId || !cur.modelId) return;
     const available = loadAllModels();
-    if (available.some((m) => m.providerId === cur.providerId && m.modelId === cur.modelId)) return;
-    const fallback = available[0];
+    // The backend persists the current model under the registry's `account:*`
+    // spelling while loadAllModels() speaks config.json's `builtin:*` —
+    // normalize before comparing, or every resume misreads an enabled model
+    // as gone and silently switches (#270).
+    const curPid = configProviderIdFor(cur.providerId);
+    if (available.some((m) => m.providerId === curPid && m.modelId === cur.modelId)) return;
+    // Genuine repair: fall back to the configured pin, not list order —
+    // available[0] is config-file order, not the user's choice (#270).
+    const pinnedProvider = process.env.ZCODE_PROVIDER;
+    const pinnedModel = process.env.ZCODE_MODEL;
+    const fallback =
+      pinnedProvider && pinnedModel
+        ? (available.find(
+            (m) =>
+              m.providerId === configProviderIdFor(pinnedProvider) && m.modelId === pinnedModel,
+          ) ?? available[0])
+        : available[0];
     if (!fallback) return;
     warn(
       `session ${zcodeSid} model ${cur.providerId}/${cur.modelId} is no longer enabled; switching to ${fallback.providerId}/${fallback.modelId}`,
@@ -3328,7 +3508,7 @@ export async function runEventTurn(
   turn: PendingTurn,
   gateArmed: boolean,
 ): Promise<acp.PromptResponse> {
-  const backend = server.ensureBackend();
+  const backend = await server.ensureBackend();
   const translator = new EventTranslator();
   differ.resetTurn();
   const managedTurn = Boolean(process.env.DD_FLOW_RUNTIME_OWNER);
@@ -3482,33 +3662,37 @@ export async function runEventTurn(
     if (Date.now() - lastUpstreamProgressAt < UPSTREAM_PROGRESS_INTERVAL_MS) return;
 
     const proj = pendingWatermarkProgress;
-    const used = proj ? proj.contextUsed || proj.totalTokenCount || 0 : 0;
+    // Occupancy only (#228): a watermark projection without contextUsed
+    // carries liveness, not a meter — never substitute totalTokenCount
+    // (lifetime consumption). Fall through to the tool heartbeat instead.
+    const used = proj?.contextUsed;
     const activeToolId = [...translator.seenToolIds].find(
       (toolId) => !translator.finalToolIds.has(toolId),
     );
     if (!proj && !activeToolId) return;
 
     try {
-      if (proj) {
+      if (typeof used === "number") {
         // Reuse normal UsageDelta dispatch so a projection that reports a zero
-        // contextWindow gets the configured model limit instead of emitting an
-        // invalid/empty context bar.  The token count itself comes directly
+        // contextWindow gets the configured model limit instead of emitting
+        // an invalid/empty context bar.  The token count itself comes directly
         // from the authoritative session/read projection.
         await dispatchEvent(
           server,
           cx,
           acpSid,
-          { kind: "UsageDelta", used, size: proj.contextWindow ?? 0 },
+          { kind: "UsageDelta", used, size: proj?.contextWindow ?? 0 },
           chunkMsgId,
         );
+        lastUpstreamProgressAt = Date.now();
       } else if (activeToolId) {
         await sendSessionUpdate(cx, acpSid, {
           sessionUpdate: "tool_call_update",
           toolCallId: activeToolId,
           status: "in_progress",
         });
+        lastUpstreamProgressAt = Date.now();
       }
-      lastUpstreamProgressAt = Date.now();
       pendingWatermarkProgress = null;
     } catch (e) {
       // Liveness forwarding is best-effort.  A detached client must not kill
@@ -3530,7 +3714,7 @@ export async function runEventTurn(
         await sendTextChunk(cx, acpSid, reply.text, chunkMsgId);
       } else if (!emittedOutput) {
         // No text and no output → suspected failure.
-        stopBackendTurn(server, turn.zcodeSid, turn);
+        void stopBackendTurn(server, turn.zcodeSid, turn);
         throw new RequestError(-32603, "turn produced no output");
       }
     }
@@ -3547,7 +3731,7 @@ export async function runEventTurn(
       } else if (turn.cancelled) {
         // Preserve the pre-existing bounded cancel behaviour. A stuck prompt
         // lock after stop must not keep a user-cancelled turn alive forever.
-        stopBackendTurn(server, turn.zcodeSid, turn);
+        void stopBackendTurn(server, turn.zcodeSid, turn);
         return turnResult(translator, "max_turn_requests");
       } else {
         const frozenMs = Date.now() - lastWatermarkAdvanceAt;
@@ -3604,7 +3788,7 @@ export async function runEventTurn(
           log(
             `  [stall] watermark frozen ${Math.round(frozenMs / 1000)}s with no output; stopping backend turn`,
           );
-          stopBackendTurn(server, turn.zcodeSid, turn);
+          void stopBackendTurn(server, turn.zcodeSid, turn);
           return turnResult(translator, "max_turn_requests");
         }
       }
@@ -3638,7 +3822,7 @@ export async function runEventTurn(
       // to no turn listener, and the next turn's turn-attribution gate
       // discards any residue that slipped into the queue meanwhile.
       if (!turn.stopSent) {
-        stopBackendTurn(server, turn.zcodeSid, turn);
+        void stopBackendTurn(server, turn.zcodeSid, turn);
         turn.stopSent = true;
       }
       return turnResult(translator, "cancelled");
@@ -3927,7 +4111,7 @@ export async function runEventTurn(
       }
       if (translator.turnFailed) {
         // Best-effort stop in case the failed turn left a residual lock.
-        stopBackendTurn(server, turn.zcodeSid, turn);
+        void stopBackendTurn(server, turn.zcodeSid, turn);
         // Throw a TurnFailedError carrying the structured error so the caller
         // (prompt's retry loop) can classify transient vs fatal. The error
         // message is formatted for display when it ultimately reaches the user.
@@ -4098,7 +4282,7 @@ async function buildSnapshot(
   zcodeSid: string,
   opts: FetchMessagesOptions = {},
 ): Promise<ZcodeSnapshot> {
-  const backend = server.ensureBackend();
+  const backend = await server.ensureBackend();
   const [msgs, readResp] = await Promise.all([
     fetchMessages(server, zcodeSid, opts),
     backend.request(server.nextId(), "session/read", { sessionId: zcodeSid }, 8000),
@@ -4228,7 +4412,7 @@ export async function dispatchPlanIfChanged(
   recheck = true,
 ): Promise<void> {
   try {
-    const backend = server.ensureBackend();
+    const backend = await server.ensureBackend();
     const readResp = await backend.request(
       server.nextId(),
       "session/read",

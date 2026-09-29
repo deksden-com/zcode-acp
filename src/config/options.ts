@@ -13,6 +13,7 @@
 import { readFileSync } from "node:fs";
 import type * as acp from "@agentclientprotocol/sdk";
 
+import { backendCapabilities } from "../backend/adapter.js";
 import type { ZcodeReadResult } from "../backend/types.js";
 import { backendError } from "../backend/errors.js";
 import { recordModelChoice } from "../lazy-sessions.js";
@@ -267,8 +268,18 @@ export function loadAllModels(): ModelRef[] {
       if (pinned && pid !== pinned) continue;
       if (!providerSelectable(pid, p)) continue;
       const providerName = p.name ?? pid;
-      const ids = new Set(Object.keys(p.models ?? {}));
-      for (const modelId of personal?.modelsByProvider.get(pid) ?? []) ids.add(modelId);
+      // Custom providers: once the personal config tracks the provider's
+      // models, THAT list is authoritative. Additions AND deletions land only
+      // there (config.json stopped syncing), and the backend registry knows no
+      // other source for the provider's models — a config.json-only entry is a
+      // deleted-model ghost that fails on switch (observed 2026-09-28). Builtin
+      // providers keep the union: their catalog comes from the account
+      // snapshot, and a personal rule is an override, not a complete list.
+      const personalIds = personal?.modelsByProvider.get(pid);
+      const ids =
+        personalIds !== undefined && !isBuiltinProvider(pid)
+          ? new Set(personalIds)
+          : new Set([...Object.keys(p.models ?? {}), ...(personalIds ?? [])]);
       for (const modelId of ids) {
         out.push({ providerId: pid, providerName, modelId });
       }
@@ -550,6 +561,18 @@ export async function buildConfigOptions(
       const tlAvail = (tlSet.available as Array<Record<string, string>>) ?? [];
       if (tlAvail.length > 0) {
         thoughtOptions = tlAvail.map((a) => ({ value: a.value, name: a.label ?? a.value }));
+        // setModel can leave the runtime briefly holding the PREVIOUS model's
+        // thoughtLevel (upstream clamps its own snapshot for the same reason —
+        // session-mapper.ts: "setModel 后 runtime 可能短暂保留上一个模型的
+        // thoughtLevel"). Never advertise a current outside the new model's
+        // list: the CLI would keep displaying — and re-sending — the old
+        // model's level (observed 2026-09-28 after switches between models
+        // with different level vocabularies).
+        const values = new Set(tlAvail.map((a) => a.value));
+        if (!values.has(currentThought)) {
+          const def = typeof tlSet.defaultLevel === "string" ? tlSet.defaultLevel : undefined;
+          currentThought = def && values.has(def) ? def : (tlAvail[0]?.value ?? currentThought);
+        }
       }
     } catch {
       // keep defaults
@@ -614,6 +637,7 @@ export async function buildConfigOptions(
   // Gated on the RECEIVER's connection identity, not process state — a
   // non-martty client must never see the spec-external string option.
   if (
+    backendCapabilities(server.backendKind).quota &&
     server.quotaDock &&
     receiverRoot !== undefined &&
     server.marttyConnectionRoots.has(receiverRoot)
@@ -652,7 +676,7 @@ export async function setConfigOption(
   }
   const dispatch = CONFIG_DISPATCH[configId];
   if (!dispatch) return null;
-  const backend = server.ensureBackend();
+  const backend = await server.ensureBackend();
   const resp = await backend.request(
     server.nextId(),
     dispatch.method,
@@ -753,11 +777,11 @@ export async function emitConfigOptionUpdate(
     // behind a model switch, so read the new model's limit from config.json.
     try {
       const read = await sessionRead(server, zcodeSid);
-      const proj = (read.projection ?? {}) as {
-        contextUsed?: number;
-        totalTokenCount?: number;
-      };
-      const used = proj.contextUsed || proj.totalTokenCount || 0;
+      const proj = (read.projection ?? {}) as { contextUsed?: number };
+      // Occupancy only (#228): totalTokenCount is lifetime consumption, never
+      // a meter. This refresh exists to re-show SIZE after the switch; used
+      // reads 0 until the backend reports real occupancy.
+      const used = proj.contextUsed ?? 0;
       // The rebuilt options[0] (model) currentValue is the just-switched value.
       const modelOpt = options.find((o) => o.id === "model");
       const { providerId, modelId } = parseModelValue(String(modelOpt?.currentValue ?? ""));
@@ -779,7 +803,7 @@ export async function emitConfigOptionUpdate(
 // ---------- helpers ----------
 
 async function sessionRead(server: ZcodeAcpServer, zcodeSid: string): Promise<ZcodeReadResult> {
-  const backend = server.ensureBackend();
+  const backend = await server.ensureBackend();
   const resp = await backend.request(
     server.nextId(),
     "session/read",

@@ -24,7 +24,7 @@ function serverWith(result: unknown) {
       sessionMap: new Map(),
       backendLoadedSessions: new Map(),
       nextId: () => 1,
-      ensureBackend: () => ({ request }),
+      ensureBackend: async () => ({ request }),
     } as unknown as ZcodeAcpServer,
     request,
   };

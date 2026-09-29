@@ -1,6 +1,6 @@
 allowBuilds:
   esbuild: true
 minimumReleaseAgeExclude:
-  - zcode-acp-martty@0.2.39-zcode.5
+  - zcode-acp-martty@0.2.39-zcode.5 || 0.2.39-zcode.6
 onlyBuiltDependencies:
   - esbuild

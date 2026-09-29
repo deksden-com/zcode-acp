@@ -64,8 +64,10 @@ import type { TerminalPrefs } from "../config/user-config.js";
 import { tuiStatsSegments } from "../config/settings.js";
 import { readCodeFingerprint } from "./code-fingerprint.js";
 import { remoteEnabledLive, remoteTerminalPrefs } from "./config.js";
+import { envWithLoginShell } from "./login-shell-env.js";
 import { accountUsageStats, type UsageStatsResult } from "../handlers/account.js";
 import { BOOT_RESUME_TRIGGER } from "../handlers/session.js";
+import { createSettingsHandler } from "./settings-endpoint.js";
 import {
   composeQuotaDock,
   formatGoDockSegment,
@@ -81,6 +83,14 @@ export interface HubOptions {
   port: number;
   host: string;
   token: string;
+  /**
+   * Absolute path of a web-client build (`dist/`) to serve same-origin: after
+   * every existing route, GET/HEAD paths resolve inside this tree (`/` →
+   * index.html; content-hashed `assets/` are immutable). Unset — or a
+   * missing/unreadable dir at startup (one warning, silent degradation) —
+   * disables the mount; static hits never extend the hub's idle lifetime.
+   */
+  webDir?: string;
   /** Registration TTL before an instance is pruned (default 30s). */
   heartbeatTimeoutMs?: number;
   /**
@@ -241,9 +251,11 @@ function authorized(req: IncomingMessage, url: URL, token: string): boolean {
 }
 
 function setCors(res: ServerResponse): void {
-  // The web UI is deployed as a separate origin; the token is the boundary.
+  // The web UI is deployed either as a separate origin (Netlify/Cloudflare
+  // Pages) or same-origin from the hub's own static mount (remote.webDir);
+  // the token is the boundary in both shapes.
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
   // Custom response headers JS may read cross-origin; without this the file
   // viewer's line-window fetches cannot see X-Zcode-First-Line at all.
@@ -277,6 +289,92 @@ function canonicalPath(p: string): string {
   } catch {
     return p;
   }
+}
+
+/** Minimal closed MIME set for the web client's build output (spec §5). */
+const STATIC_MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
+  ".json": "application/json; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
+};
+
+/**
+ * Resolve the webDir to a canonical serving root, or null (one warning) when
+ * it is missing/unreadable — the hub keeps serving its API either way.
+ */
+function resolveWebRoot(webDir: string): string | null {
+  try {
+    const real = realpathSync(webDir);
+    if (!statSync(real).isDirectory()) throw new Error("not a directory");
+    return real;
+  } catch (e) {
+    warn(
+      `hub: webDir ${webDir} unusable (${e instanceof Error ? e.message : String(e)}) — ` +
+        "static hosting disabled, API unaffected",
+    );
+    return null;
+  }
+}
+
+/**
+ * Serve one GET/HEAD path from the static root. Returns false (nothing
+ * written) for anything that is not a real file inside the root — the
+ * caller's terminal 404 then applies. Traversal defenses are layered: the
+ * URL parser neutralizes literal dot segments, decode + normalize + prefix
+ * check catches the encoded `%2e%2e%2f` spellings, and a realpath re-check
+ * pins the FINAL target inside the root so symlinked files cannot escape.
+ */
+async function serveStatic(
+  root: string,
+  pathname: string,
+  method: string,
+  res: ServerResponse,
+): Promise<boolean> {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return false; // malformed percent-encoding
+  }
+  if (decoded.includes("\0")) return false;
+  if (decoded === "/") decoded = "/index.html";
+  const target = path.normalize(path.join(root, `.${decoded}`));
+  if (target !== root && !target.startsWith(root + path.sep)) return false;
+  let real: string;
+  try {
+    real = realpathSync(target);
+  } catch {
+    return false;
+  }
+  if (real !== root && !real.startsWith(root + path.sep)) return false;
+  let body: Buffer;
+  try {
+    const st = await stat(real);
+    if (!st.isFile()) return false;
+    body = await readFile(real);
+  } catch {
+    return false; // vanished, or a stat race mid-build
+  }
+  const cacheControl = real.startsWith(root + path.sep + "assets" + path.sep)
+    ? "public, max-age=31536000, immutable"
+    : "no-cache";
+  res.writeHead(200, {
+    "Content-Type": STATIC_MIME[path.extname(real).toLowerCase()] ?? "application/octet-stream",
+    "Content-Length": body.length,
+    "Cache-Control": cacheControl,
+    "X-Content-Type-Options": "nosniff",
+  });
+  res.end(method === "HEAD" ? undefined : body);
+  return true;
 }
 
 function validSessions(raw: unknown): SessionSummary[] | null {
@@ -979,6 +1077,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     port,
     host,
     token,
+    webDir,
     heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
     probeGraceMs = PROBE_GRACE_MS,
     idleExitMs = IDLE_EXIT_MS,
@@ -1004,6 +1103,14 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
    */
   const hubFingerprint =
     options.hubFingerprint !== undefined ? options.hubFingerprint : readCodeFingerprint();
+
+  /**
+   * Canonical web-client root (realpath'd webDir) or null when static
+   * hosting is off/unusable. Frozen at startup on purpose: the tree is a
+   * build output; per-request re-resolution buys nothing and a mid-run
+   * disappearance must serve 404s, not warnings.
+   */
+  const webRoot = webDir ? resolveWebRoot(webDir) : null;
 
   const instances = new Map<string, InstanceEntry>();
   const proxyPairs = new Set<{ client: WebSocket; bridge: WebSocket }>();
@@ -1067,8 +1174,16 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     // terminalTuiScript exports the var into the terminal's fresh shell; the
     // detached serve spawn inherits it directly.
     const nonce = randomUUID();
+    // The login-shell completion comes FIRST so the plumbing below overrides
+    // it. This hub is a detached daemon whose birth env came from whatever
+    // spawned its bridge — an editor GUI process, which means launchd's bare
+    // PATH with no version managers in it. Without this, a session opened from
+    // a phone cannot find `pnpm` / `cargo` / `java` even though the same
+    // command works in the user's terminal. The probe is async and shared, so
+    // the hub's event loop (WS proxying, heartbeats) never freezes for it.
+    const shellEnv = await envWithLoginShell();
     const env: NodeJS.ProcessEnv = {
-      ...process.env,
+      ...shellEnv,
       ZCODE_ACP_REMOTE: "1",
       ZCODE_ACP_REMOTE_TOKEN: token,
       ZCODE_ACP_HUB_PORT: String(port),
@@ -1098,7 +1213,10 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     // never saw it). terminalTuiScript exports it into the terminal's fresh
     // shell — launchd's environment would otherwise drop it, and martty
     // reads the variable once at its own process start.
-    const statsFilter = tuiStatsSegments(process.env);
+    //
+    // Read from the completed env, not process.env: the fallback the user
+    // exported in their shell lives only in the login shell's environment.
+    const statsFilter = tuiStatsSegments(env);
     if (statsFilter !== undefined) env.DSH_TUI_STATS = statsFilter;
     if (kind === "resume") {
       // ADR-0017: the requested session rides the env — terminalTuiScript
@@ -1142,7 +1260,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     const launches =
       kind === "serve"
         ? []
-        : (terminalLaunches ?? resolveTerminalLaunches(remoteTerminalPrefs(process.env)));
+        : (terminalLaunches ?? resolveTerminalLaunches(remoteTerminalPrefs(env)));
     let li = 0;
     /**
      * Try launches[li..] until one OPENS; advance li past every failure and
@@ -1365,7 +1483,57 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
 
   let idleSince: number | null = null;
 
+  // Settings API (ADR-0025): the same handler factory the bridge mounts on its
+  // loopback server. No server is passed because settings are machine level —
+  // no session or backend state is consulted, which is also why this works
+  // with zero bridges registered.
+  const settingsHandler = createSettingsHandler();
+
   const wss = new WebSocketServer({ noServer: true });
+
+  /**
+   * Forward a request to one bridge's loopback port, relaying the response.
+   *
+   * Hop-by-hop headers are stripped and the client-side abort is the only thing
+   * that destroys the upstream: `req`'s own 'close' fires as soon as its (often
+   * empty) body drains, which is typically BEFORE the relayed response has
+   * finished writing — keying on it resets the bridge socket on every request.
+   */
+  function relayToBridge(
+    req: IncomingMessage,
+    res: ServerResponse,
+    port: number,
+    path: string,
+    method = req.method ?? "GET",
+  ): void {
+    const upstream = httpRequest({ host: "127.0.0.1", port, path, method }, (up) => {
+      const headers = { ...up.headers };
+      delete headers["transfer-encoding"];
+      delete headers["connection"];
+      res.writeHead(up.statusCode ?? 502, headers);
+      up.pipe(res);
+    });
+    upstream.on("error", () => {
+      if (res.headersSent) res.destroy();
+      else {
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end("bridge unreachable");
+      }
+    });
+    // A mid-body upstream failure (the bridge dying after the headers were
+    // written) emits on the RESPONSE stream, not on the request — so the
+    // 'error' handler above never fires and the client would hang until its own
+    // timeout. Destroy the downstream here so the fetch rejects immediately.
+    upstream.on("response", (up) => {
+      up.on("error", () => {
+        if (!res.writableEnded) res.destroy();
+      });
+    });
+    res.on("close", () => {
+      if (!res.writableEnded) upstream.destroy();
+    });
+    req.pipe(upstream);
+  }
 
   /**
    * Reject a WS upgrade with a real HTTP status before destroying. A bare
@@ -1802,6 +1970,62 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       }
       return;
     }
+    // /api/settings/* — the ZCode configuration API (ADR-0025), served by the
+    // hub itself rather than proxied. The state is machine-level (files under
+    // ~/.zcode/) and no backend RPC is involved, so it works with zero bridges
+    // registered — the same reason /api/quota is hub-local. The handler is the
+    // SAME factory the bridge mounts on its loopback server, so the two routes
+    // cannot drift apart.
+    if (url.pathname.startsWith("/api/settings/")) {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      settingsHandler(req, res);
+      return;
+    }
+    // /api/instances/{id}/settings/... — the per-instance form, proxied to that
+    // bridge's loopback mount. Semantics are identical (same factory); the
+    // instance form exists so a client that is already addressing one bridge
+    // keeps a single base URL.
+    const settingsMatch = url.pathname.match(/^\/api\/instances\/([^/]+)(\/settings\/.*)$/);
+    if (settingsMatch) {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const entry = instances.get(settingsMatch[1]!);
+      if (!entry) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("unknown instance");
+        return;
+      }
+      relayToBridge(req, res, entry.port, settingsMatch[2]! + url.search);
+      return;
+    }
+    // /api/instances/{id}/backend/restart — the documented spelling of the
+    // backend restart (ADR-0025 §needs-restart). It is a bridge-side operation
+    // with no settings state of its own, so the documented URL omits the
+    // /settings/ segment; map it onto the bridge's /settings/backend/restart
+    // rather than making clients guess which prefix carries it.
+    const restartMatch = url.pathname.match(/^\/api\/instances\/([^/]+)\/backend\/restart$/u);
+    if (restartMatch && req.method === "POST") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const entry = instances.get(restartMatch[1]!);
+      if (!entry) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("unknown instance");
+        return;
+      }
+      relayToBridge(req, res, entry.port, "/settings/backend/restart");
+      return;
+    }
     // /api/instances/{id}/fs/... and /status — byte-level proxy to the
     // instance's loopback file/status endpoint (ADR-0004, ADR-0005). The hub
     // routes by instance id only; sessionId, path semantics, and scope checks
@@ -1982,6 +2206,53 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       req.pipe(upstream);
       return;
     }
+    // POST /api/instances/{id}/push/test — the push-channel verification route
+    // (push-backend-requirements §7): strip the instance prefix, forward the
+    // /push/test suffix to the bridge's loopback endpoint. Same
+    // forward-and-relay shape as the session close/rename block above; the hub
+    // parses no body and holds no push state.
+    const pushMatch = url.pathname.match(/^\/api\/instances\/([^/]+)\/(push\/test)$/);
+    if (pushMatch && req.method === "POST") {
+      const [, instId, suffix] = pushMatch;
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const entry = instances.get(instId!);
+      if (!entry) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("unknown instance");
+        return;
+      }
+      const upstream = httpRequest(
+        {
+          host: "127.0.0.1",
+          port: entry.port,
+          path: `/${suffix}`,
+          method: "POST",
+        },
+        (up) => {
+          const headers = { ...up.headers };
+          delete headers["transfer-encoding"];
+          delete headers.connection;
+          res.writeHead(up.statusCode ?? 502, headers);
+          up.pipe(res);
+        },
+      );
+      upstream.on("error", () => {
+        if (res.headersSent) res.destroy();
+        else {
+          res.writeHead(502, { "Content-Type": "text/plain" });
+          res.end("bridge unreachable");
+        }
+      });
+      res.on("close", () => {
+        if (!res.writableEnded) upstream.destroy();
+      });
+      req.pipe(upstream);
+      return;
+    }
     if (
       (url.pathname === "/api/register" || url.pathname === "/api/unregister") &&
       req.method === "POST"
@@ -2013,7 +2284,19 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           id,
           port: bridgePort,
           pid: typeof body.pid === "number" ? body.pid : 0,
-          startedAt: prev?.startedAt ?? (typeof body.startedAt === "number" ? body.startedAt : Date.now()),
+          // The registrant's own start time when it sends one, else the hub's
+          // clock. The sender knows its real boot instant; the hub's `Date.now()`
+          // is skewed by however long the register took to arrive, and a bridge
+          // whose first register is slow (a cold provider sync) would look NEWER
+          // than a bridge that actually started after it. That ordering is
+          // load-bearing: it is the tie-break when two bridges advertise the
+          // same session with the same updatedAt, and the winner is the one
+          // clients attach to. A re-registration keeps the first value seen.
+          startedAt:
+            prev?.startedAt ??
+            (typeof body.startedAt === "number" && Number.isFinite(body.startedAt)
+              ? body.startedAt
+              : Date.now()),
           workspace: typeof body.workspace === "string" ? body.workspace : "",
           sessions,
           lastSeen: Date.now(),
@@ -2061,6 +2344,14 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         log("hub: newer-bridge vote ignored (restart cooldown after a recent restart)");
       }
       return;
+    }
+    // Same-origin web client (opt-in webDir): mounted AFTER every existing
+    // route, so API/WS precedence is untouched. Unauthenticated by design —
+    // public frontend bytes; the bearer token remains the /api/* boundary.
+    // Static hits deliberately never touch idleSince: a configured webDir
+    // must not by itself keep the idle-retire clock from firing.
+    if (webRoot !== null && (req.method === "GET" || req.method === "HEAD")) {
+      if (await serveStatic(webRoot, url.pathname, req.method ?? "GET", res)) return;
     }
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");

@@ -370,6 +370,45 @@ describe("stall termination policy (watermark-based)", () => {
     await expect(turn).resolves.toEqual({ stopReason: "end_turn" });
   });
 
+  it("CP222: reasoning and a completed TodoWrite do not infer completion during the next quiet model request", async () => {
+    vi.stubEnv("DD_FLOW_RUNTIME_OWNER", '{"schema_id":"dd-flow/runtime-owner@1"}');
+    const control = staleRunningBackend();
+    const turn = prompt(setup(control.backend), params, cx, 10);
+    let settled = false;
+    void turn.then(() => {
+      settled = true;
+    });
+    await waitForSend(control.sendRequests);
+
+    // CP222 kept streaming reasoning while read counters stayed frozen.
+    // Cross the stale-watermark age with real events, not polling keepalives.
+    for (let i = 0; i < 7; i++) {
+      await vi.advanceTimersByTimeAsync(90_000);
+      control.emit({
+        type: "model.streaming",
+        payload: { kind: "reasoning_delta", delta: "Planning requirements" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    control.emit({
+      type: "tool.updated",
+      payload: { kind: "started", toolCallId: "todo-cp222", toolName: "TodoWrite" },
+    });
+    control.emit({
+      type: "tool.updated",
+      payload: { kind: "result", toolCallId: "todo-cp222", result: { content: "Updated todos" } },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    // The next native model request has no active tool and is silent for >120s.
+    await vi.advanceTimersByTimeAsync(125_000);
+    expect(settled).toBe(false);
+    expect(control.sendRequests).toHaveBeenCalledTimes(1);
+    expect(control.backend.send).not.toHaveBeenCalled();
+    control.emit({ type: "turn.completed", payload: { resultType: "success" } });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(turn).resolves.toEqual({ stopReason: "end_turn" });
+  });
+
   it("does not stop a silent managed turn from a frozen watermark", async () => {
     vi.stubEnv("DD_FLOW_RUNTIME_OWNER", '{"schema_id":"dd-flow/runtime-owner@1"}');
     const control = staleRunningBackend();

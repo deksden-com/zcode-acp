@@ -39,6 +39,7 @@ function safeError(value: unknown): RecordValue {
 
 export function readRetainedTerminal(
   sessionId: string,
+  startedAt: number,
   endedAt: number,
   turnId?: string,
   dbPath = zcodeUsageDbPath(),
@@ -50,20 +51,23 @@ export function readRetainedTerminal(
       "node:sqlite",
     ) as typeof import("node:sqlite");
     db = new DatabaseSync(dbPath, { readOnly: true });
-    // LIMIT 2 detects ambiguous identity rather than selecting an arbitrary last assistant.
+    // Native topology settles after the message commit. Bound the latest completed
+    // assistant to that exact child lifetime; never choose a nearest timestamp.
     // ponytail: cap native error JSON at 16 KiB; oversized records stay unassessable.
     // Use SQL field projection if native errors routinely exceed this ceiling.
     const rows = db
       .prepare(
         `SELECT
       json_extract(data, '$.anchor.turnId') AS turn_id,
+      json_extract(data, '$.time.completed') AS completed_at,
       substr(json_extract(data, '$.error'), 1, 16384) AS error
       FROM message WHERE session_id = ? AND json_extract(data, '$.role') = 'assistant'
-      AND json_extract(data, '$.time.completed') = ?
-      AND json_type(data, '$.error') = 'object' LIMIT 2`,
+      AND json_extract(data, '$.time.completed') BETWEEN ? AND ?
+      ORDER BY json_extract(data, '$.time.completed') DESC LIMIT 2`,
       )
-      .all(sessionId, endedAt);
-    if (rows.length !== 1) return unavailable;
+      .all(sessionId, startedAt, endedAt);
+    if (!rows.length || (rows.length === 2 && rows[0].completed_at === rows[1].completed_at))
+      return unavailable;
     const row = rows[0];
     if (
       typeof row.turn_id !== "string" ||
@@ -75,8 +79,10 @@ export function readRetainedTerminal(
     return {
       sessionId,
       available: true,
+      startedAt,
+      endedAt,
       terminal_turn_id: row.turn_id,
-      terminal_observed_at: new Date(endedAt).toISOString(),
+      terminal_observed_at: new Date(row.completed_at as number).toISOString(),
       provider_error: safeError(JSON.parse(row.error)),
     };
   } catch {

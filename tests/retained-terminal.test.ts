@@ -45,10 +45,14 @@ describe("retained terminal metadata", () => {
       };
       const insert = db.prepare("INSERT INTO message VALUES (?, ?)");
       insert.run("sess_child", JSON.stringify(message));
-      const result = readRetainedTerminal("sess_child", 1791839989041, "turn_failed", path);
+      const startedAt = 1791839980000,
+        endedAt = 1791839989050;
+      const result = readRetainedTerminal("sess_child", startedAt, endedAt, "turn_failed", path);
       expect(result).toMatchObject({
         available: true,
         sessionId: "sess_child",
+        startedAt,
+        endedAt,
         terminal_turn_id: "turn_failed",
         terminal_observed_at: "2026-10-12T21:19:49.041Z",
         provider_error: {
@@ -58,26 +62,35 @@ describe("retained terminal metadata", () => {
       });
       expect(JSON.stringify(result)).not.toContain("secret");
       expect(
-        readRetainedTerminal("sess_foreign", 1791839989041, "turn_failed", path).available,
+        readRetainedTerminal("sess_foreign", startedAt, endedAt, "turn_failed", path).available,
       ).toBe(false);
-      expect(readRetainedTerminal("sess_child", 1791839989041, "turn_other", path).available).toBe(
-        false,
-      );
-      expect(readRetainedTerminal("sess_child", 1791839989042, undefined, path).available).toBe(
-        false,
-      );
+      expect(
+        readRetainedTerminal("sess_child", startedAt, endedAt, "turn_other", path).available,
+      ).toBe(false);
+      expect(
+        readRetainedTerminal("sess_child", 1791839989042, endedAt, undefined, path).available,
+      ).toBe(false);
       delete (message.error.data.attribution as { retryable?: boolean }).retryable;
       db.exec("DELETE FROM message");
       insert.run("sess_child", JSON.stringify(message));
       expect(
-        JSON.stringify(readRetainedTerminal("sess_child", 1791839989041, undefined, path)),
+        JSON.stringify(readRetainedTerminal("sess_child", startedAt, endedAt, undefined, path)),
       ).not.toContain("retryable");
       insert.run("sess_child", JSON.stringify(message));
-      expect(readRetainedTerminal("sess_child", 1791839989041, undefined, path).available).toBe(
-        false,
+      expect(
+        readRetainedTerminal("sess_child", startedAt, endedAt, undefined, path).available,
+      ).toBe(false);
+      expect(
+        readRetainedTerminal("sess_child", 1, 2, undefined, join(dir, "missing.sqlite")).available,
+      ).toBe(false);
+      db.exec("DELETE FROM message");
+      insert.run("sess_child", JSON.stringify(message));
+      insert.run(
+        "sess_child",
+        JSON.stringify({ ...message, time: { completed: endedAt }, error: undefined }),
       );
       expect(
-        readRetainedTerminal("sess_child", 1, undefined, join(dir, "missing.sqlite")).available,
+        readRetainedTerminal("sess_child", startedAt, endedAt, undefined, path).available,
       ).toBe(false);
     } finally {
       db.close();

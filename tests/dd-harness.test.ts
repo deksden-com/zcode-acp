@@ -74,10 +74,10 @@ describe("dd harness extensions", () => {
       "endedAt",
     );
     await expect(
-      retainedTerminal(server, { sessionId: "sess_child", endedAt: 1, turnId: "" }),
+      retainedTerminal(server, { sessionId: "sess_child", startedAt: 1, endedAt: 1, turnId: "" }),
     ).rejects.toThrow("turnId");
     await expect(
-      retainedTerminal(server, { sessionId: "sess_child", endedAt: 1 }),
+      retainedTerminal(server, { sessionId: "sess_child", startedAt: 1, endedAt: 1 }),
     ).resolves.toEqual({ sessionId: "sess_native", available: false });
     expect(request).not.toHaveBeenCalled();
   });

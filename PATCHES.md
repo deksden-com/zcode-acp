@@ -27,7 +27,10 @@ requirement before selecting this tuple for a scored run.
 - Forward documented `endedCursor` in retained topology reads; the 25-child
   regression in `dd-harness.test.ts` checks both pages without session resume.
 - `zcode/session/retainedTerminal` reads bounded terminal metadata for exact
-  native child/completion/turn from the existing read-only message store.
+  native child lifetime/terminal turn from the existing read-only message store.
+  Topology endedAt can follow the assistant commit; select the unique latest
+  completed assistant inside the exact startedAt/endedAt interval, not a nearest
+  timestamp or an older error hidden by a later successful assistant.
   Native `session/read` and `session/messages` require a resident and cannot
   serve closed children. Error projection excludes raw headers/body and never
   guesses retryability; absent or ambiguous evidence remains unavailable.

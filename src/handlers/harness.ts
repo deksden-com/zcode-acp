@@ -85,10 +85,17 @@ export async function retainedTerminal(
     (params.endedAt as number) > 8.64e15
   )
     throw new Error("Terminal inspection requires an exact endedAt timestamp");
+  if (
+    !Number.isSafeInteger(params.startedAt) ||
+    (params.startedAt as number) <= 0 ||
+    (params.startedAt as number) > (params.endedAt as number)
+  )
+    throw new Error("Terminal inspection requires an exact child lifetime startedAt");
   if (params.turnId !== undefined && (typeof params.turnId !== "string" || !params.turnId.trim()))
     throw new Error("Terminal inspection turnId must be nonempty");
   return readRetainedTerminal(
     nativeId,
+    params.startedAt as number,
     params.endedAt as number,
     params.turnId as string | undefined,
   );

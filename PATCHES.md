@@ -22,6 +22,19 @@ Tests: dd-harness, session-lazy, background tasks, adapter usage and cancellatio
 regressions, plus upstream CI checks. Native qualification remains a separate
 requirement before selecting this tuple for a scored run.
 
+### CP225 retained evidence repair
+
+- Forward documented `endedCursor` in retained topology reads; the 25-child
+  regression in `dd-harness.test.ts` checks both pages without session resume.
+- `zcode/session/retainedTerminal` reads bounded terminal metadata for exact
+  native child/completion/turn from the existing read-only message store.
+  Native `session/read` and `session/messages` require a resident and cannot
+  serve closed children. Error projection excludes raw headers/body and never
+  guesses retryability; absent or ambiguous evidence remains unavailable.
+  `retained-terminal.test.ts` covers CP225 stream failure and identity mismatch.
+- Remove the storage reader when native provides equivalent side-effect-free,
+  bounded terminal facts; remove cursor overlay when upstream forwards it.
+
 ### Native recovery integration (reviewed archive)
 
 The old experiment was reviewed by behavior, not transplanted by file:

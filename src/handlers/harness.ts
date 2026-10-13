@@ -1,5 +1,6 @@
 /** Downstream native-evidence transport. Consumer policy belongs in dd-zcode. */
 import { backendError } from "../backend/errors.js";
+import { readRetainedTerminal } from "../backend/retained-terminal.js";
 import type { ZcodeResponse } from "../backend/types.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { log } from "../utils.js";
@@ -57,9 +58,47 @@ export async function retainedSubagents(
     throw new Error("Retained topology requires a native Session identity");
   const response = await (
     await server.ensureBackend()
-  ).request(server.nextId(), "session/subagents", { sessionId: nativeId }, 15000);
+  ).request(
+    server.nextId(),
+    "session/subagents",
+    {
+      sessionId: nativeId,
+      ...(params.endedCursor !== undefined ? { endedCursor: params.endedCursor } : {}),
+    },
+    15000,
+  );
   if (response.error) nativeFailure("session/subagents", nativeId, response);
   return { sessionId: nativeId, topology: response.result ?? null };
+}
+
+/** Exact retained terminal metadata; never materialize a closed child. */
+export async function retainedTerminal(
+  server: ZcodeAcpServer,
+  params: ExtensionParams,
+): Promise<Result> {
+  const nativeId = server.resolveSid(params.sessionId) ?? params.sessionId;
+  if (!nativeId.startsWith("sess_"))
+    throw new Error("Terminal inspection requires a native Session identity");
+  if (
+    !Number.isSafeInteger(params.endedAt) ||
+    (params.endedAt as number) <= 0 ||
+    (params.endedAt as number) > 8.64e15
+  )
+    throw new Error("Terminal inspection requires an exact endedAt timestamp");
+  if (
+    !Number.isSafeInteger(params.startedAt) ||
+    (params.startedAt as number) <= 0 ||
+    (params.startedAt as number) > (params.endedAt as number)
+  )
+    throw new Error("Terminal inspection requires an exact child lifetime startedAt");
+  if (params.turnId !== undefined && (typeof params.turnId !== "string" || !params.turnId.trim()))
+    throw new Error("Terminal inspection turnId must be nonempty");
+  return readRetainedTerminal(
+    nativeId,
+    params.startedAt as number,
+    params.endedAt as number,
+    params.turnId as string | undefined,
+  );
 }
 export const usage = (server: ZcodeAcpServer, params: ExtensionParams) =>
   inspectSession(server, params, "session/usage");

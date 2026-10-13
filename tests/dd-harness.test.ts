@@ -7,6 +7,7 @@ import {
   resolveSession,
   residentSession,
   retainedSubagents,
+  retainedTerminal,
   subagents,
   usage,
 } from "../src/handlers/harness.js";
@@ -31,6 +32,55 @@ function serverWith(result: unknown) {
 }
 
 describe("dd harness extensions", () => {
+  it("reads all 25 ended children through retained cursor pages without resume", async () => {
+    const children = Array.from({ length: 25 }, (_, index) => ({
+      sessionId: `sess_child_${index}`,
+    }));
+    const { server, request } = serverWith({});
+    server.isBackendSessionLive = () => false;
+    request.mockImplementation(async (_id, method, params) => {
+      expect(method).toBe("session/subagents");
+      const offset = params.endedCursor === "page_20" ? 20 : 0;
+      return {
+        result: {
+          ended: {
+            total: 25,
+            items: children.slice(offset, offset + 20),
+            ...(offset === 0 ? { nextCursor: "page_20" } : {}),
+          },
+        },
+      };
+    });
+    const first = await retainedSubagents(server, { sessionId: "sess_native" });
+    const ended = (first.topology as { ended: { items: unknown[]; nextCursor: string } }).ended;
+    const second = await retainedSubagents(server, {
+      sessionId: "sess_native",
+      endedCursor: ended.nextCursor,
+    });
+    expect([
+      ...ended.items,
+      ...(second.topology as { ended: { items: unknown[] } }).ended.items,
+    ]).toEqual(children);
+    expect(request).toHaveBeenLastCalledWith(
+      1,
+      "session/subagents",
+      { sessionId: "sess_native", endedCursor: "page_20" },
+      15000,
+    );
+  });
+  it("requires an exact terminal identity and never requests native load/resume", async () => {
+    const { server, request } = serverWith({});
+    await expect(retainedTerminal(server, { sessionId: "sess_child", endedAt: 0 })).rejects.toThrow(
+      "endedAt",
+    );
+    await expect(
+      retainedTerminal(server, { sessionId: "sess_child", startedAt: 1, endedAt: 1, turnId: "" }),
+    ).rejects.toThrow("turnId");
+    await expect(
+      retainedTerminal(server, { sessionId: "sess_child", startedAt: 1, endedAt: 1 }),
+    ).resolves.toEqual({ sessionId: "sess_native", available: false });
+    expect(request).not.toHaveBeenCalled();
+  });
   it("reads retained topology without materializing or resuming a session", async () => {
     const { server, request } = serverWith({ childSessionIds: [] });
     server.isBackendSessionLive = () => false;

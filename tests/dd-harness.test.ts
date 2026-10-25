@@ -32,6 +32,25 @@ function serverWith(result: unknown) {
 }
 
 describe("dd harness extensions", () => {
+  it("does not leak bridge effects options into strict native subagent parameters", async () => {
+    const { server, request } = serverWith({
+      revision: 1,
+      childSessionIds: [],
+      running: [],
+      ended: { total: 0, items: [] },
+    });
+    await subagents(server, {
+      sessionId: "sess_native",
+      proofContract: "zcode/retained-child-effects@1",
+      parentSessionId: "sess_parent",
+    });
+    expect(request).toHaveBeenCalledWith(
+      1,
+      "session/subagents",
+      { sessionId: "sess_native" },
+      15000,
+    );
+  });
   it("reads all 25 ended children through retained cursor pages without resume", async () => {
     const children = Array.from({ length: 25 }, (_, index) => ({
       sessionId: `sess_child_${index}`,

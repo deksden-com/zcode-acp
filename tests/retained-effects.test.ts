@@ -323,6 +323,62 @@ it("accepts typed SendMessage success plus native current-lifetime metadata with
       agentId: "agent_owned",
       childSessionId: "sess_child",
       parentSessionId: "sess_parent",
+      parentToolUseId: "call_send",
+      createdAt: new Date(140).toISOString(),
+      status: "running",
+    }),
+  );
+  db.prepare("UPDATE message SET data=? WHERE id=?").run(
+    JSON.stringify({
+      role: "assistant",
+      anchor: { turnId: "turn_predecessor" },
+      time: { created: 100, completed: 110 },
+    }),
+    "assistant",
+  );
+  const inspect = () =>
+    readRetainedChildBinding(
+      "sess_child",
+      "sess_parent",
+      "agent_owned",
+      "call_launch",
+      file.replace(/agents.*$/, "db/db.sqlite"),
+    );
+  const partial = inspect();
+  expect(partial).toMatchObject({
+    current_turn_id: "turn_predecessor",
+    continuation_admission: {
+      proof_kind: "parent_tool_admission",
+      parent_turn_id: "turn_parent",
+      parent_tool_call_id: "call_send",
+      successor_started_at: 140,
+    },
+  });
+  expect(
+    (partial.continuation_admission as Record<string, unknown>).successor_turn_id,
+  ).toBeUndefined();
+  expect((partial.continuation_admission as Record<string, unknown>).message_id).toBeUndefined();
+  db.prepare("UPDATE message SET data=? WHERE id=?").run(
+    JSON.stringify({
+      role: "assistant",
+      anchor: { turnId: "turn_successor" },
+      time: { created: 145, completed: 150 },
+    }),
+    "assistant",
+  );
+  expect(inspect()).toMatchObject({
+    current_turn_id: "turn_successor",
+    continuation_admission: {
+      proof_kind: "parent_tool_successor",
+      successor_turn_id: "turn_successor",
+    },
+  });
+  writeFileSync(
+    file,
+    JSON.stringify({
+      agentId: "agent_owned",
+      childSessionId: "sess_child",
+      parentSessionId: "sess_parent",
       parentToolUseId: "call_foreign",
       createdAt: new Date(140).toISOString(),
     }),

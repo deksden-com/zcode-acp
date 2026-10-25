@@ -58,6 +58,11 @@ requirement before selecting this tuple for a scored run.
   retained child history alone does not restore SendMessage capability. Only a
   freshly created root bound to the current backend can receive a continuation
   reference; real resume/close invalidates that in-memory ownership fact.
+- Before the successor Turn reaches SQLite, `parent_tool_admission` can retain
+  typed SendMessage success plus exact new native lifetime/tool binding. It is
+  admission-only evidence: no invented Turn/message ID, no completion claim and
+  no resend. A later read upgrades it to `parent_tool_successor` only after the
+  native successor message exists.
 - Narrow regressions: `retained-effects`, `retained-terminal`, `dd-harness`, and
   managed cases in `turn-state`. No model qualification is part of ordinary tests.
 - Remove these downstream extensions only after equivalent native managed retry

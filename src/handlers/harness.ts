@@ -29,10 +29,10 @@ function enrichedChild(value: unknown, parentSessionId: string): Result {
     item.toolCallId,
   );
   const successor = record(binding.continuation_admission);
-  const startedAt =
-    successor.proof_kind === "parent_tool_successor"
-      ? successor.successor_started_at
-      : item.startedAt;
+  const admitted = ["parent_tool_successor", "parent_tool_admission"].includes(
+    String(successor.proof_kind),
+  );
+  const startedAt = admitted ? successor.successor_started_at : item.startedAt;
   const terminal =
     ["success", "failed", "cancelled"].includes(String(item.status)) &&
     typeof binding.latest_terminal_turn_id === "string" &&
@@ -45,7 +45,7 @@ function enrichedChild(value: unknown, parentSessionId: string): Result {
     ...item,
     ...binding,
     ...(terminal ? { terminal_turn_id: binding.latest_terminal_turn_id } : {}),
-    ...(successor.proof_kind === "parent_tool_successor"
+    ...(admitted
       ? {
           startedAt: successor.successor_started_at,
           toolCallId: successor.parent_tool_call_id,

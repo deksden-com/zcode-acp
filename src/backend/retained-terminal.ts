@@ -324,22 +324,26 @@ export function readRetainedChildBinding(
         Number.isSafeInteger(metadata.metadata_started_at) &&
         typeof start === "number" &&
         Number(metadata.metadata_started_at) >= start &&
-        typeof latest?.turn_id === "string" &&
-        typeof latest.created_at === "number" &&
-        latest.created_at >= Number(metadata.metadata_started_at)
+        typeof record(state.time).end === "number" &&
+        Number(metadata.metadata_started_at) <= Number(record(state.time).end)
       ) {
+        const successor =
+          typeof latest?.turn_id === "string" &&
+          typeof latest.created_at === "number" &&
+          latest.created_at >= Number(metadata.metadata_started_at);
+        if (!successor && metadata.metadata_status !== "running") continue;
         admission = {
           schema_id: "zcode/child-admission@1",
-          proof_kind: "parent_tool_successor",
+          proof_kind: successor ? "parent_tool_successor" : "parent_tool_admission",
           child_session_id: sessionId,
           parent_session_id: parentSessionId,
           agent_id: agentId,
           parent_tool_call_id: part.callID,
           parent_turn_id: row.turn_id,
           successor_started_at: metadata.metadata_started_at,
-          successor_turn_id: latest.turn_id,
+          ...(successor ? { successor_turn_id: latest!.turn_id } : {}),
           native_evidence_sha256: createHash("sha256")
-            .update(JSON.stringify({ part, metadata, turn_id: latest.turn_id }))
+            .update(JSON.stringify({ part, metadata, turn_id: successor ? latest!.turn_id : null }))
             .digest("hex"),
         };
         continue;
@@ -449,6 +453,9 @@ function readChildMetadata(
         ? { metadata_parent_tool_call_id: data.parentToolUseId }
         : {}),
       metadata_sha256: createHash("sha256").update(bytes).digest("hex"),
+      ...(["running", "completed", "failed", "stopped"].includes(String(data.status))
+        ? { metadata_status: data.status }
+        : {}),
     };
   } catch {
     return {};

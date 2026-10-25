@@ -14,6 +14,7 @@
 import { log } from "../utils.js";
 import { backendCapabilities, type BackendCapabilities, type ServerRequest } from "./adapter.js";
 import { JsonRpcChild } from "./jsonrpc-child.js";
+import { nativeStorageHome } from "./resolve.js";
 import type { ZcodeEvent } from "./types.js";
 
 // The generic wire vocabulary (ServerRequest, EventListener) lives in
@@ -23,6 +24,7 @@ export type { EventListener, ServerRequest } from "./adapter.js";
 
 export class ZcodeBackend extends JsonRpcChild {
   readonly capabilities: BackendCapabilities = backendCapabilities("zcode");
+  readonly storageHome: string;
 
   /**
    * Arrival-time responder for `interaction/requestProviderRuntimeHeaders`.
@@ -56,6 +58,7 @@ export class ZcodeBackend extends JsonRpcChild {
       cliLabel: "zcode CLI",
       binEnvVar: "ZCODE_BIN",
     });
+    this.storageHome = nativeStorageHome(env);
   }
 
   protected handleNotification(method: string, params: Record<string, unknown>): void {

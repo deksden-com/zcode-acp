@@ -206,6 +206,14 @@ export function builtinProviderEnv(entryArg?: string): NodeJS.ProcessEnv {
  * silently wired to the wrong tree.
  */
 let warnedNonZcodeHome = false;
+/** Snapshot the native process's storage selection, not the bridge's config home. */
+export function nativeStorageHome(env: NodeJS.ProcessEnv): string {
+  return path.resolve(
+    env.ZCODE_DATA_BASE_DIR?.trim() || env.HOME?.trim() || os.homedir(),
+    ".zcode",
+  );
+}
+
 export function zcodeDataBaseDirEnv(): NodeJS.ProcessEnv {
   const home = process.env.ZCODE_HOME?.trim();
   if (!home) return {};

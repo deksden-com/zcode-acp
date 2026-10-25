@@ -18,7 +18,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { resolveZcodeCommand } from "../src/backend/resolve.js";
+import { nativeStorageHome, resolveZcodeCommand } from "../src/backend/resolve.js";
 
 const SAVED = {
   ZCODE_BIN: process.env.ZCODE_BIN,
@@ -27,6 +27,35 @@ const SAVED = {
   ZCODE_DISALLOWED_TOOLS: process.env.ZCODE_DISALLOWED_TOOLS,
   ZCODE_ENABLE_AUTOMATION_TOOLS: process.env.ZCODE_ENABLE_AUTOMATION_TOOLS,
 };
+
+describe("native storage binding", () => {
+  it("follows the actual native base-dir env instead of bridge HOME", () => {
+    expect(
+      nativeStorageHome({ HOME: "/home/default", ZCODE_DATA_BASE_DIR: "/home/selected" }),
+    ).toBe(path.resolve("/home/selected/.zcode"));
+    expect(nativeStorageHome({ HOME: "/home/default" })).toBe(path.resolve("/home/default/.zcode"));
+  });
+  it("does not mistake an incompatible bridge override for native storage", async () => {
+    const { zcodeDataBaseDirEnv } = await import("../src/backend/resolve.js");
+    const previous = process.env.ZCODE_HOME;
+    try {
+      process.env.ZCODE_HOME = "/tmp/not-a-native-tree";
+      const env = {
+        HOME: "/home/default",
+        ZCODE_DATA_BASE_DIR: "/home/selected",
+        ...zcodeDataBaseDirEnv(),
+      };
+      expect(nativeStorageHome(env)).toBe(path.resolve("/home/selected/.zcode"));
+      process.env.ZCODE_HOME = "/tmp/isolated/.zcode";
+      expect(nativeStorageHome({ ...env, ...zcodeDataBaseDirEnv() })).toBe(
+        path.resolve("/tmp/isolated/.zcode"),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.ZCODE_HOME;
+      else process.env.ZCODE_HOME = previous;
+    }
+  });
+});
 
 afterEach(() => {
   for (const [k, v] of Object.entries(SAVED)) {

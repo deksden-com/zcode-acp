@@ -18,6 +18,17 @@ artifact identity; npm package/CLI names remain upstream-compatible for now.
 Upstream npm release automation is disabled in this fork. Build does not notify
 or restart an existing local hub. Qualification is separate from a passing build.
 
+Managed consumers can negotiate `dd-flow/managed-provider-recovery@1` through
+`_meta.zcode.ddFlowRecovery`: one semantic send per prompt, structured failures,
+and no bridge-owned prompt replay. Standalone retry behavior is unchanged.
+Optional `zcode/retained-child-effects@1` inspection reads native storage without
+resuming children and returns only bounded identity/effect facts. Completed shell
+or unknown tools do not establish settled background effects. Same-child recovery
+also requires the original live backend task registry; a backend restart is not
+permission to recreate a child. Inspection omits continuation authority for
+unproven backend generations or resumed roots, even when retained history is
+readable. See [the patch contract](PATCHES.md#managed-provider-recovery).
+
 [![CI](https://github.com/william0wang/zcode-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/william0wang/zcode-acp/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 

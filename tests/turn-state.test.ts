@@ -86,6 +86,60 @@ function promptParams(): acp.PromptRequest {
   return { sessionId: "sess_ts", prompt: [{ type: "text", text: "hello" }] } as acp.PromptRequest;
 }
 
+describe("managed controller recovery", () => {
+  const recovery = {
+    schema_id: "dd-flow/managed-provider-recovery@1",
+    owner: "controller",
+    operation_id: "operation:one",
+    root_operation_id: "root:one",
+  };
+  const params = () => ({ ...promptParams(), _meta: { zcode: { ddFlowRecovery: recovery } } });
+  it("sends once on transient terminal failure and retains native envelope Turn and acknowledgement", async () => {
+    const backend = scriptedBackend(() => [
+      { type: "turn.started", turnId: "turn_native" },
+      {
+        type: "turn.failed",
+        turnId: "turn_native",
+        payload: {
+          error: {
+            code: "UNKNOWN_ERROR",
+            cause: { code: "model_request_failed", message: "Network connection failed" },
+          },
+        },
+      },
+    ]);
+    const send = vi.spyOn(backend, "request");
+    const server = setup(backend),
+      { cx } = collectCx();
+    await expect(prompt(server, params(), cx, 1)).rejects.toMatchObject({
+      data: { _meta: { zcode: { ddFlowRecovery: recovery }, zcodeNativeTurnId: "turn_native" } },
+    });
+    expect(send.mock.calls.filter((call) => call[1] === "session/send")).toHaveLength(1);
+  });
+  it("acknowledges unknown setup failure and never consumes a sandbox continuation", async () => {
+    const server = setup(scriptedBackend(() => [])),
+      { cx } = collectCx();
+    server.sandboxContinuations.set("sess_ts", "continue");
+    vi.spyOn(server, "ensureBackend").mockRejectedValue(new Error("private setup detail"));
+    await expect(prompt(server, params(), cx, 1)).rejects.toMatchObject({
+      data: { code: "native_outcome_unknown", _meta: { zcode: { ddFlowRecovery: recovery } } },
+    });
+    expect(server.sandboxContinuations.has("sess_ts")).toBe(false);
+  });
+  it("returns native envelope Turn on a successful managed prompt", async () => {
+    const server = setup(
+      scriptedBackend(() => [
+        { type: "turn.started", turnId: "turn_success" },
+        { type: "turn.completed", turnId: "turn_success", payload: { resultType: "success" } },
+      ]),
+    );
+    expect(await prompt(server, params(), collectCx().cx, 1)).toMatchObject({
+      stopReason: "end_turn",
+      _meta: { zcode: { ddFlowRecovery: recovery }, zcodeNativeTurnId: "turn_success" },
+    });
+  });
+});
+
 describe("$/zcode/turnState emission", () => {
   it("emits running:true at turn start and running:false at completion", async () => {
     const server = setup(

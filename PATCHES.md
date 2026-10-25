@@ -38,6 +38,31 @@ requirement before selecting this tuple for a scored run.
 - Remove the storage reader when native provides equivalent side-effect-free,
   bounded terminal facts; remove cursor overlay when upstream forwards it.
 
+### Managed provider recovery
+
+- Initialize advertises `dd-flow/managed-provider-recovery@1`. Managed prompts
+  supply operation/root-operation IDs and receive the exact acknowledgement on
+  success or failure, plus the native envelope Turn ID when available. Semantic
+  retry, backend-lost replay and sandbox continuation are controller-owned;
+  standalone callers retain upstream behavior.
+- Optional `zcode/retained-child-effects@1` on subagent/retained-terminal reads
+  binds exact native parent, child lifetime and Turn. Read-only bounded SQLite
+  inspection and before/after topology fences never load or resume the child.
+  Unknown/pending tools, unsupported shell effects, changed topology, missing
+  storage or metadata remain unproven rather than successful.
+- Native persisted SendMessage output can omit messageId/delivery. The
+  `parent_tool_successor` proof instead binds typed success to the exact parent
+  Turn/tool, same child/agent, current native lifecycle metadata and successor
+  Turn. It never fabricates an ID or infers delivery from prose. Unknown admission
+  cannot be resent. A restarted native backend loses its local-agent registry;
+  retained child history alone does not restore SendMessage capability. Only a
+  freshly created root bound to the current backend can receive a continuation
+  reference; real resume/close invalidates that in-memory ownership fact.
+- Narrow regressions: `retained-effects`, `retained-terminal`, `dd-harness`, and
+  managed cases in `turn-state`. No model qualification is part of ordinary tests.
+- Remove these downstream extensions only after equivalent native managed retry
+  ownership and durable child admission/effects APIs are available.
+
 ### Native recovery integration (reviewed archive)
 
 The old experiment was reviewed by behavior, not transplanted by file:

@@ -8,6 +8,7 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
+import { managedRecoveryCapability } from "./backend/managed-recovery.js";
 
 import {
   builtinProviderEnv,
@@ -66,6 +67,7 @@ export interface PendingTurn {
    * app-server (its abort controller is never registered; see AGENTS.md).
    */
   foregroundExecutionId?: string;
+  nativeTurnId?: string;
   /**
    * Set when the turn was ended by the stall-recovery heuristic (backend
    * reported idle after a silence) rather than a real turn.completed event.
@@ -440,6 +442,9 @@ export class ZcodeAcpServer {
    * `markBackendLoaded`/`isBackendSessionLive` instead of touching the map.
    */
   readonly backendLoadedSessions = new Map<string, number>();
+  /** Fresh native roots whose local-agent registry belongs to this exact backend.
+   * Loading retained history does not recreate that registry. Never persist this. */
+  readonly nativeChildRegistryParents = new Map<string, ZcodeBackend>();
   /**
    * Sessions eligible for the one-shot auto-title. Only `session/new`
    * populates this — resumed/loaded sessions already carry a title, so their
@@ -1044,6 +1049,7 @@ export class ZcodeAcpServer {
     return {
       protocolVersion: PROTOCOL_VERSION,
       agentInfo: { ...AGENT_INFO },
+      _meta: { zcode: { ddFlowRecovery: managedRecoveryCapability } },
       agentCapabilities: {
         loadSession: true,
         promptCapabilities: { image: true, audio: false, embeddedContext: false },
@@ -1054,7 +1060,7 @@ export class ZcodeAcpServer {
         sessionCapabilities: { list: {}, resume: {}, fork: {} },
         // Read-only session file access lives on the bridge's loopback /fs
         // endpoint, hub-proxied at /api/instances/{id}/fs/* (ADR-0004).
-        _meta: { zcode: { fs: true } },
+        _meta: { zcode: { fs: true, ddFlowRecovery: managedRecoveryCapability } },
       },
       // The GLM API key is read from ~/.zcode/v2/config.json by the ZCode
       // backend subprocess; the editor never needs to supply credentials.

@@ -19,6 +19,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
 
 import { backendCapabilities } from "../backend/adapter.js";
+import { managedRecovery } from "../backend/managed-recovery.js";
 import type { ZcodeBackend } from "../backend/client.js";
 import { backendError, isUnknownBackendOutcome } from "../backend/errors.js";
 import {
@@ -770,6 +771,7 @@ export async function ensureRealSession(
       recordMaterializedSession(acpSid, sid, pending.cwd);
       recordMaterializedSession(sid, sid, pending.cwd);
       server.registerSession(acpSid, sid);
+      server.nativeChildRegistryParents.set(sid, backend);
       // Notify only the requesting consumer; never broadcast private aliases.
       await opts.onAllocated?.(sid);
     };
@@ -1483,6 +1485,39 @@ export async function prompt(
   // continuation loop below must NOT re-stamp (bridge-internal rounds are not
   // the user being at the desk).
   noteUserActivity(server);
+  const managed = managedRecovery(params._meta);
+  if (managed) {
+    try {
+      const result = await runPrompt(server, params, cx, requestId, false, client);
+      return {
+        ...result,
+        _meta: {
+          ...result._meta,
+          zcode: { ...(result._meta?.zcode as object), ddFlowRecovery: managed },
+        },
+      };
+    } catch (error) {
+      const request =
+        error instanceof RequestError
+          ? error
+          : new RequestError(-32603, "Managed native prompt failed with an unconfirmed outcome", {
+              code: "native_outcome_unknown",
+            });
+      const data =
+        request.data && typeof request.data === "object"
+          ? (request.data as Record<string, unknown>)
+          : {};
+      const meta =
+        data._meta && typeof data._meta === "object" ? (data._meta as Record<string, unknown>) : {};
+      throw new RequestError(request.code, request.message, {
+        ...data,
+        _meta: { ...meta, zcode: { ddFlowRecovery: managed } },
+      });
+    } finally {
+      // The managed controller alone owns follow-up semantic sends.
+      server.sandboxContinuations.delete(params.sessionId);
+    }
+  }
   let result = await runPrompt(server, params, cx, requestId, false, client);
   // Sandbox-allow continuation chaining, BOUNDED: each batched restart
   // cancels the in-flight round and queues a continuation for prompt() to
@@ -1564,6 +1599,7 @@ export interface RunOneTurnOptions {
   continuationRound?: boolean;
   /** Run the env-gated maybeAutoCompact after an end_turn. Default true. */
   autoCompact?: boolean;
+  managedRecovery?: Record<string, string>;
 }
 
 /**
@@ -1656,14 +1692,14 @@ export async function runOneTurn(
     // user-visible message and return end_turn so the session stays usable.
     // 1 initial attempt + 5 retries. Backoff grows exponentially then caps so
     // later retries don't keep stretching: 1s, 2s, 4s, 4s, 4s.
-    const MAX_TURN_ATTEMPTS = 6;
+    const MAX_TURN_ATTEMPTS = opts.managedRecovery ? 1 : 6;
     const MAX_BACKOFF_MS = 4000;
     const backoffMs = (attempt: number): number =>
       Math.min(1000 * 2 ** (attempt - 1), MAX_BACKOFF_MS);
     let lastTurnError: Record<string, unknown> | null = null;
     // Backend-lost (process died / storage closed mid-turn) gets its own cap:
     // each recovery respawns the subprocess, so an unbounded retry would churn.
-    const MAX_BACKEND_LOST_RETRIES = 2;
+    const MAX_BACKEND_LOST_RETRIES = opts.managedRecovery ? 0 : 2;
     let backendLostRetries = 0;
     let suppressRetryNotice = false;
 
@@ -2015,7 +2051,7 @@ export async function runOneTurn(
             lastTurnError = e.turnError;
             continue;
           }
-          if (!transient) throw turnFailureRequestError(e);
+          if (!transient || opts.managedRecovery) throw turnFailureRequestError(e);
         }
         throw e;
       }
@@ -2077,6 +2113,7 @@ async function runPrompt(
   continuationRound = false,
   client?: acp.AgentContext,
 ): Promise<acp.PromptResponse> {
+  const recovery = managedRecovery(params._meta);
   // Project-level sandbox flip (ADR-0011): a .zcode/acp/sandbox.json created
   // after the backend spawned unsandboxed must arm on THIS prompt, not on the
   // next bridge restart — kill the old process; the ensureBackend() below
@@ -2322,6 +2359,7 @@ async function runPrompt(
       sendText,
       attachments,
       continuationRound,
+      managedRecovery: recovery,
     });
     pushSettled(server, {
       kind: "turn",
@@ -2329,7 +2367,16 @@ async function runPrompt(
       title:
         result.stopReason === "end_turn" ? "turn completed" : `turn ended (${result.stopReason})`,
     });
-    return result;
+    return recovery
+      ? {
+          ...result,
+          _meta: {
+            ...result._meta,
+            zcode: { ddFlowRecovery: recovery },
+            ...(turn.nativeTurnId ? { zcodeNativeTurnId: turn.nativeTurnId } : {}),
+          },
+        }
+      : result;
   } catch (e) {
     pushSettled(server, {
       kind: "turn",
@@ -2337,6 +2384,16 @@ async function runPrompt(
       title: "turn failed",
       body: e instanceof Error ? e.message : String(e),
     });
+    if (recovery && e instanceof RequestError) {
+      const data = e.data && typeof e.data === "object" ? e.data : {};
+      throw new RequestError(e.code, e.message, {
+        ...data,
+        _meta: {
+          zcode: { ddFlowRecovery: recovery },
+          ...(turn.nativeTurnId ? { zcodeNativeTurnId: turn.nativeTurnId } : {}),
+        },
+      });
+    }
     throw e;
   }
 }
@@ -2985,6 +3042,7 @@ async function resumeBackendSession(
   zcParams: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const backend = await server.ensureBackend();
+  server.nativeChildRegistryParents.delete(String(zcParams.sessionId));
   const resp = await backend.request(server.nextId(), "session/resume", zcParams, 30_000);
   if (resp.error) throw backendError("session/resume", resp, String(zcParams.sessionId));
   return (resp.result ?? {}) as Record<string, unknown>;
@@ -3970,6 +4028,9 @@ export async function runEventTurn(
       continue;
     }
     if (ev.type === "turn.started") {
+      const nativeTurnId = ev.turnId ?? (ev.payload as { turnId?: unknown } | undefined)?.turnId;
+      if (typeof nativeTurnId === "string" && nativeTurnId.startsWith("turn_"))
+        turn.nativeTurnId = nativeTurnId;
       // Remember the runtime's foreground execution id: the v4/command stop
       // (see stopBackendTurn) targets it if the user cancels mid-turn.
       const fge = (ev.payload as { foregroundExecutionId?: string } | undefined)

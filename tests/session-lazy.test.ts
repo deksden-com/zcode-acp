@@ -186,6 +186,7 @@ describe("ensureRealSession", () => {
     const sid = await ensureRealSession(server, resp.sessionId);
     expect(sid).toBe("sess_lazy_1");
     expect(server.resolveSid(resp.sessionId)).toBe(sid);
+    expect(server.nativeChildRegistryParents.get(sid)).toBe(backend);
     expect(server.pendingSessions.has(resp.sessionId)).toBe(false);
 
     const creates = calls.filter((c) => c.method === "session/create");
@@ -609,12 +610,14 @@ describe("backend-loaded session tracking", () => {
     ];
     const { backend, calls } = fakeBackend([], history);
     server.backend = backend;
+    server.nativeChildRegistryParents.set("sess_old", backend);
 
     await loadSession(server, { sessionId: "s-old" } as acp.LoadSessionRequest, stubCx);
 
     const resume = calls.find((c) => c.method === "session/resume");
     expect(resume?.params).toMatchObject({ sessionId: "sess_old" });
     expect(server.isBackendSessionLive("s-old")).toBe(true);
+    expect(server.nativeChildRegistryParents.has("sess_old")).toBe(false);
   });
 
   it("session/load skips the resume RPC once the session is verified loaded", async () => {

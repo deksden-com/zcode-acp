@@ -1,4 +1,6 @@
 /** Downstream native-evidence transport. Consumer policy belongs in dd-zcode. */
+import path from "node:path";
+
 import { backendError } from "../backend/errors.js";
 import { readRetainedChildBinding, readRetainedTerminal } from "../backend/retained-terminal.js";
 import type { ZcodeResponse } from "../backend/types.js";
@@ -14,7 +16,7 @@ type Result = Record<string, unknown>;
 const record = (value: unknown): Result =>
   value && typeof value === "object" && !Array.isArray(value) ? (value as Result) : {};
 const EFFECTS = "zcode/retained-child-effects@1";
-function enrichedChild(value: unknown, parentSessionId: string): Result {
+function enrichedChild(value: unknown, parentSessionId: string, storageHome?: string): Result {
   const item = record(value);
   if (
     typeof item.childSessionId !== "string" ||
@@ -22,11 +24,15 @@ function enrichedChild(value: unknown, parentSessionId: string): Result {
     typeof item.toolCallId !== "string"
   )
     return item;
+  if (!storageHome)
+    return { ...item, available: false, reason: "native_storage_binding_unavailable" };
   const binding = readRetainedChildBinding(
     item.childSessionId,
     parentSessionId,
     item.agentId,
     item.toolCallId,
+    path.join(storageHome, "cli", "db", "db.sqlite"),
+    storageHome,
   );
   const successor = record(binding.continuation_admission);
   const admitted = ["parent_tool_successor", "parent_tool_admission"].includes(
@@ -84,18 +90,22 @@ async function inspectSession(
     parentSessionId: _parentSessionId,
     ...options
   } = params;
-  const resp = await (
-    await server.ensureBackend()
-  ).request(server.nextId(), method, { ...options, sessionId: zcodeSid }, 15000);
+  const backend = await server.ensureBackend();
+  const resp = await backend.request(
+    server.nextId(),
+    method,
+    { ...options, sessionId: zcodeSid },
+    15000,
+  );
   if (resp.error) nativeFailure(method, zcodeSid, resp);
   const result = (resp.result ?? {}) as Result;
   return method === "session/subagents" && params.proofContract === EFFECTS
-    ? enrichedTopology(result, zcodeSid)
+    ? enrichedTopology(result, zcodeSid, backend.storageHome)
     : result;
 }
 
-function enrichedTopology(topology: Result, parentSessionId: string): Result {
-  const enrich = (value: unknown) => enrichedChild(value, parentSessionId);
+function enrichedTopology(topology: Result, parentSessionId: string, storageHome?: string): Result {
+  const enrich = (value: unknown) => enrichedChild(value, parentSessionId, storageHome);
   return {
     ...topology,
     running: Array.isArray(topology.running) ? topology.running.map(enrich) : topology.running,
@@ -122,9 +132,8 @@ export async function retainedSubagents(
   const nativeId = server.resolveSid(params.sessionId) ?? params.sessionId;
   if (!nativeId.startsWith("sess_"))
     throw new Error("Retained topology requires a native Session identity");
-  const response = await (
-    await server.ensureBackend()
-  ).request(
+  const backend = await server.ensureBackend();
+  const response = await backend.request(
     server.nextId(),
     "session/subagents",
     {
@@ -136,7 +145,10 @@ export async function retainedSubagents(
   if (response.error) nativeFailure("session/subagents", nativeId, response);
   const topology = record(response.result);
   if (params.proofContract === EFFECTS) {
-    return { sessionId: nativeId, topology: enrichedTopology(topology, nativeId) };
+    return {
+      sessionId: nativeId,
+      topology: enrichedTopology(topology, nativeId, backend.storageHome),
+    };
   }
   return { sessionId: nativeId, topology: response.result ?? null };
 }
@@ -165,6 +177,12 @@ export async function retainedTerminal(
     throw new Error("Terminal inspection turnId must be nonempty");
   if (params.proofContract !== undefined && params.proofContract !== EFFECTS)
     throw new Error("Unsupported retained effects contract");
+  // A retained read must never select a different account from process.env,
+  // or spawn/resume a native process merely to discover its storage root.
+  const storageHome = server.backend?.storageHome;
+  if (!storageHome)
+    return { sessionId: nativeId, available: false, reason: "native_storage_binding_unavailable" };
+  const dbPath = path.join(storageHome, "cli", "db", "db.sqlite");
   if (params.proofContract === EFFECTS) {
     const parent = params.parentSessionId;
     if (typeof parent !== "string" || !parent.startsWith("sess_") || parent === nativeId)
@@ -183,13 +201,20 @@ export async function retainedTerminal(
     )
       return { sessionId: nativeId, available: false, reason: "child_lifetime_unproven" };
     const childBefore = await boundedTopology(server, nativeId);
-    const binding = readRetainedChildBinding(nativeId, parent, node.agentId, node.toolCallId);
+    const binding = readRetainedChildBinding(
+      nativeId,
+      parent,
+      node.agentId,
+      node.toolCallId,
+      dbPath,
+      storageHome,
+    );
     const terminal = readRetainedTerminal(
       nativeId,
       params.startedAt as number,
       params.endedAt as number,
       params.turnId as string | undefined,
-      undefined,
+      dbPath,
       EFFECTS,
     );
     const after = await boundedTopology(server, parent);
@@ -260,6 +285,7 @@ export async function retainedTerminal(
     params.startedAt as number,
     params.endedAt as number,
     params.turnId as string | undefined,
+    dbPath,
   );
 }
 
@@ -291,8 +317,11 @@ async function boundedTopology(
     if (revision !== undefined && revision !== data.revision)
       throw new Error("Retained topology changed during pagination");
     revision = data.revision;
-    if (!cursor) items.push(...data.running.map((value) => enrichedChild(value, sessionId)));
-    items.push(...ended.items.map((value) => enrichedChild(value, sessionId)));
+    if (!cursor)
+      items.push(
+        ...data.running.map((value) => enrichedChild(value, sessionId, backend.storageHome)),
+      );
+    items.push(...ended.items.map((value) => enrichedChild(value, sessionId, backend.storageHome)));
     if (items.length > 4096) throw new Error("Retained topology exceeds proof budget");
     cursor = typeof ended.nextCursor === "string" ? ended.nextCursor : undefined;
     if (cursor && cursors.has(cursor)) throw new Error("Retained topology cursor cycle");

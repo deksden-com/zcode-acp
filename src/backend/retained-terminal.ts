@@ -142,12 +142,12 @@ function retainedEffects(
     // before reading rows, and include user/system sequence positions.
     const size = db
       .prepare(
-        `SELECT count(*) AS count, coalesce(sum(length(data)),0) AS bytes FROM message WHERE session_id=?`,
+        `SELECT count(*) AS count, coalesce(sum(length(CAST(data AS BLOB))),0) AS bytes FROM message WHERE session_id=?`,
       )
       .get(sessionId)!;
     const partsSize = db
       .prepare(
-        `SELECT count(*) AS count, coalesce(sum(length(data)),0) AS bytes FROM part WHERE session_id=?`,
+        `SELECT count(*) AS count, coalesce(sum(length(CAST(data AS BLOB))),0) AS bytes FROM part WHERE session_id=?`,
       )
       .get(sessionId)!;
     if (
@@ -265,6 +265,7 @@ export function readRetainedChildBinding(
   agentId: string,
   parentToolCallId: string,
   dbPath = zcodeUsageDbPath(),
+  storageHome = zcodeHomeDir(),
 ): RecordValue {
   let db: InstanceType<typeof import("node:sqlite").DatabaseSync> | undefined;
   try {
@@ -278,7 +279,7 @@ export function readRetainedChildBinding(
       return { available: false, reason: "child_parent_unproven" };
     const budget = db
       .prepare(
-        "SELECT count(*) AS count, coalesce(sum(length(data)),0) AS bytes FROM part WHERE session_id=?",
+        "SELECT count(*) AS count, coalesce(sum(length(CAST(data AS BLOB))),0) AS bytes FROM part WHERE session_id=?",
       )
       .get(parentSessionId)!;
     if (Number(budget.count) > 4096 || Number(budget.bytes) > 16 * 1024 * 1024)
@@ -296,7 +297,7 @@ export function readRetainedChildBinding(
     }));
     const original = parts.filter((row) => row.value.callID === parentToolCallId);
     if (original.length !== 1) return { available: false, reason: "parent_tool_binding_unproven" };
-    const metadata = readChildMetadata(parentSessionId, agentId, sessionId);
+    const metadata = readChildMetadata(parentSessionId, agentId, sessionId, storageHome);
     const latest = db
       .prepare(
         "SELECT json_extract(data,'$.anchor.turnId') AS turn_id,json_extract(data,'$.time.created') AS created_at,json_extract(data,'$.role') AS role,json_extract(data,'$.time.completed') AS completed_at FROM message WHERE session_id=? ORDER BY sequence DESC LIMIT 1",
@@ -404,20 +405,14 @@ function readChildMetadata(
   parentSessionId: string,
   agentId: string,
   sessionId: string,
+  storageHome: string,
 ): RecordValue {
   if (![parentSessionId, agentId].every((id) => /^[\w-]+$/.test(id))) return {};
   let fd: number | undefined;
   try {
-    const file = path.join(
-      zcodeHomeDir(),
-      "cli",
-      "agents",
-      parentSessionId,
-      agentId,
-      "metadata.json",
-    );
+    const file = path.join(storageHome, "cli", "agents", parentSessionId, agentId, "metadata.json");
     const canonical = realpathSync(file),
-      root = realpathSync(path.join(zcodeHomeDir(), "cli", "agents"));
+      root = realpathSync(path.join(storageHome, "cli", "agents"));
     if (
       path.relative(root, canonical) !== `${parentSessionId}/${agentId}/metadata.json` ||
       lstatSync(file).isSymbolicLink()

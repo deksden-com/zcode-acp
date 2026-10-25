@@ -112,6 +112,19 @@ it("rejects pending/duplicate tools and newer unanchored input", () => {
     effects_proof: { settled: false, reason: "successor_turn_present" },
   });
 });
+it("bounds UTF-8 bytes rather than SQLite text character counts", () => {
+  db.prepare("UPDATE part SET data=? WHERE id='read'").run(
+    JSON.stringify({
+      type: "tool",
+      tool: "Read",
+      callID: "read",
+      state: { status: "completed", output: "界".repeat(6 * 1024 * 1024) },
+    }),
+  );
+  expect(read()).toMatchObject({
+    effects_proof: { settled: false, reason: "proof_budget_exceeded" },
+  });
+});
 it("binds durable SendMessage admission to native parent, child, tool and parent Turn", () => {
   const insert = (status = "completed", call = "send") =>
     db.prepare("INSERT INTO part VALUES (?,?,?,?,?)").run(
@@ -189,9 +202,10 @@ it("fences parent/child topology before and after read-only effects inspection",
       },
     };
   });
-  const backend = { request, isDead: false };
+  const backend = { request, isDead: false, storageHome: path.join(root, ".zcode") };
   const owners = new Map([["sess_parent", backend]]);
   const server = {
+    backend,
     resolveSid: () => undefined,
     ensureBackend: async () => backend,
     nativeChildRegistryParents: owners,
@@ -205,6 +219,9 @@ it("fences parent/child topology before and after read-only effects inspection",
     turnId: "turn_failed",
     proofContract: proof,
   };
+  // Storage belongs to the spawned generation, not later ambient configuration.
+  vi.stubEnv("ZCODE_HOME", path.join(root, "foreign", ".zcode"));
+  vi.stubEnv("ZCODE_DATA_BASE_DIR", path.join(root, "another-account"));
   expect(await retainedTerminal(server, input)).toMatchObject({
     effects_proof: { settled: true },
     continuation_ref: {

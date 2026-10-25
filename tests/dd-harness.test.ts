@@ -97,7 +97,11 @@ describe("dd harness extensions", () => {
     ).rejects.toThrow("turnId");
     await expect(
       retainedTerminal(server, { sessionId: "sess_child", startedAt: 1, endedAt: 1 }),
-    ).resolves.toEqual({ sessionId: "sess_native", available: false });
+    ).resolves.toEqual({
+      sessionId: "sess_native",
+      available: false,
+      reason: "native_storage_binding_unavailable",
+    });
     expect(request).not.toHaveBeenCalled();
   });
   it("reads retained topology without materializing or resuming a session", async () => {

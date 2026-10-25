@@ -2,7 +2,7 @@
 // Explicit downstream archive preparation. Never calls npm publish or lifecycle hooks.
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { lstat, mkdir, readFile, readdir, realpath } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -85,11 +85,44 @@ export function validateSelection(selection) {
   return selection;
 }
 
-async function verifyContract(descriptor, { jobs = 1, signal } = {}) {
+export async function prepareBuildOutput(sourceRoot = repository) {
+  const root = await realpath(sourceRoot);
+  const output = path.join(root, "dist");
+  try {
+    const existing = await lstat(output);
+    assert(existing.isDirectory() && !existing.isSymbolicLink() && await realpath(output) === output, "Build output must be an owned real directory");
+  } catch (error) { if (error.code !== "ENOENT") throw error; }
+  // tsc overwrites files but never removes JS from deleted/renamed sources.
+  await rm(output, { recursive: true, force: true });
+}
+
+export async function contractDescriptor(contract, root = repository) {
+  const packageInfo = await readJson(path.join(root, "package.json"));
+  const common = ["vitest.config.ts", "tests/setup/hermetic-home.ts", "tsconfig.json"];
+  const inputs = await inventory(root, [...contract.inputs, ...contract.tests, ...contract.dependency_inputs, ...common,
+    ...(contract.requires_build ? ["dist/code-fingerprint.json"] : [])]);
+  assert(contract.tests.every(file => !inputs.find(input => input.path === file)?.missing), `${contract.id}: selected test is missing`);
+  const declaration = { id: contract.id, inputs: contract.inputs, tests: contract.tests, dependency_inputs: contract.dependency_inputs, execution_class: contract.execution_class, requires_build: contract.requires_build };
+  return { contract, inputs, execution_key: hash({ declaration, inputs, toolchain: { node: process.version, platform: process.platform, arch: process.arch },
+    runner: { vitest: packageInfo.devDependencies.vitest, typescript: packageInfo.devDependencies.typescript }, dependencies: packageInfo.dependencies, peers: packageInfo.peerDependencies }),
+    validation_key: "dd-zcode/vitest-json-complete@2" };
+}
+
+export async function assertContractInputs(descriptor, root = repository) {
+  const current = await contractDescriptor(descriptor.contract, root);
+  assert(current.execution_key === descriptor.execution_key && JSON.stringify(current.inputs) === JSON.stringify(descriptor.inputs), `${descriptor.contract.id}: consumed inputs changed`);
+}
+
+async function verifyContract(descriptor, { jobs = 1, signal, sourceCommit } = {}) {
   const { contract, execution_key, validation_key } = descriptor;
   const index = path.join(os.userInfo().homedir, ".dd-flow", "bridge-verification", `${contract.id}-${execution_key}.json`);
   await mkdir(path.dirname(index), { recursive: true });
+  const assertCurrent = async () => {
+    assert(git("rev-parse", "HEAD") === sourceCommit && git("status", "--porcelain", "--untracked-files=normal") === "", `${contract.id}: frozen source changed`);
+    await assertContractInputs(descriptor);
+  };
   const validate = async retained => {
+    await assertCurrent();
     assert(retained?.schema_id === "dd-zcode/contract-receipt@2" && retained.execution_key === execution_key
       && retained.validation_key === validation_key && retained.status === "PASS"
       && digest(await readFile(retained.report)) === retained.report_sha256, `${contract.id}: invalid retained proof`);
@@ -102,6 +135,7 @@ async function verifyContract(descriptor, { jobs = 1, signal } = {}) {
       && item.assertionResults.every(item => item.status === "passed")), `${contract.id}: incomplete retained cases`);
   };
   const proof = await withContractAttempt(index, { signal, validate, validationKey: validation_key }, async ({ root, attemptId }) => {
+    await assertCurrent();
     const report = path.join(root, "vitest.json");
     const [job] = await runJobs([{ id: contract.id, command: "pnpm", cwd: repository,
       args: ["exec", "vitest", "run", ...contract.tests, "--reporter=json", `--outputFile=${report}`, "--maxWorkers=1", "--minWorkers=1", "--fileParallelism=false"],
@@ -134,13 +168,12 @@ export async function prepareDownstream({ selectionFile, output, jobs = verifica
   assert(packageInfo.version === upstream.version, "Upstream version differs from committed pin");
   const changed = git("diff", "--name-only", "--no-renames", selection.base, "HEAD").split("\n").filter(Boolean);
   assertChangedInputs(selection, changed, packageInfo, JSON.parse(git("show", `${selection.base}:package.json`)));
-  const common = ["vitest.config.ts", "tests/setup/hermetic-home.ts", "tsconfig.json"];
   const buildInputs = await inventory(repository, ["package.json", "pnpm-lock.yaml", "tsconfig.json", "upstream-base.json", "scripts/write-harness-build.mjs", "scripts/write-code-fingerprint.mjs", ...git("ls-files", "src", "assets").split("\n").filter(Boolean)]);
   let identity;
   const buildOnce = async () => {
     if (identity) return;
     assertFrozen();
-    const [build] = await runJobs([{ id: "bridge-build", command: "pnpm", args: ["run", "build"], cwd: repository, executionClass: "exclusive" }], { jobs, signal });
+    const [build] = await runJobs([{ id: "bridge-build", command: process.execPath, args: [fileURLToPath(import.meta.url), "build"], cwd: repository, executionClass: "exclusive" }], { jobs, signal });
     assert(build.code === 0, "Bridge build failed");
     identity = await readJson(path.join(repository, "dist/dd-harness-build.json"));
     assert(identity.upstream_version === upstream.version && identity.upstream_commit === upstream.commit
@@ -148,17 +181,9 @@ export async function prepareDownstream({ selectionFile, output, jobs = verifica
     assertFrozen();
   };
   if (selection.required_contracts.some(contract => contract.requires_build)) await buildOnce();
-  const descriptors = await Promise.all(selection.required_contracts.map(async contract => {
-    const inputs = await inventory(repository, [...contract.inputs, ...contract.tests, ...contract.dependency_inputs, ...common,
-      ...(contract.requires_build ? ["dist/code-fingerprint.json"] : [])]);
-    assert(contract.tests.every(file => !inputs.find(input => input.path === file)?.missing), `${contract.id}: selected test is missing`);
-    const declaration = { id: contract.id, inputs: contract.inputs, tests: contract.tests, dependency_inputs: contract.dependency_inputs, execution_class: contract.execution_class, requires_build: contract.requires_build };
-    return { contract, inputs, execution_key: hash({ declaration, inputs, toolchain: { node: process.version, platform: process.platform, arch: process.arch },
-      runner: { vitest: packageInfo.devDependencies.vitest, typescript: packageInfo.devDependencies.typescript }, dependencies: packageInfo.dependencies, peers: packageInfo.peerDependencies }),
-      validation_key: "dd-zcode/vitest-json-complete@2" };
-  }));
+  const descriptors = await Promise.all(selection.required_contracts.map(contract=>contractDescriptor(contract)));
   const selected = path.join(output, "selection.json");
-  await atomicJson(selected, { ...selection, jobs, descriptors });
+  await atomicJson(selected, { ...selection, jobs, descriptors, source_commit: sourceCommit });
   const workerJobs = descriptors.map(({ contract }, index) => ({ id: contract.id, command: process.execPath,
     args: [fileURLToPath(import.meta.url), "worker", selected, String(index), path.join(output, `contract-${index}.json`)],
     cwd: repository, executionClass: contract.execution_class }));
@@ -186,13 +211,20 @@ export async function prepareDownstream({ selectionFile, output, jobs = verifica
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const controller = new AbortController();
   for (const name of ["SIGINT", "SIGTERM"]) process.once(name, () => controller.abort());
-  if (process.argv[2] === "worker") {
+  if (process.argv[2] === "build") {
+    assert(process.argv.length === 3, "Build worker accepts no external output path");
+    // Cleanup belongs inside the exclusive slot, not before waiting for it.
+    await prepareBuildOutput();
+    const [built] = await runJobs([{ id: "bridge-build-content", command: "pnpm", args: ["run", "build"], cwd: repository }], { jobs: 1, signal: controller.signal });
+    assert(built.status === "passed" && built.code === 0, "Bridge build failed or interrupted");
+  } else if (process.argv[2] === "worker") {
     assert(process.argv.length === 6, "Worker requires selection, contract index and receipt output");
     const selected = await readJson(process.argv[3]);
     validateSelection(selected);
     const index = Number(process.argv[4]);
     assert(Number.isSafeInteger(index) && index >= 0 && index < selected.descriptors.length, "Invalid contract index");
-    await atomicJson(process.argv[5], await verifyContract(selected.descriptors[index], { signal: controller.signal }));
+    assert(/^[a-f0-9]{40}$/.test(selected.source_commit ?? ""), "Worker requires frozen source identity");
+    await atomicJson(process.argv[5], await verifyContract(selected.descriptors[index], { signal: controller.signal, sourceCommit: selected.source_commit }));
   } else {
     assert(process.argv.length === 4, "Usage: node scripts/downstream-release.mjs reviewed-selection.json /absolute/output");
     await prepareDownstream({ selectionFile: process.argv[2], output: process.argv[3], signal: controller.signal });

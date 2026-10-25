@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { expect, it } from "vitest";
 // @ts-expect-error The release helper is a standalone Node ESM script.
-import { assertChangedInputs, prepareOutput, validateSelection, verificationJobs } from "../scripts/downstream-release.mjs";
+import { assertChangedInputs, assertContractInputs, contractDescriptor, prepareBuildOutput, prepareOutput, validateSelection, verificationJobs } from "../scripts/downstream-release.mjs";
 
 const selection = () => ({
   schema_id: "dd-zcode/release-selection@2",
@@ -22,6 +22,41 @@ const selection = () => ({
     execution_class: "isolated",
     requires_build: false,
   }],
+});
+
+it("cleans only owned dist before building and rejects output aliases", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "bridge-clean-build-"));
+  try {
+    const source = path.join(root, "source");
+    const neighbor = path.join(root, "neighbor");
+    await mkdir(path.join(source, "dist"), { recursive: true });
+    await mkdir(neighbor);
+    await writeFile(path.join(source, "dist", "deleted-source.js"), "obsolete payload");
+    await writeFile(path.join(neighbor, "retained.js"), "retained evidence");
+    await prepareBuildOutput(source);
+    expect(existsSync(path.join(source, "dist"))).toBe(false);
+    expect(await readFile(path.join(neighbor, "retained.js"), "utf8")).toBe("retained evidence");
+    await symlink(neighbor, path.join(source, "dist"), "dir");
+    await expect(prepareBuildOutput(source)).rejects.toThrow("owned real directory");
+    expect(await readFile(path.join(neighbor, "retained.js"), "utf8")).toBe("retained evidence");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it("recomputes consumed inputs before reusing or publishing a contract receipt", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "bridge-contract-inputs-"));
+  try {
+    const contract = selection().required_contracts[0];
+    for (const directory of ["src/handlers", "tests"]) await mkdir(path.join(root, directory), { recursive: true });
+    await writeFile(path.join(root, "package.json"), JSON.stringify({ version: "1", devDependencies: { vitest: "2", typescript: "5" } }));
+    await writeFile(path.join(root, contract.inputs[0]), "original runtime");
+    await writeFile(path.join(root, contract.tests[0]), "test placeholder");
+    const descriptor = await contractDescriptor(contract, root);
+    await expect(assertContractInputs(descriptor, root)).resolves.toBeUndefined();
+    await writeFile(path.join(root, "package.json"), JSON.stringify({ version: "2", devDependencies: { vitest: "2", typescript: "5" } }));
+    await expect(assertContractInputs(descriptor, root)).resolves.toBeUndefined();
+    await writeFile(path.join(root, contract.inputs[0]), "changed runtime while test was running");
+    await expect(assertContractInputs(descriptor, root)).rejects.toThrow("consumed inputs changed");
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 it("honors only the one/two-job fallback and preserves existing or aliased output attempts", async () => {

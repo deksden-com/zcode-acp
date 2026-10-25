@@ -88,6 +88,7 @@ export async function withContractAttempt(index, { rerun = false, reason, signal
   if (initial?.status === 'running' && !rerun) {
     const result = await joinAttempt(initial, signal);
     await validate?.(result.result, initial);
+    signal?.throwIfAborted();
     return result;
   }
   let joined = null;
@@ -102,8 +103,10 @@ export async function withContractAttempt(index, { rerun = false, reason, signal
         const terminal = read(current.report);
         if (terminal.attemptId !== current.attemptId || terminal.status !== 'passed') throw new Error('Invalid terminal attempt');
         await validate?.(terminal.result, current);
+        signal?.throwIfAborted();
         return { ...terminal, reused: true, joined: false };
       } catch (error) {
+        signal?.throwIfAborted(); // A cancelled reader never invalidates its producer.
         atomicJson(index, { ...current, status: 'evidence_invalid', reason: String(error.message) });
         reason = `Invalid evidence: ${error.message}`;
       }
@@ -121,12 +124,14 @@ export async function withContractAttempt(index, { rerun = false, reason, signal
   if (joined) {
     const result = await joinAttempt(joined, signal);
     await validate?.(result.result, joined);
+    signal?.throwIfAborted();
     return result;
   }
   try {
     signal?.throwIfAborted();
     const result = await action({ attemptId: attempt.attemptId, root: attempt.root });
     await validate?.(result, attempt);
+    signal?.throwIfAborted();
     const terminal = { attemptId: attempt.attemptId, result, status: 'passed' };
     atomicJson(attempt.report, terminal);
     atomicJson(index, { ...attempt, status: 'passed' });
@@ -151,20 +156,44 @@ async function joinAttempt(attempt, signal) {
   }
 }
 
-function inheritedSlot(env, home) {
-  if (!env.DD_FLOW_VERIFICATION_SLOT) return false;
-  let context;
-  try { context = JSON.parse(env.DD_FLOW_VERIFICATION_SLOT); } catch { throw blocked('Malformed inherited slot'); }
-  const owner = optional(path.join(home, 'lease', 'owner.json'));
-  const processes = snapshot();
-  const group = owner?.groups?.find(g => g.token === context.token);
+function isAncestor(identity, processes) {
   let cursor = processes.find(p => p.pid === process.pid);
   const seen = new Set();
   while (cursor && !seen.has(cursor.pid)) {
-    if (group && same(group, cursor) && owner.token === context.owner && alive(owner, processes)) return true;
+    if (same(identity, cursor)) return true;
     seen.add(cursor.pid); cursor = processes.find(p => p.pid === cursor.ppid);
   }
+  return false;
+}
+async function inheritedSlot(env, home, signal) {
+  if (!env.DD_FLOW_VERIFICATION_SLOT) return false;
+  let context;
+  try { context = JSON.parse(env.DD_FLOW_VERIFICATION_SLOT); } catch { throw blocked('Malformed inherited slot'); }
+  for (;;) {
+    const owner = optional(path.join(home, 'lease', 'owner.json')), processes = snapshot();
+    const group = owner?.groups?.find(g => g.token === context.token);
+    if (!group || owner.token !== context.owner || !alive(owner, processes)) break;
+    // A child may reach its first import before spawn() publishes its identity.
+    if (!group.pid) { await delay(10, undefined, { signal }); continue; }
+    if (isAncestor(group, processes)) return { owner, group };
+    break;
+  }
   throw blocked('Inherited slot is not owned by an ancestor job');
+}
+async function nestedScope(env, home, outer, signal) {
+  if (!env.DD_FLOW_VERIFICATION_NESTED_SLOT) return outer ? `${outer.owner.token}-${outer.group.token}` : null;
+  let context;
+  try { context = JSON.parse(env.DD_FLOW_VERIFICATION_NESTED_SLOT); } catch { throw blocked('Malformed nested slot'); }
+  if (!outer || !/^[a-f0-9-]+$/.test(context.scope ?? '')) throw blocked('Invalid nested slot scope');
+  for (;;) {
+    const owner = optional(path.join(home, 'nested-slots', context.scope, 'owner.json')), processes = snapshot();
+    const child = owner?.groups?.find(group => group.token === context.child);
+    if (!child || owner.token !== context.owner || !alive(owner, processes)) break;
+    if (!child.pid) { await delay(10, undefined, { signal }); continue; }
+    if (isAncestor(child, processes)) return `${owner.token}-${child.token}`;
+    break;
+  }
+  throw blocked('Nested slot is not owned by an ancestor dispatch');
 }
 
 /** FIFO host-wide pool; descriptors are child commands, never callbacks sharing
@@ -175,16 +204,20 @@ export async function runJobs(jobs, { jobs: budget = 2, signal, env = process.en
   if (Array.isArray(jobs) && jobs.some(job => job?.credentialKeys !== undefined && (!Array.isArray(job.credentialKeys) || job.credentialKeys.some(name => typeof name !== 'string' || !providerCredentials.includes(name))))) throw new Error('Invalid credential allowlist');
   if (!Array.isArray(jobs) || jobs.some(job=>!job || typeof job.id!=='string' || !job.id || typeof job.command!=='string' || !job.command || job.args && (!Array.isArray(job.args)||job.args.some(arg=>typeof arg!=='string')) || job.executionClass!==undefined && !['isolated','exclusive'].includes(job.executionClass)) || new Set(jobs.map(job=>job.id)).size!==jobs.length) throw new Error('Invalid/duplicate verification job descriptor');
   const home = coordinationHome ?? env.DD_FLOW_VERIFICATION_COORDINATION_HOME ?? path.join(realHome, '.dd-flow', 'verification-coordinator');
-  const nested = inheritedSlot(env, home);
-  const lock = path.join(home, 'lease');
-  const owner = nested ? null : await claim(lock, signal);
+  const nested = await inheritedSlot(env, home, signal);
+  const scope = await nestedScope(env, home, nested, signal);
+  const lock = scope ? path.join(home, 'nested-slots', scope) : path.join(home, 'lease');
+  const owner = await claim(lock, signal);
+  // A dead nested coordinator cannot free this slot while its outer group lives.
+  if (nested) { owner.groups = [{ ...nested.group, token: 'outer-group' }]; atomicJson(path.join(lock, 'owner.json'), owner); }
   const results = new Array(jobs.length);
   const active = new Set();
   let failure;
   const save = () => { if (owner) atomicJson(path.join(lock, 'owner.json'), owner); };
   const start = (job, index) => {
+    signal?.throwIfAborted();
     if (failure) throw failure;
-    const promise = execute(job, { home, owner, signal, env, save, queuedAt }).then(result => { results[index] = result; }, error => { failure ??= error; }).finally(() => active.delete(promise));
+    const promise = execute(job, { home, owner, nested, scope, signal, env, save, queuedAt }).then(result => { results[index] = result; }, error => { failure ??= error; }).finally(() => active.delete(promise));
     active.add(promise); return promise;
   };
   try {
@@ -200,11 +233,12 @@ export async function runJobs(jobs, { jobs: budget = 2, signal, env = process.en
   } finally {
     await Promise.allSettled(active);
     // Never release a lease after unknown cleanup.
-    if (owner && owner.groups.length === 0) release(lock, owner);
+    if (nested && owner.groups.every(group => group.token === 'outer-group')) owner.groups = [];
+    if (owner.groups.length === 0) release(lock, owner);
   }
 }
 
-async function execute(job, { home, owner, signal, env, save, queuedAt }) {
+async function execute(job, { home, owner, nested, scope, signal, env, save, queuedAt }) {
   const started = Date.now();
   const attemptId = randomUUID();
   const root = path.join(home, 'jobs', attemptId);
@@ -220,23 +254,31 @@ async function execute(job, { home, owner, signal, env, save, queuedAt }) {
   }
   // Only an explicit native/delivery descriptor may opt into provider credentials.
   const token = randomUUID();
-  if (owner) {
+  if (!nested) {
     childEnv.DD_FLOW_VERIFICATION_SLOT = JSON.stringify({ owner: owner.token, token });
-    // Unknown spawn outcome must retain the lease after coordinator death.
-    owner.groups.push({ token, attemptId, root, pgid: null }); save();
+    delete childEnv.DD_FLOW_VERIFICATION_NESTED_SLOT;
+  } else {
+    childEnv.DD_FLOW_VERIFICATION_SLOT = env.DD_FLOW_VERIFICATION_SLOT;
+    childEnv.DD_FLOW_VERIFICATION_NESTED_SLOT = JSON.stringify({ scope, owner: owner.token, child: token });
   }
-  const child = spawn(job.command, job.args ?? [], { cwd: job.cwd, env: childEnv, stdio: job.stdio ?? 'inherit', detached: Boolean(owner) });
+  // Unknown spawn outcome must retain the lease after coordinator death.
+  owner.groups.push({ token, attemptId, root, pgid: null }); save();
+  const child = spawn(job.command, job.args ?? [], { cwd: job.cwd, env: childEnv, stdio: job.stdio ?? 'inherit', detached: !nested });
   let spawnError;
-  const completion = new Promise(resolve => { child.once('error', error => { spawnError = error; }); child.once('close', (code, exitSignal) => resolve({ code, signal: exitSignal })); });
+  const closed = new Promise(resolve => child.once('close', resolve));
+  const completion = new Promise(resolve => { child.once('error', error => { spawnError = error; resolve({ code: null, signal: null }); }); child.once('exit', (code, exitSignal) => resolve({ code, signal: exitSignal })); });
+  // A pipe is owned by this helper, not exposed to callers. Drain it while
+  // preserving output; an orphan holding it open must not hide direct exit.
+  for (const [name, stream] of [['stdout', child.stdout], ['stderr', child.stderr]]) stream?.on('data', bytes => fs.appendFileSync(path.join(root, `${name}.log`), bytes));
   let identity;
-  if (child.pid) identity = snapshot().find(p => p.pid === child.pid);
+  if (child.pid) identity = snapshot().find(p => p.pid === child.pid && !p.zombie);
   if (identity && owner) { identity = { ...identity, token, attemptId, root }; owner.groups = owner.groups.map(g => g.token === token ? identity : g); save(); }
   let cleanupError;
   const stop = (killSignal = 'SIGTERM') => {
     if (!identity) return;
     try {
       const current = snapshot().find(p => p.pid === identity.pid);
-      if (same(identity, current)) process.kill(owner ? -identity.pgid : identity.pid, killSignal);
+      if (same(identity, current)) process.kill(nested ? identity.pid : -identity.pgid, killSignal);
     } catch (error) { if (error.code !== 'ESRCH') cleanupError = error; }
   };
   let forceTimer;
@@ -246,19 +288,30 @@ async function execute(job, { home, owner, signal, env, save, queuedAt }) {
   const result = await completion;
   clearTimeout(forceTimer);
   signal?.removeEventListener('abort', cancel);
+  try {
   if (cleanupError) throw cleanupError;
-  if (identity && owner) {
+  if (identity && !nested) {
     for (let n = 0; n < 100 && snapshot().some(p => p.pgid === identity.pgid && !p.zombie); n++) {
       stop(); await delay(50);
     }
     if (snapshot().some(p => p.pgid === identity.pgid && !p.zombie)) throw blocked(`Owned group cleanup unconfirmed: ${identity.pgid}`);
-    if (owner) { owner.groups = owner.groups.filter(g => g.token !== token); save(); }
   }
-  if (!child.pid && owner) { owner.groups = owner.groups.filter(g => g.token !== token); save(); }
-  if (child.pid && !identity) throw blocked(`Spawned process identity unconfirmed: ${child.pid}`);
+  if (child.pid && !identity && snapshot().some(p => !p.zombie && (nested ? p.pid === child.pid : p.pgid === child.pid))) throw blocked(`Spawned process identity unconfirmed: ${child.pid}`);
+  const ioClosed = await Promise.race([closed.then(() => true), delay(5000, undefined, { ref: false }).then(() => false)]);
+  if (!ioClosed) {
+    owner.groups = owner.groups.map(group => group.token === token ? { ...group, pgid: null, reason: 'stdio_cleanup_unconfirmed' } : group); save();
+    throw blocked(`Owned stdio cleanup unconfirmed: ${child.pid}`);
+  }
+  // Missing startup identity is not an eternal unknown after actual exit plus
+  // positive absence of the exact spawned group. Never kill by an inferred PID.
+  owner.groups = owner.groups.filter(g => g.token !== token); save();
   if (spawnError) throw spawnError;
   const finished = Date.now();
   const terminal = { id: job.id, attemptId, root, ...result, started_at: new Date(started).toISOString(), finished_at: new Date(finished).toISOString(), queue_ms: started - queuedAt, elapsed_ms: finished - started, status: signal?.aborted ? 'interrupted' : result.code === 0 ? 'passed' : 'failed' };
   atomicJson(path.join(root, 'terminal.json'), terminal);
   return terminal;
+  } catch (error) {
+    child.stdout?.destroy(); child.stderr?.destroy();
+    throw error;
+  }
 }

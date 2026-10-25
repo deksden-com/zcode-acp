@@ -105,7 +105,11 @@ hermetic setup and Vitest JSON inventory, never a live native model probe.
 No automatic retry is performed after a failed/interrupted attempt.
 
 After missing tests, one exclusive build stamps the unchanged upstream version
-and downstream commit. `npm pack --ignore-scripts` deliberately bypasses the
+and downstream commit. Its worker first removes only canonical owned `dist`
+inside that exclusive slot; stale JS from deleted sources must not ship. Each
+contract worker checks actual source/dependency inputs before reuse, dispatch
+and PASS publication, not only the parent's final frozen-source check.
+`npm pack --ignore-scripts` deliberately bypasses the
 upstream `prepublishOnly` full-test hook. Installed delivery uses a private prefix
 and `npm install --ignore-scripts`, so the upstream `postinstall` cannot notify
 or restart another hub. It checks the installed version and harness contract/

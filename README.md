@@ -17,6 +17,8 @@ Dirty builds report an unknown harness commit. `dd-zcode-acp` is the downstream
 artifact identity; npm package/CLI names remain upstream-compatible for now.
 Upstream npm release automation is disabled in this fork. Build does not notify
 or restart an existing local hub. Qualification is separate from a passing build.
+Downstream archives use the explicit [reviewed selection and receipt path](docs/FORK-UPDATES.md#scoped-downstream-archive),
+not the upstream npm publishing lifecycle.
 
 Managed consumers can negotiate `dd-flow/managed-provider-recovery@1` through
 `_meta.zcode.ddFlowRecovery`: one semantic send per prompt, structured failures,

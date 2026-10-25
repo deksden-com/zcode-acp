@@ -37,12 +37,12 @@ separately; these rules do not assert that enforcement is already enabled.
    identity rather than depending on tags being available in shallow CI clones.
    Keep transport extensions near the existing extension handlers; avoid
    invasive rewrites of upstream session machinery for consumer-only policy.
-5. Use the Node/pnpm versions required by the selected revision. Run
-   `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm build`,
-   `pnpm exec vitest run tests/dd-harness.test.ts`, and affected session/turn
-   tests. Run the upstream CI-required checks before releasing the candidate.
-   Check exact script/test names at that revision. Build may execute upstream
-   post-build hooks; run in the isolated candidate environment.
+5. Use the Node/pnpm versions required by the selected revision and an isolated
+   candidate environment. Review exact changed contracts and their consumers;
+   use the scoped downstream archive path below. Its build performs TypeScript
+   compilation once, so do not add a duplicate typecheck or a full suite merely
+   because the archive is new. Unknown impact blocks selection; it is not a
+   reason to silently run every test. Qualification remains consumer-owned.
 6. Verify `node dist/cli.js --dd-harness-version` and
    `node dist/cli.js --dd-harness-commit` against the intended contract and
    source commit. Build from clean committed sources and retain artifact hashes.
@@ -69,3 +69,52 @@ publishing a downstream npm package requires its own explicit release setup.
 
 Do not add evaluation profiles, workflow policy, model configuration or complete
 system upgrade instructions to this fork. Link to their owning repositories.
+
+## Scoped downstream archive
+
+From clean committed sources with dependencies already installed:
+
+```sh
+pnpm release:downstream /absolute/reviewed-selection.json /absolute/release-output
+```
+
+The output directory must be empty, outside this checkout, under an existing
+canonical parent; symlink aliases cannot bypass the boundary. Never reuse a prior
+attempt directory. `DD_FLOW_VERIFICATION_JOBS=1` selects the serial fallback.
+Selection schema
+`dd-zcode/release-selection@2` requires `base` equal to the full committed
+`upstream-base.json` commit and `required_contracts`. Each reviewed contract has
+an `id`, exact `inputs`, exact `tests` (individual `tests/name.test.ts` paths),
+`dependency_inputs` containing its actual dependency closure, nonempty `reasons`,
+`execution_class` (`isolated` or `exclusive`), and boolean `requires_build`.
+Compiled consumers wait for the one build and fingerprint its executable code;
+source-only checks do not wait for an unrelated build. Include runtime assets, imported
+helpers, setup/config and direct consumers in the reviewed input closure.
+An input may be explicitly absent after deletion; a selected test may not.
+The helper blocks unclaimed changed source/assets/tests, executable scripts/tools,
+compiler/lock inputs and consumed package declarations (not version-only metadata).
+It does not infer a safe mapping from filenames or treat HEAD as a skip base.
+
+Contract receipts use final meaningful inputs, not version, README, source commit
+or the neighboring selection. Their immutable producer report/hash is retained
+on reuse or join; malformed/incomplete evidence cannot pass. The shared host
+coordinator dispatches contract workers in one bounded batch, caps cooperating
+jobs at two (nested workers use one), isolates
+mutable homes and preserves unknown-cleanup blockers. Tests use the existing
+hermetic setup and Vitest JSON inventory, never a live native model probe.
+No automatic retry is performed after a failed/interrupted attempt.
+
+After missing tests, one exclusive build stamps the unchanged upstream version
+and downstream commit. Its worker first removes only canonical owned `dist`
+inside that exclusive slot; stale JS from deleted sources must not ship. Each
+contract worker checks actual source/dependency inputs before reuse, dispatch
+and PASS publication, not only the parent's final frozen-source check.
+`npm pack --ignore-scripts` deliberately bypasses the
+upstream `prepublishOnly` full-test hook. Installed delivery uses a private prefix
+and `npm install --ignore-scripts`, so the upstream `postinstall` cannot notify
+or restart another hub. It checks the installed version and harness contract/
+commit entrypoints without starting native sessions. `release.json` records
+requirements, executed/reused proofs, build inputs, archive SHA-256 and delivery.
+The helper never publishes; registry readback and system qualification are
+separate explicit release/consumer steps. The upstream npm scripts and native
+behavior remain unchanged.

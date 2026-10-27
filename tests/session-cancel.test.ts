@@ -135,6 +135,78 @@ function makeTurnFixtures() {
 }
 
 describe("runEventTurn: cancel exits immediately (backend ignores session/stop)", () => {
+  it("publishes one live native turn binding for the exact managed ACP request", async () => {
+    vi.stubEnv("DD_FLOW_RUNTIME_OWNER", "managed-test");
+    try {
+      const f = makeTurnFixtures();
+      const turn: PendingTurn = {
+        zcodeSid: "sess_z",
+        cancelled: false,
+        nativeInputId: "input_owned",
+      };
+      (f.server as unknown as { pendingTurns: Map<number, PendingTurn> }).pendingTurns = new Map([
+        [71, turn],
+      ]);
+      const events = [
+        {
+          sessionId: "sess_z",
+          seq: 1,
+          type: "turn.started",
+          turnId: "turn_background",
+          payload: { inputSource: "background_task" },
+        },
+        {
+          sessionId: "sess_z",
+          seq: 2,
+          type: "turn.started",
+          turnId: "turn_stale",
+          payload: { inputId: "input_old" },
+        },
+        {
+          sessionId: "sess_z",
+          seq: 3,
+          type: "model.streaming",
+          turnId: "turn_stale",
+          payload: { kind: "text_delta", delta: "stale" },
+        },
+        {
+          sessionId: "sess_z",
+          seq: 4,
+          type: "turn.started",
+          turnId: "turn_owned",
+          payload: { inputId: "input_owned" },
+        },
+        { sessionId: "sess_z", seq: 5, type: "turn.started", turnId: "turn_foreign", payload: {} },
+      ];
+      f.pollEvent.mockImplementation(async () => events.shift() ?? ((turn.cancelled = true), null));
+      await runEventTurn(
+        f.server,
+        f.listener,
+        f.monitor,
+        f.differ,
+        f.cx,
+        "acp_a",
+        "m1",
+        turn,
+        false,
+      );
+      const bindings = vi
+        .mocked(f.cx.notify)
+        .mock.calls.filter(([method]) => method === "zcode/session/native_turn_started");
+      expect(bindings).toEqual([
+        [
+          "zcode/session/native_turn_started",
+          { sessionId: "acp_a", requestId: 71, nativeTurnId: "turn_owned" },
+        ],
+      ]);
+      expect(turn.nativeTurnId).toBe("turn_owned");
+      expect(
+        vi.mocked(f.cx.notify).mock.calls.some((call) => JSON.stringify(call).includes("stale")),
+      ).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
   it("returns cancelled at once when the turn is already flagged", async () => {
     const f = makeTurnFixtures();
     const turn: PendingTurn = { zcodeSid: "sess_z", cancelled: true, stopSent: false };

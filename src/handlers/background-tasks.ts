@@ -129,6 +129,22 @@ export class BackgroundTaskListener implements EventListener {
   readonly zcodeSid: string;
   /** taskId → tracked state. */
   private readonly tasks = new Map<string, TrackedTask>();
+  private readonly forwardedMirroredEvents = new WeakSet<object>();
+  private readonly mirroredInputs = new Map<string, unknown>();
+  private readonly mirroredTools = new Map<string, string>();
+  private readonly pendingMirroredStarts = new Map<
+    string,
+    { signature: string; delivered: Promise<boolean> }
+  >();
+  private readonly mirroredIdentities = new Map<
+    string,
+    { childSessionId: string; childToolCallId: string; parentToolCallId: string; toolName: string }
+  >();
+  private readonly mirroredTerminals = new Map<string, "completed" | "failed">();
+  private readonly pendingMirroredTerminals = new Map<string, "completed" | "failed">();
+  private readonly queuedMirroredTerminals = new Map<string, ZcodeEvent>();
+  private readonly mirroredProgress = new Map<string, string>();
+  private readonly pendingMirroredProgress = new Map<string, Promise<void>>();
   /**
    * The turnId of the currently-active background notification turn, if any.
    * While set, that turn's `model.streaming text_delta` events are forwarded
@@ -141,8 +157,268 @@ export class BackgroundTaskListener implements EventListener {
     this.zcodeSid = zcodeSid;
   }
 
+  /** The prompt listener receives the very same event object. */
+  forwardedMirrored(event: ZcodeEvent): boolean {
+    return this.forwardedMirroredEvents.has(event);
+  }
+
+  noteForegroundMirrored(event: ZcodeEvent): void {
+    const p = event.payload;
+    if (
+      event.type === "tool.updated" &&
+      typeof event.turnId === "string" &&
+      event.turnId &&
+      p?.["source"] === "subagent" &&
+      typeof p["toolCallId"] === "string" &&
+      p["toolCallId"] &&
+      typeof p["childSessionId"] === "string" &&
+      p["childSessionId"] &&
+      typeof p["childToolCallId"] === "string" &&
+      p["childToolCallId"] &&
+      typeof p["parentToolCallId"] === "string" &&
+      p["parentToolCallId"]
+    ) {
+      const key = JSON.stringify([event.turnId, p["toolCallId"]]);
+      const prior = this.mirroredIdentities.get(key);
+      if (
+        prior &&
+        (prior.childSessionId !== p["childSessionId"] ||
+          prior.childToolCallId !== p["childToolCallId"] ||
+          prior.parentToolCallId !== p["parentToolCallId"])
+      )
+        return;
+      if (
+        ["scheduled", "started"].includes(String(p["kind"])) &&
+        typeof p["toolName"] === "string"
+      ) {
+        this.mirroredTools.set(key, "foreground");
+        this.mirroredIdentities.set(key, {
+          childSessionId: p["childSessionId"],
+          childToolCallId: p["childToolCallId"],
+          parentToolCallId: p["parentToolCallId"],
+          toolName: p["toolName"],
+        });
+      } else if (p["kind"] === "progress" && prior) {
+        const output = [p["stdoutTail"], p["stderrTail"]]
+          .filter((value): value is string => typeof value === "string" && value.length > 0)
+          .join("\n");
+        if (output) this.mirroredProgress.set(key, output);
+      } else if (p["kind"] === "result" || p["kind"] === "error") {
+        if (prior && !this.mirroredTerminals.has(key)) {
+          this.mirroredTerminals.set(key, p["kind"] === "result" ? "completed" : "failed");
+          this.mirroredInputs.delete(key);
+          this.mirroredProgress.delete(key);
+        }
+      }
+    }
+  }
+
+  private forwardLateMirroredTool(event: ZcodeEvent): boolean {
+    const p = event.payload,
+      turnId = event.turnId;
+    if (typeof turnId !== "string" || !turnId || !p || typeof p !== "object") return false;
+    const toolCallId = p["toolCallId"];
+    if (typeof toolCallId !== "string" || !toolCallId) return false;
+    const key = JSON.stringify([turnId, toolCallId]);
+    if (
+      event.type !== "tool.updated" ||
+      !["scheduled", "started", "progress", "result", "error"].includes(String(p["kind"])) ||
+      p["source"] !== "subagent" ||
+      typeof p["childSessionId"] !== "string" ||
+      !p["childSessionId"] ||
+      typeof p["childToolCallId"] !== "string" ||
+      !p["childToolCallId"] ||
+      typeof p["parentToolCallId"] !== "string" ||
+      !p["parentToolCallId"]
+    )
+      return false;
+    const matchingTurn = [...this.server.pendingTurns.values()].some(
+      (turn) => turn.zcodeSid === this.zcodeSid && turn.nativeTurnId === turnId && !turn.closed,
+    );
+    const identity = this.mirroredIdentities.get(key);
+    if (p["kind"] === "progress") {
+      if (
+        matchingTurn ||
+        !identity ||
+        identity.childSessionId !== p["childSessionId"] ||
+        identity.childToolCallId !== p["childToolCallId"] ||
+        identity.parentToolCallId !== p["parentToolCallId"]
+      )
+        return false;
+      this.forwardedMirroredEvents.add(event);
+      const output = [p["stdoutTail"], p["stderrTail"]]
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+        .join("\n");
+      if (!output || this.mirroredTerminals.has(key)) return true;
+      // Preserve native arrival order and wait for the real start delivery;
+      // repeated snapshots or a failed notify must not manufacture progress.
+      const preceding =
+        this.pendingMirroredProgress.get(key) ?? this.pendingMirroredStarts.get(key)?.delivered;
+      const flight = Promise.resolve(preceding)
+        .then(async () => {
+          if (
+            !this.mirroredTools.has(key) ||
+            this.mirroredTerminals.has(key) ||
+            this.mirroredProgress.get(key) === output
+          )
+            return;
+          const sent = await this.server.notifyByZcodeSid(this.zcodeSid, {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            status: "in_progress",
+            rawOutput: output,
+            _meta: {
+              claudeCode: { toolName: identity.toolName },
+              zcodeRuntime: { source: "subagent", ...identity, nativeTurnId: turnId },
+            },
+          });
+          if (sent) this.mirroredProgress.set(key, output);
+        })
+        .catch((error) => warn(`late mirrored progress delivery failed: ${String(error)}`))
+        .finally(() => {
+          if (this.pendingMirroredProgress.get(key) !== flight) return;
+          this.pendingMirroredProgress.delete(key);
+          const terminal = this.queuedMirroredTerminals.get(key);
+          if (terminal) this.forwardLateMirroredTool(terminal);
+        });
+      this.pendingMirroredProgress.set(key, flight);
+      return true;
+    }
+    if (p["kind"] === "result" || p["kind"] === "error") {
+      if (
+        !identity ||
+        identity.childSessionId !== p["childSessionId"] ||
+        identity.childToolCallId !== p["childToolCallId"] ||
+        identity.parentToolCallId !== p["parentToolCallId"]
+      )
+        return false;
+      const savedTerminal = this.queuedMirroredTerminals.get(key);
+      if (savedTerminal && savedTerminal.payload?.["kind"] !== p["kind"]) {
+        warn("conflicting terminal outcomes for mirrored child tool");
+        this.forwardedMirroredEvents.add(event);
+        return true;
+      }
+      if (!savedTerminal && !this.mirroredTerminals.has(key))
+        this.queuedMirroredTerminals.set(key, event);
+      const pendingStart = this.pendingMirroredStarts.get(key);
+      if (pendingStart || this.pendingMirroredProgress.has(key) || !this.mirroredTools.has(key)) {
+        this.forwardedMirroredEvents.add(event);
+        return true;
+      }
+      const status = p["kind"] === "result" ? "completed" : "failed",
+        prior = this.mirroredTerminals.get(key) ?? this.pendingMirroredTerminals.get(key);
+      this.forwardedMirroredEvents.add(event);
+      if (prior) {
+        if (prior !== status) warn("conflicting terminal outcomes for mirrored child tool");
+        return true;
+      }
+      this.pendingMirroredTerminals.set(key, status);
+      void this.server
+        .notifyByZcodeSid(this.zcodeSid, {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status,
+          _meta: {
+            claudeCode: { toolName: identity.toolName },
+            zcodeRuntime: { source: "subagent", ...identity, nativeTurnId: turnId },
+          },
+        })
+        .then((sent) => {
+          if (sent) {
+            this.mirroredTerminals.set(key, status);
+            this.mirroredInputs.delete(key);
+            this.mirroredProgress.delete(key);
+            this.queuedMirroredTerminals.delete(key);
+          }
+        })
+        .catch((error) => warn(`late mirrored terminal delivery failed: ${String(error)}`))
+        .finally(() => this.pendingMirroredTerminals.delete(key));
+      return true;
+    }
+    if (matchingTurn) return false; // The foreground listener owns this exact start.
+    if (
+      identity &&
+      (identity.childSessionId !== p["childSessionId"] ||
+        identity.childToolCallId !== p["childToolCallId"] ||
+        identity.parentToolCallId !== p["parentToolCallId"])
+    )
+      return false;
+    const queued = this.queuedMirroredTerminals.get(key)?.payload;
+    if (
+      queued &&
+      (queued["childSessionId"] !== p["childSessionId"] ||
+        queued["childToolCallId"] !== p["childToolCallId"] ||
+        queued["parentToolCallId"] !== p["parentToolCallId"])
+    )
+      return false;
+    if (!["Bash", "bash", "execute"].includes(String(p["toolName"]))) return false;
+    const input = p["input"] ?? this.mirroredInputs.get(key);
+    if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+    const command =
+      (input as Record<string, unknown>)["command"] ?? (input as Record<string, unknown>)["cmd"];
+    if (typeof command !== "string" || !command.trim()) return false;
+    if (p["input"]) this.mirroredInputs.set(key, input);
+    const signature = JSON.stringify(input),
+      prior = this.mirroredTools.get(key) ?? this.pendingMirroredStarts.get(key)?.signature;
+    this.forwardedMirroredEvents.add(event);
+    if (prior) {
+      if (prior !== "foreground" && prior !== signature)
+        warn("conflicting input for mirrored child tool");
+      else if (this.mirroredTools.has(key)) {
+        const terminal = this.queuedMirroredTerminals.get(key);
+        if (terminal) this.forwardLateMirroredTool(terminal);
+      }
+      return true;
+    }
+    this.mirroredIdentities.set(key, {
+      childSessionId: p["childSessionId"] as string,
+      childToolCallId: p["childToolCallId"] as string,
+      parentToolCallId: p["parentToolCallId"] as string,
+      toolName: String(p["toolName"]),
+    });
+    const delivered = this.server
+      .notifyByZcodeSid(this.zcodeSid, {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: String(p["toolName"]),
+        kind: "execute",
+        status: "in_progress",
+        rawInput: input,
+        _meta: {
+          claudeCode: { toolName: p["toolName"] },
+          zcodeRuntime: {
+            source: "subagent",
+            childSessionId: p["childSessionId"],
+            childToolCallId: p["childToolCallId"],
+            parentToolCallId: p["parentToolCallId"],
+            nativeTurnId: turnId,
+          },
+        },
+      })
+      .then((sent) => {
+        if (sent) this.mirroredTools.set(key, signature);
+        return sent;
+      })
+      .catch((error) => {
+        warn(`late mirrored tool delivery failed: ${String(error)}`);
+        return false;
+      })
+      .finally(() => {
+        this.pendingMirroredStarts.delete(key);
+        if (this.mirroredTools.has(key)) {
+          const terminal = this.queuedMirroredTerminals.get(key);
+          if (terminal) {
+            this.forwardLateMirroredTool(terminal);
+          }
+        }
+      });
+    this.pendingMirroredStarts.set(key, { signature, delivered });
+    return true;
+  }
+
   handleEvent(event: ZcodeEvent): void {
     try {
+      if (this.forwardLateMirroredTool(event)) return;
       if (event.type === "session.updated") {
         const raw = event.payload as Partial<TaskStatusPayload> | undefined;
         if (raw && typeof raw.taskId === "string" && raw.taskId) {

@@ -192,6 +192,7 @@ describe("mirrored child identity", () => {
       sessionId: "sess_root",
       seq: 7,
       type: "tool.updated",
+      turnId: "turn_creator",
       payload: {
         kind: "scheduled",
         toolCallId: "child_bash",
@@ -199,6 +200,7 @@ describe("mirrored child identity", () => {
         input: { command: "dd-flow work start WORK-1 --project-root /work --json" },
         source: "subagent",
         childSessionId: "sess_child",
+        childToolCallId: "native_child_bash",
         agentId: "agent_child",
         parentToolCallId: "parent_agent_call",
       },
@@ -208,9 +210,35 @@ describe("mirrored child identity", () => {
       runtimeMeta: {
         source: "subagent",
         childSessionId: "sess_child",
+        childToolCallId: "native_child_bash",
         agentId: "agent_child",
         parentToolCallId: "parent_agent_call",
+        nativeTurnId: "turn_creator",
       },
     });
+  });
+
+  it("retains the actual old envelope turn, never the active or payload turn", () => {
+    const translator = new EventTranslator();
+    translator.translate({ type: "turn.started", turnId: "turn_new", payload: {} });
+    const event = {
+      type: "tool.updated",
+      payload: {
+        kind: "scheduled",
+        toolName: "Bash",
+        toolCallId: "call",
+        childSessionId: "child",
+        parentToolCallId: "parent",
+        turnId: "forged_payload",
+        input: { command: "pwd" },
+      },
+    };
+    expect(translator.translate({ ...event, turnId: "turn_old" })[0]).toMatchObject({
+      runtimeMeta: { nativeTurnId: "turn_old", parentToolCallId: "parent" },
+    });
+    const unproven = new EventTranslator().translate(event)[0] as {
+      runtimeMeta?: Record<string, unknown>;
+    };
+    expect(unproven.runtimeMeta).not.toHaveProperty("nativeTurnId");
   });
 });

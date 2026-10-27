@@ -325,7 +325,10 @@ async function dispatchTerminalUpdate(
       await sendSessionUpdate(cx, acpSid, {
         sessionUpdate: "tool_call_update",
         toolCallId: ev.callId,
-        _meta: { terminal_output: { terminal_id: ev.callId, data: delta } },
+        _meta: {
+          terminal_output: { terminal_id: ev.callId, data: delta },
+          ...(ev.runtimeMeta ? { zcodeRuntime: ev.runtimeMeta } : {}),
+        },
       });
     }
   }
@@ -356,6 +359,7 @@ async function dispatchTerminalUpdate(
       _meta: {
         claudeCode: { toolName },
         terminal_exit: { terminal_id: ev.callId, exit_code: exitCode, signal: null },
+        ...(ev.runtimeMeta ? { zcodeRuntime: ev.runtimeMeta } : {}),
       },
     };
     await sendSessionUpdate(cx, acpSid, exitUpdate);

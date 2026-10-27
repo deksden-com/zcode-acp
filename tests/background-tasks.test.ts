@@ -30,6 +30,7 @@ interface FakeServer {
   terminalSentData: Map<string, string>;
   /** Mirrors ZcodeAcpServer.notifyTurnActiveSince (notification busy window). */
   notifyTurnActiveSince: Map<string, number>;
+  pendingTurns: Map<string, { zcodeSid: string; nativeTurnId?: string }>;
 }
 type TestServer = FakeServer & Pick<ZcodeAcpServer, "notifyByZcodeSid">;
 
@@ -39,6 +40,7 @@ function makeServer(): TestServer {
     calls,
     terminalSentData: new Map<string, string>(),
     notifyTurnActiveSince: new Map<string, number>(),
+    pendingTurns: new Map<string, { zcodeSid: string; nativeTurnId?: string }>(),
     // pushTaskTerminal reads the live client count (offline-push gate).
     clients: { size: 0 },
     async notifyByZcodeSid(zcodeSid: string, update: Record<string, unknown>): Promise<boolean> {
@@ -64,6 +66,615 @@ function zcodeEvent(
 }
 
 describe("BackgroundTaskListener", () => {
+  it("forwards only changing late child output on its original native turn, before its terminal", async () => {
+    const server = makeServer(),
+      listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const base = {
+      toolCallId: "tool",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native",
+      parentToolCallId: "parent",
+    };
+    const event = (payload: Record<string, unknown>, turnId = "turn_old") =>
+      zcodeEvent("tool.updated", { ...base, ...payload }, { turnId });
+    server.pendingTurns.set("old", { zcodeSid: "sess_test", nativeTurnId: "turn_old" });
+    const start = event({ kind: "scheduled", input: { command: "long-command" } });
+    listener.handleEvent(start);
+    listener.noteForegroundMirrored(start);
+    const foreground = event({ kind: "progress", stdoutTail: "foreground" });
+    listener.handleEvent(foreground);
+    expect(listener.forwardedMirrored(foreground)).toBe(false);
+    listener.noteForegroundMirrored(foreground);
+    server.pendingTurns.delete("old");
+    server.pendingTurns.set("next", { zcodeSid: "sess_test", nativeTurnId: "turn_new" });
+    listener.handleEvent(event({ kind: "progress", stdoutTail: "foreign" }, "turn_other"));
+    listener.handleEvent(event({ kind: "progress", stdoutTail: "foreground" }));
+    listener.handleEvent(
+      event({ kind: "progress", stdoutTail: "foreign", childSessionId: "other" }),
+    );
+    listener.handleEvent(event({ kind: "progress", stdoutTail: "first" }));
+    listener.handleEvent(event({ kind: "progress", stdoutTail: "first" }));
+    listener.handleEvent(
+      event({ kind: "progress", stdoutTail: "first\nsecond", stderrTail: "warning" }),
+    );
+    listener.handleEvent(event({ kind: "result" }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(server.calls.map((call) => call.update.rawOutput)).toEqual([
+      "first",
+      "first\nsecond\nwarning",
+      undefined,
+    ]);
+    expect(server.calls.map((call) => call.update.status)).toEqual([
+      "in_progress",
+      "in_progress",
+      "completed",
+    ]);
+    expect(
+      server.calls.every(
+        (call) =>
+          (call.update._meta as { zcodeRuntime: { nativeTurnId: string } }).zcodeRuntime
+            .nativeTurnId === "turn_old",
+      ),
+    ).toBe(true);
+    listener.handleEvent(event({ kind: "progress", stdoutTail: "after terminal" }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(server.calls).toHaveLength(3);
+  });
+
+  it("waits for late start delivery and retries an undelivered progress snapshot", async () => {
+    const server = makeServer(),
+      listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const base = {
+      toolCallId: "tool",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native",
+      parentToolCallId: "parent",
+    };
+    const event = (kind: string) =>
+      zcodeEvent(
+        "tool.updated",
+        { ...base, kind, input: { command: "long-command" }, stdoutTail: "output" },
+        { turnId: "turn_old" },
+      );
+    let release!: (value: boolean) => void;
+    const notify = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<boolean>((resolve) => {
+            release = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+    server.notifyByZcodeSid = notify as typeof server.notifyByZcodeSid;
+    listener.handleEvent(event("scheduled"));
+    listener.handleEvent(event("progress"));
+    await Promise.resolve();
+    expect(notify).toHaveBeenCalledTimes(1);
+    release(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(2);
+    listener.handleEvent(event("progress"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(3);
+    listener.handleEvent(event("progress"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(3);
+  });
+
+  it("forwards only native terminal outcomes of the same known mirrored child", async () => {
+    const server = makeServer(),
+      listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const base = {
+      toolCallId: "tool",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native",
+      parentToolCallId: "parent",
+    };
+    const start = zcodeEvent(
+      "tool.updated",
+      { ...base, kind: "scheduled", input: { command: "pwd" } },
+      { turnId: "turn_old", seq: 1 },
+    );
+    listener.handleEvent(start);
+    await Promise.resolve();
+    expect(server.calls).toHaveLength(1);
+    const foreign = zcodeEvent(
+      "tool.updated",
+      { ...base, kind: "result", childSessionId: "foreign" },
+      { turnId: "turn_old", seq: 2 },
+    );
+    listener.handleEvent(foreign);
+    expect(listener.forwardedMirrored(foreign)).toBe(false);
+    expect(server.calls).toHaveLength(1);
+    const wrongTurn = zcodeEvent(
+      "tool.updated",
+      { ...base, kind: "result" },
+      { turnId: "turn_other", seq: 3 },
+    );
+    listener.handleEvent(wrongTurn);
+    expect(listener.forwardedMirrored(wrongTurn)).toBe(false);
+    const terminal = zcodeEvent(
+      "tool.updated",
+      { ...base, kind: "result" },
+      { turnId: "turn_old", seq: 4 },
+    );
+    listener.handleEvent(terminal);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(server.calls[1]?.update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tool",
+      status: "completed",
+      _meta: {
+        zcodeRuntime: {
+          childSessionId: "child",
+          childToolCallId: "native",
+          parentToolCallId: "parent",
+          nativeTurnId: "turn_old",
+        },
+      },
+    });
+    listener.handleEvent(
+      zcodeEvent("tool.updated", { ...base, kind: "result" }, { turnId: "turn_old", seq: 5 }),
+    );
+    await Promise.resolve();
+    expect(server.calls).toHaveLength(2);
+    listener.handleEvent(
+      zcodeEvent(
+        "tool.updated",
+        { ...base, kind: "started", input: { command: "changed" } },
+        { turnId: "turn_old", seq: 7 },
+      ),
+    );
+    await Promise.resolve();
+    expect(server.calls).toHaveLength(2);
+    // A first event that is only terminal does not establish a prior tool.
+    listener.handleEvent(
+      zcodeEvent(
+        "tool.updated",
+        { ...base, kind: "error", toolCallId: "unseen" },
+        { turnId: "turn_old", seq: 6 },
+      ),
+    );
+    await Promise.resolve();
+    expect(server.calls).toHaveLength(2);
+  });
+
+  it("retains a foreground child identity so its later error reaches the same physical child", async () => {
+    const server = makeServer(),
+      listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const base = {
+      toolCallId: "tool",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native",
+      parentToolCallId: "parent",
+    };
+    server.pendingTurns.set("foreground", { zcodeSid: "sess_test", nativeTurnId: "turn_old" });
+    const start = zcodeEvent(
+      "tool.updated",
+      { ...base, kind: "scheduled", input: { command: "pwd" } },
+      { turnId: "turn_old" },
+    );
+    listener.handleEvent(start);
+    expect(listener.forwardedMirrored(start)).toBe(false);
+    listener.noteForegroundMirrored(start);
+    const currentResult = zcodeEvent(
+      "tool.updated",
+      { ...base, kind: "error" },
+      { turnId: "turn_old" },
+    );
+    listener.handleEvent(currentResult);
+    await Promise.resolve();
+    expect(listener.forwardedMirrored(currentResult)).toBe(true);
+    server.pendingTurns.set("next", { zcodeSid: "sess_test", nativeTurnId: "turn_new" });
+    server.pendingTurns.delete("foreground");
+    const late = zcodeEvent("tool.updated", { ...base, kind: "error" }, { turnId: "turn_old" });
+    listener.handleEvent(late);
+    await Promise.resolve();
+    expect(server.calls).toHaveLength(1);
+    expect(server.calls[0]?.update).toMatchObject({
+      status: "failed",
+      _meta: {
+        zcodeRuntime: {
+          childSessionId: "child",
+          childToolCallId: "native",
+          nativeTurnId: "turn_old",
+        },
+      },
+    });
+  });
+
+  it("does not treat an undelivered terminal notification as sent", async () => {
+    const server = makeServer(),
+      listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const base = {
+      toolCallId: "tool",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native",
+      parentToolCallId: "parent",
+    };
+    listener.handleEvent(
+      zcodeEvent(
+        "tool.updated",
+        { ...base, kind: "scheduled", input: { command: "pwd" } },
+        { turnId: "turn_old" },
+      ),
+    );
+    await Promise.resolve();
+    const notify = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    server.notifyByZcodeSid = notify as typeof server.notifyByZcodeSid;
+    const terminal = () =>
+      zcodeEvent("tool.updated", { ...base, kind: "result" }, { turnId: "turn_old" });
+    listener.handleEvent(terminal());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listener.handleEvent(terminal());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(2);
+  });
+  it("retains a failed terminal delivery and retries on a duplicate start", async () => {
+    const server = makeServer();
+    const listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const notify = vi
+      .fn()
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    server.notifyByZcodeSid = notify as typeof server.notifyByZcodeSid;
+    const base = {
+      toolCallId: "tool",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native",
+      parentToolCallId: "parent",
+    };
+    const start = () =>
+      zcodeEvent(
+        "tool.updated",
+        { ...base, kind: "started", input: { command: "pwd" } },
+        { turnId: "turn_old" },
+      );
+    listener.handleEvent(start());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listener.handleEvent(
+      zcodeEvent("tool.updated", { ...base, kind: "result" }, { turnId: "turn_old" }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(2);
+    listener.handleEvent(start());
+    listener.handleEvent(start());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(3);
+    expect(notify.mock.calls[2]?.[1]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      status: "completed",
+      _meta: {
+        zcodeRuntime: {
+          childSessionId: "child",
+          childToolCallId: "native",
+          nativeTurnId: "turn_old",
+        },
+      },
+    });
+    listener.handleEvent(start());
+    expect(notify).toHaveBeenCalledTimes(3);
+  });
+  it("retries an undelivered late start without duplicating an in-flight delivery", async () => {
+    const server = makeServer();
+    const listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    let resolveFirst!: (value: boolean) => void;
+    const first = new Promise<boolean>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const notify = vi.fn().mockReturnValueOnce(first).mockResolvedValueOnce(true);
+    server.notifyByZcodeSid = notify as typeof server.notifyByZcodeSid;
+    const start = () =>
+      zcodeEvent(
+        "tool.updated",
+        {
+          kind: "scheduled",
+          toolCallId: "tool",
+          toolName: "Bash",
+          input: { command: "pwd" },
+          source: "subagent",
+          childSessionId: "child",
+          childToolCallId: "native",
+          parentToolCallId: "parent",
+        },
+        { turnId: "turn_old" },
+      );
+    listener.handleEvent(start());
+    listener.handleEvent(start());
+    expect(notify).toHaveBeenCalledTimes(1);
+    resolveFirst(false);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listener.handleEvent(start());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listener.handleEvent(start());
+    expect(notify).toHaveBeenCalledTimes(2);
+  });
+  it("retains the native terminal across a failed start until a successful start retry", async () => {
+    const server = makeServer();
+    const listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    let resolveFirst!: (value: boolean) => void;
+    const first = new Promise<boolean>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const notify = vi.fn().mockReturnValueOnce(first).mockResolvedValue(true);
+    server.notifyByZcodeSid = notify as typeof server.notifyByZcodeSid;
+    const base = {
+      toolCallId: "tool",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native",
+      parentToolCallId: "parent",
+    };
+    const start = () =>
+      zcodeEvent(
+        "tool.updated",
+        { ...base, kind: "scheduled", input: { command: "pwd" } },
+        { turnId: "turn_old" },
+      );
+    listener.handleEvent(start());
+    listener.handleEvent(
+      zcodeEvent("tool.updated", { ...base, kind: "result" }, { turnId: "turn_old" }),
+    );
+    resolveFirst(false);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(1);
+    listener.handleEvent(start());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(3);
+    expect(notify.mock.calls[1]?.[1]).toMatchObject({
+      sessionUpdate: "tool_call",
+      status: "in_progress",
+    });
+    expect(notify.mock.calls[2]?.[1]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      status: "completed",
+      _meta: {
+        zcodeRuntime: {
+          childSessionId: "child",
+          childToolCallId: "native",
+          nativeTurnId: "turn_old",
+        },
+      },
+    });
+  });
+  it("retains a terminal arriving after failed start and before its retry", async () => {
+    const server = makeServer();
+    const listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const notify = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    server.notifyByZcodeSid = notify as typeof server.notifyByZcodeSid;
+    const base = {
+      toolCallId: "tool",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native",
+      parentToolCallId: "parent",
+    };
+    const start = () =>
+      zcodeEvent(
+        "tool.updated",
+        { ...base, kind: "started", input: { command: "pwd" } },
+        { turnId: "turn_old" },
+      );
+    listener.handleEvent(start());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listener.handleEvent(
+      zcodeEvent("tool.updated", { ...base, kind: "error" }, { turnId: "turn_old" }),
+    );
+    listener.handleEvent(start());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify.mock.calls[2]?.[1]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      status: "failed",
+    });
+  });
+  it("forwards source-bound late shell commands without guessing their semantics", async () => {
+    const server = makeServer(),
+      listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const commands = [
+      "$DD_FLOW_BIN work start W",
+      "node /opt/engine/dist/cli.js work start W",
+      "pwd",
+    ];
+    for (const [index, command] of commands.entries()) {
+      const event = zcodeEvent(
+        "tool.updated",
+        {
+          kind: "scheduled",
+          toolCallId: `tool-${index}`,
+          toolName: "Bash",
+          input: { command },
+          source: "subagent",
+          childSessionId: "child",
+          childToolCallId: `native-${index}`,
+          parentToolCallId: "parent",
+        },
+        { seq: index + 1, turnId: "turn_old" },
+      );
+      listener.handleEvent(event);
+      expect(listener.forwardedMirrored(event)).toBe(true);
+    }
+    await Promise.resolve();
+    expect(
+      server.calls.map((call) => (call.update.rawInput as { command: string }).command),
+    ).toEqual(commands);
+    server.pendingTurns.set("foreground", { zcodeSid: "sess_test", nativeTurnId: "turn_new" });
+    const foreground = zcodeEvent(
+      "tool.updated",
+      {
+        kind: "scheduled",
+        toolCallId: "foreground",
+        toolName: "Bash",
+        input: { command: "pwd" },
+        source: "subagent",
+        childSessionId: "child",
+        childToolCallId: "native-foreground",
+        parentToolCallId: "parent",
+      },
+      { turnId: "turn_new" },
+    );
+    listener.handleEvent(foreground);
+    expect(listener.forwardedMirrored(foreground)).toBe(false);
+    expect(server.calls).toHaveLength(3);
+  });
+  it("forwards only exact late mirrored child tools and lets the foreground skip the same event", async () => {
+    const server = makeServer(),
+      listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const payload = {
+      kind: "scheduled",
+      toolCallId: "child-call",
+      toolName: "Bash",
+      input: { command: "dd-flow work start W" },
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native-child-call",
+      parentToolCallId: "parent",
+    };
+    const between = zcodeEvent("tool.updated", payload, { seq: 1, turnId: "turn_old" });
+    listener.handleEvent(between);
+    await Promise.resolve();
+    expect(listener.forwardedMirrored(between)).toBe(true);
+    expect(server.calls[0]?.update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "child-call",
+      rawInput: payload.input,
+      _meta: {
+        zcodeRuntime: {
+          nativeTurnId: "turn_old",
+          childSessionId: "child",
+          parentToolCallId: "parent",
+        },
+      },
+    });
+    listener.handleEvent(zcodeEvent("tool.updated", payload, { seq: 2, turnId: "turn_old" }));
+    await Promise.resolve();
+    expect(server.calls).toHaveLength(1);
+    server.pendingTurns.set("next", { zcodeSid: "sess_test", nativeTurnId: "turn_new" });
+    const late = zcodeEvent(
+      "tool.updated",
+      { ...payload, toolCallId: "late-call" },
+      { seq: 3, turnId: "turn_old" },
+    );
+    listener.handleEvent(late);
+    await Promise.resolve();
+    expect(listener.forwardedMirrored(late)).toBe(true);
+    expect(server.calls).toHaveLength(2);
+    const own = zcodeEvent(
+      "tool.updated",
+      { ...payload, toolCallId: "own-call" },
+      { seq: 4, turnId: "turn_new" },
+    );
+    listener.handleEvent(own);
+    expect(listener.forwardedMirrored(own)).toBe(false);
+    listener.noteForegroundMirrored(own);
+    server.pendingTurns.clear();
+    const oldReplay = zcodeEvent(
+      "tool.updated",
+      { ...payload, toolCallId: "own-call" },
+      { seq: 9, turnId: "turn_new" },
+    );
+    listener.handleEvent(oldReplay);
+    expect(listener.forwardedMirrored(oldReplay)).toBe(true);
+    const unbound = zcodeEvent("tool.updated", { ...payload, toolCallId: "unbound" }, { seq: 5 });
+    listener.handleEvent(unbound);
+    expect(listener.forwardedMirrored(unbound)).toBe(false);
+    const forged = zcodeEvent(
+      "tool.updated",
+      { ...payload, toolCallId: "bad", parentToolCallId: "" },
+      { seq: 6, turnId: "turn_old" },
+    );
+    listener.handleEvent(forged);
+    expect(listener.forwardedMirrored(forged)).toBe(false);
+    expect(server.calls).toHaveLength(2);
+  });
+
+  it("ignores root streaming input and retains only source-bound scheduled input for child retry", async () => {
+    const server = makeServer(),
+      listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    listener.handleEvent(
+      zcodeEvent(
+        "model.streaming",
+        { kind: "tool_call", toolCallId: "call", input: { command: "dd-flow work start W" } },
+        { turnId: "turn_old" },
+      ),
+    );
+    const payload = {
+      kind: "scheduled",
+      toolCallId: "call",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native-child-call",
+      parentToolCallId: "parent",
+    };
+    const absent = zcodeEvent("tool.updated", payload, { turnId: "turn_old" });
+    listener.handleEvent(absent);
+    expect(listener.forwardedMirrored(absent)).toBe(false);
+    expect((listener as any).mirroredInputs.size).toBe(0);
+    const exact = zcodeEvent(
+      "tool.updated",
+      { ...payload, input: { command: "dd-flow work start W" } },
+      { turnId: "turn_old" },
+    );
+    listener.handleEvent(exact);
+    await Promise.resolve();
+    expect(listener.forwardedMirrored(exact)).toBe(true);
+    expect(server.calls).toHaveLength(1);
+    const terminal = zcodeEvent(
+      "tool.updated",
+      { ...payload, kind: "result" },
+      { turnId: "turn_old" },
+    );
+    listener.handleEvent(terminal);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const replay = zcodeEvent("tool.updated", payload, { turnId: "turn_old" });
+    listener.handleEvent(replay);
+    expect(listener.forwardedMirrored(replay)).toBe(false); // cached input was released after terminal delivery
+  });
+  it("retains source-bound scheduled input when retry arrives as started without input", async () => {
+    const server = makeServer();
+    const listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const notify = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    server.notifyByZcodeSid = notify as typeof server.notifyByZcodeSid;
+    const base = {
+      toolCallId: "tool",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native",
+      parentToolCallId: "parent",
+    };
+    listener.handleEvent(
+      zcodeEvent(
+        "tool.updated",
+        { ...base, kind: "scheduled", input: { command: "pwd" } },
+        { turnId: "old" },
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    listener.handleEvent(
+      zcodeEvent("tool.updated", { ...base, kind: "started" }, { turnId: "old" }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(2);
+    expect(notify.mock.calls[1]?.[1]).toMatchObject({ rawInput: { command: "pwd" } });
+  });
   it("emits a tool_call card on the first running session.updated(taskId)", async () => {
     const server = makeServer();
     const l = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");

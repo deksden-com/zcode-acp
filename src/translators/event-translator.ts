@@ -228,7 +228,7 @@ export class EventTranslator {
     } else if (etype === "model.streaming") {
       results.push(...this.translateStreaming(payload));
     } else if (etype === "tool.updated") {
-      results.push(...this.translateTool(payload));
+      results.push(...this.translateTool(payload, event.turnId));
     } else if (etype === "session.updated") {
       const usage = (payload["usage"] as Record<string, unknown>) ?? {};
       const used = usage["inputTokens"];
@@ -326,12 +326,12 @@ export class EventTranslator {
     return results;
   }
 
-  private translateTool(payload: Record<string, unknown>): InternalEvent[] {
+  private translateTool(payload: Record<string, unknown>, nativeTurnId?: string): InternalEvent[] {
     const results: InternalEvent[] = [];
     const tkind = (payload["kind"] as string) ?? "";
     const callId = (payload["toolCallId"] as string) ?? "";
     const toolName = (payload["toolName"] as string) ?? "";
-    const runtimeMeta = zcodeRuntimeMeta(payload);
+    const runtimeMeta = zcodeRuntimeMeta(payload, nativeTurnId);
 
     if (tkind === "scheduled") {
       const newEv = this.createToolCall(callId, toolName, payload["input"], "pending");
@@ -346,13 +346,21 @@ export class EventTranslator {
           if (runtimeMeta) newEv.runtimeMeta = runtimeMeta;
           results.push(newEv);
         } else {
-          results.push({ kind: "ToolCallUpdate", callId, status: "in_progress", ...(runtimeMeta ? { runtimeMeta } : {}) });
+          results.push({
+            kind: "ToolCallUpdate",
+            callId,
+            status: "in_progress",
+            ...(runtimeMeta ? { runtimeMeta } : {}),
+          });
         }
       }
     } else if (tkind === "progress") {
       if (callId) {
         const newEv = this.createToolCall(callId, toolName, payload["input"], "in_progress");
-        if (newEv) results.push(newEv);
+        if (newEv) {
+          if (runtimeMeta) newEv.runtimeMeta = runtimeMeta;
+          results.push(newEv);
+        }
         const output = payload["stdoutTail"] ?? payload["stderrTail"] ?? "";
         const tn = (toolName || this.toolNames.get(callId)) ?? "";
         results.push({
@@ -368,7 +376,10 @@ export class EventTranslator {
     } else if (tkind === "result") {
       if (callId) {
         const newEv = this.createToolCall(callId, toolName, payload["input"], "in_progress");
-        if (newEv) results.push(newEv);
+        if (newEv) {
+          if (runtimeMeta) newEv.runtimeMeta = runtimeMeta;
+          results.push(newEv);
+        }
         const resultPayload = payload["result"];
         const tn = (toolName || this.toolNames.get(callId)) ?? "";
         const ev: InternalEvent = {
@@ -392,7 +403,10 @@ export class EventTranslator {
     } else if (tkind === "error") {
       if (callId) {
         const newEv = this.createToolCall(callId, toolName, payload["input"], "in_progress");
-        if (newEv) results.push(newEv);
+        if (newEv) {
+          if (runtimeMeta) newEv.runtimeMeta = runtimeMeta;
+          results.push(newEv);
+        }
         const tn = (toolName || this.toolNames.get(callId)) ?? "";
         const errPayload = payload["error"];
         const ev: InternalEvent = {
@@ -492,10 +506,23 @@ function parseCacheStats(raw: unknown): TurnCacheStats | null {
   return stats;
 }
 
-function zcodeRuntimeMeta(payload: Record<string, unknown>): Record<string, unknown> | null {
-  const keys = ["source", "childSessionId", "agentId", "parentToolCallId", "taskId"];
+function zcodeRuntimeMeta(
+  payload: Record<string, unknown>,
+  nativeTurnId?: string,
+): Record<string, unknown> | null {
+  const keys = [
+    "source",
+    "childSessionId",
+    "childToolCallId",
+    "agentId",
+    "parentToolCallId",
+    "taskId",
+  ];
   const meta = Object.fromEntries(
-    keys.flatMap((key) => (payload[key] === undefined ? [] : [[key, payload[key]]] as const)),
+    keys.flatMap((key) => (payload[key] === undefined ? [] : ([[key, payload[key]]] as const))),
   );
+  // Only the native envelope establishes a turn. Never substitute the active
+  // prompt: a mirrored child event can arrive during a later prompt.
+  if (typeof nativeTurnId === "string" && nativeTurnId.trim()) meta.nativeTurnId = nativeTurnId;
   return Object.keys(meta).length > 0 ? meta : null;
 }

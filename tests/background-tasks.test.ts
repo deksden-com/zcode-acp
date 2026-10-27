@@ -100,6 +100,7 @@ describe("BackgroundTaskListener", () => {
       event({ kind: "progress", stdoutTail: "first\nsecond", stderrTail: "warning" }),
     );
     listener.handleEvent(event({ kind: "result" }));
+    listener.handleEvent(event({ kind: "progress", stdoutTail: "after native terminal" }));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(server.calls.map((call) => call.update.rawOutput)).toEqual([
       "first",

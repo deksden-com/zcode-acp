@@ -143,6 +143,8 @@ export class BackgroundTaskListener implements EventListener {
   private readonly mirroredTerminals = new Map<string, "completed" | "failed">();
   private readonly pendingMirroredTerminals = new Map<string, "completed" | "failed">();
   private readonly queuedMirroredTerminals = new Map<string, ZcodeEvent>();
+  private readonly mirroredProgress = new Map<string, string>();
+  private readonly pendingMirroredProgress = new Map<string, Promise<void>>();
   /**
    * The turnId of the currently-active background notification turn, if any.
    * While set, that turn's `model.streaming text_delta` events are forwarded
@@ -196,10 +198,16 @@ export class BackgroundTaskListener implements EventListener {
           parentToolCallId: p["parentToolCallId"],
           toolName: p["toolName"],
         });
+      } else if (p["kind"] === "progress" && prior) {
+        const output = [p["stdoutTail"], p["stderrTail"]]
+          .filter((value): value is string => typeof value === "string" && value.length > 0)
+          .join("\n");
+        if (output) this.mirroredProgress.set(key, output);
       } else if (p["kind"] === "result" || p["kind"] === "error") {
         if (prior && !this.mirroredTerminals.has(key)) {
           this.mirroredTerminals.set(key, p["kind"] === "result" ? "completed" : "failed");
           this.mirroredInputs.delete(key);
+          this.mirroredProgress.delete(key);
         }
       }
     }
@@ -214,7 +222,7 @@ export class BackgroundTaskListener implements EventListener {
     const key = JSON.stringify([turnId, toolCallId]);
     if (
       event.type !== "tool.updated" ||
-      !["scheduled", "started", "result", "error"].includes(String(p["kind"])) ||
+      !["scheduled", "started", "progress", "result", "error"].includes(String(p["kind"])) ||
       p["source"] !== "subagent" ||
       typeof p["childSessionId"] !== "string" ||
       !p["childSessionId"] ||
@@ -228,6 +236,54 @@ export class BackgroundTaskListener implements EventListener {
       (turn) => turn.zcodeSid === this.zcodeSid && turn.nativeTurnId === turnId && !turn.closed,
     );
     const identity = this.mirroredIdentities.get(key);
+    if (p["kind"] === "progress") {
+      if (
+        matchingTurn ||
+        !identity ||
+        identity.childSessionId !== p["childSessionId"] ||
+        identity.childToolCallId !== p["childToolCallId"] ||
+        identity.parentToolCallId !== p["parentToolCallId"]
+      )
+        return false;
+      this.forwardedMirroredEvents.add(event);
+      const output = [p["stdoutTail"], p["stderrTail"]]
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+        .join("\n");
+      if (!output || this.mirroredTerminals.has(key)) return true;
+      // Preserve native arrival order and wait for the real start delivery;
+      // repeated snapshots or a failed notify must not manufacture progress.
+      const preceding =
+        this.pendingMirroredProgress.get(key) ?? this.pendingMirroredStarts.get(key)?.delivered;
+      const flight = Promise.resolve(preceding)
+        .then(async () => {
+          if (
+            !this.mirroredTools.has(key) ||
+            this.mirroredTerminals.has(key) ||
+            this.mirroredProgress.get(key) === output
+          )
+            return;
+          const sent = await this.server.notifyByZcodeSid(this.zcodeSid, {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            status: "in_progress",
+            rawOutput: output,
+            _meta: {
+              claudeCode: { toolName: identity.toolName },
+              zcodeRuntime: { source: "subagent", ...identity, nativeTurnId: turnId },
+            },
+          });
+          if (sent) this.mirroredProgress.set(key, output);
+        })
+        .catch((error) => warn(`late mirrored progress delivery failed: ${String(error)}`))
+        .finally(() => {
+          if (this.pendingMirroredProgress.get(key) !== flight) return;
+          this.pendingMirroredProgress.delete(key);
+          const terminal = this.queuedMirroredTerminals.get(key);
+          if (terminal) this.forwardLateMirroredTool(terminal);
+        });
+      this.pendingMirroredProgress.set(key, flight);
+      return true;
+    }
     if (p["kind"] === "result" || p["kind"] === "error") {
       if (
         !identity ||
@@ -245,7 +301,7 @@ export class BackgroundTaskListener implements EventListener {
       if (!savedTerminal && !this.mirroredTerminals.has(key))
         this.queuedMirroredTerminals.set(key, event);
       const pendingStart = this.pendingMirroredStarts.get(key);
-      if (pendingStart || !this.mirroredTools.has(key)) {
+      if (pendingStart || this.pendingMirroredProgress.has(key) || !this.mirroredTools.has(key)) {
         this.forwardedMirroredEvents.add(event);
         return true;
       }
@@ -271,6 +327,7 @@ export class BackgroundTaskListener implements EventListener {
           if (sent) {
             this.mirroredTerminals.set(key, status);
             this.mirroredInputs.delete(key);
+            this.mirroredProgress.delete(key);
             this.queuedMirroredTerminals.delete(key);
           }
         })

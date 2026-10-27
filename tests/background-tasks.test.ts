@@ -66,6 +66,107 @@ function zcodeEvent(
 }
 
 describe("BackgroundTaskListener", () => {
+  it("forwards only changing late child output on its original native turn, before its terminal", async () => {
+    const server = makeServer(),
+      listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const base = {
+      toolCallId: "tool",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native",
+      parentToolCallId: "parent",
+    };
+    const event = (payload: Record<string, unknown>, turnId = "turn_old") =>
+      zcodeEvent("tool.updated", { ...base, ...payload }, { turnId });
+    server.pendingTurns.set("old", { zcodeSid: "sess_test", nativeTurnId: "turn_old" });
+    const start = event({ kind: "scheduled", input: { command: "long-command" } });
+    listener.handleEvent(start);
+    listener.noteForegroundMirrored(start);
+    const foreground = event({ kind: "progress", stdoutTail: "foreground" });
+    listener.handleEvent(foreground);
+    expect(listener.forwardedMirrored(foreground)).toBe(false);
+    listener.noteForegroundMirrored(foreground);
+    server.pendingTurns.delete("old");
+    server.pendingTurns.set("next", { zcodeSid: "sess_test", nativeTurnId: "turn_new" });
+    listener.handleEvent(event({ kind: "progress", stdoutTail: "foreign" }, "turn_other"));
+    listener.handleEvent(event({ kind: "progress", stdoutTail: "foreground" }));
+    listener.handleEvent(
+      event({ kind: "progress", stdoutTail: "foreign", childSessionId: "other" }),
+    );
+    listener.handleEvent(event({ kind: "progress", stdoutTail: "first" }));
+    listener.handleEvent(event({ kind: "progress", stdoutTail: "first" }));
+    listener.handleEvent(
+      event({ kind: "progress", stdoutTail: "first\nsecond", stderrTail: "warning" }),
+    );
+    listener.handleEvent(event({ kind: "result" }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(server.calls.map((call) => call.update.rawOutput)).toEqual([
+      "first",
+      "first\nsecond\nwarning",
+      undefined,
+    ]);
+    expect(server.calls.map((call) => call.update.status)).toEqual([
+      "in_progress",
+      "in_progress",
+      "completed",
+    ]);
+    expect(
+      server.calls.every(
+        (call) =>
+          (call.update._meta as { zcodeRuntime: { nativeTurnId: string } }).zcodeRuntime
+            .nativeTurnId === "turn_old",
+      ),
+    ).toBe(true);
+    listener.handleEvent(event({ kind: "progress", stdoutTail: "after terminal" }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(server.calls).toHaveLength(3);
+  });
+
+  it("waits for late start delivery and retries an undelivered progress snapshot", async () => {
+    const server = makeServer(),
+      listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    const base = {
+      toolCallId: "tool",
+      toolName: "Bash",
+      source: "subagent",
+      childSessionId: "child",
+      childToolCallId: "native",
+      parentToolCallId: "parent",
+    };
+    const event = (kind: string) =>
+      zcodeEvent(
+        "tool.updated",
+        { ...base, kind, input: { command: "long-command" }, stdoutTail: "output" },
+        { turnId: "turn_old" },
+      );
+    let release!: (value: boolean) => void;
+    const notify = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<boolean>((resolve) => {
+            release = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+    server.notifyByZcodeSid = notify as typeof server.notifyByZcodeSid;
+    listener.handleEvent(event("scheduled"));
+    listener.handleEvent(event("progress"));
+    await Promise.resolve();
+    expect(notify).toHaveBeenCalledTimes(1);
+    release(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(2);
+    listener.handleEvent(event("progress"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(3);
+    listener.handleEvent(event("progress"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notify).toHaveBeenCalledTimes(3);
+  });
+
   it("forwards only native terminal outcomes of the same known mirrored child", async () => {
     const server = makeServer(),
       listener = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");

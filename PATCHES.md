@@ -28,8 +28,11 @@ requirement before selecting this tuple for a scored run.
   `turn.started` publishes the ACP request/native-turn binding. Native tool
   metadata carries the actual envelope turn and mirrored child/tool/parent IDs.
   The session listener forwards late mirrored shell tools between prompts without
-  reattributing them to a newer turn, including source-bound terminal updates;
-  missing evidence remains unqualified.
+  reattributing them to a newer turn, including source-bound progress and
+  terminal updates. Real stdout/stderr changes remain observable after root
+  reply; empty/repeated snapshots do not manufacture activity. Ordered late
+  progress waits for start delivery, and terminal delivery waits for pending
+  progress. Missing evidence remains unqualified.
 - Scoped regressions: `session-cancel`, `session-title`, `background-tasks`,
   `dd-harness`, `event-translator`, and `dispatch`. These are offline bridge
   checks, not native or E2E qualification.

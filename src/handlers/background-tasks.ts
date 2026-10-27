@@ -249,7 +249,13 @@ export class BackgroundTaskListener implements EventListener {
       const output = [p["stdoutTail"], p["stderrTail"]]
         .filter((value): value is string => typeof value === "string" && value.length > 0)
         .join("\n");
-      if (!output || this.mirroredTerminals.has(key)) return true;
+      if (
+        !output ||
+        this.mirroredTerminals.has(key) ||
+        this.pendingMirroredTerminals.has(key) ||
+        this.queuedMirroredTerminals.has(key)
+      )
+        return true;
       // Preserve native arrival order and wait for the real start delivery;
       // repeated snapshots or a failed notify must not manufacture progress.
       const preceding =

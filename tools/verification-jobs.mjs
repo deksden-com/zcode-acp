@@ -81,11 +81,11 @@ async function claim(lock, signal) {
 
 /** One immutable producer attempt. The index is scheduling state, not proof;
  * callers must validate the returned report bytes and meaningful inputs. */
-export async function withContractAttempt(index, { rerun = false, reason, signal, validate, validationKey } = {}, action) {
+export async function withContractAttempt(index, { rerun = false, failedOnly = false, reason, signal, validate, validationKey } = {}, action) {
   if (rerun && !reason) throw new Error('Explicit rerun requires a reason');
   const lock = `${index}.claim`;
   const initial = optional(index);
-  if (initial?.status === 'running' && !rerun) {
+  if (initial?.status === 'running' && (!rerun || failedOnly)) {
     const result = await joinAttempt(initial, signal);
     await validate?.(result.result, initial);
     signal?.throwIfAborted();
@@ -96,8 +96,8 @@ export async function withContractAttempt(index, { rerun = false, reason, signal
   let attempt;
   try {
     const current = optional(index); // Mandatory reread under claim.
-    if (current?.status === 'running' && !rerun) { joined = current; }
-    else if (current && !rerun) {
+    if (current?.status === 'running' && (!rerun || failedOnly)) { joined = current; }
+    else if (current && (!rerun || failedOnly && current.status === 'passed')) {
       if (current.status !== 'passed') throw blocked(`Retained ${current.status} attempt requires explicit rerun: ${index}`);
       try {
         const terminal = read(current.report);
@@ -249,9 +249,14 @@ async function execute(job, { home, owner, nested, scope, signal, env, save, que
   // node:test sets this private flag for its own children; a separately managed
   // test command must produce a standalone report, not use its parent's IPC.
   delete childEnv.NODE_TEST_CONTEXT;
-  for (const name of ['HOME', 'TMPDIR', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR', 'CODEX_HOME', 'AGY_HOME', 'DD_FLOW_HOME', 'DD_FLOW_RESOURCE_HOME', 'DD_FLOW_CONFIG_HOME']) {
+  for (const name of ['HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR', 'CODEX_HOME', 'AGY_HOME', 'DD_FLOW_HOME', 'DD_FLOW_RESOURCE_HOME', 'DD_FLOW_CONFIG_HOME']) {
     childEnv[name] = path.join(root, name.toLowerCase()); fs.mkdirSync(childEnv[name], { recursive: true });
   }
+  // Unix socket paths have a small OS limit. Keep the per-attempt temporary
+  // world short even when the durable coordinator/report home is deeply nested.
+  const tempBase = process.platform === 'win32' ? os.tmpdir() : fs.realpathSync('/tmp');
+  childEnv.TMPDIR = fs.mkdtempSync(path.join(tempBase, 'ddv-'));
+  atomicJson(path.join(root, 'temporary.json'), { tmpdir: childEnv.TMPDIR });
   // Only an explicit native/delivery descriptor may opt into provider credentials.
   const token = randomUUID();
   if (!nested) {

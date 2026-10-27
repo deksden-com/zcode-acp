@@ -96,6 +96,60 @@ function promptParams(text: string): acp.PromptRequest {
 }
 
 describe("one-shot session title (set once at the FIRST prompt)", () => {
+  it("continues a legacy native turn without an inputId but emits no qualified turn binding", async () => {
+    vi.stubEnv("DD_FLOW_RUNTIME_OWNER", "managed-test");
+    try {
+      const server = setup(
+        scriptedBackend(() => [
+          { type: "turn.started", turnId: "turn_legacy", payload: {} },
+          { type: "turn.completed", turnId: "turn_legacy", payload: { resultType: "success" } },
+        ]),
+      );
+      const notify = vi.fn(async () => {}),
+        cx = { notify, request: async () => ({}) } as unknown as acp.AgentContext;
+      const result = await prompt(server, promptParams("legacy prompt"), cx, 193);
+      expect(result.stopReason).toBe("end_turn");
+      expect(result._meta ?? {}).not.toHaveProperty("zcodeNativeTurnId");
+      expect(
+        notify.mock.calls.some(([method]) => method === "zcode/session/native_turn_started"),
+      ).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  it("reuses the managed inputId when the same send is retried after busy", async () => {
+    vi.stubEnv("DD_FLOW_RUNTIME_OWNER", "managed-test");
+    try {
+      const backend = scriptedBackend(() => [
+        { type: "turn.started", payload: {} },
+        { type: "turn.completed", payload: { resultType: "success" } },
+      ]);
+      const sendInputs: unknown[] = [],
+        original = backend.request.bind(backend);
+      backend.request = (async (
+        id: number,
+        method: string,
+        params: Record<string, unknown>,
+        timeout?: number,
+      ) => {
+        if (method === "session/send") {
+          sendInputs.push(params.inputId);
+          if (sendInputs.length === 1)
+            return { error: { code: -32010, message: "already running" } };
+        }
+        return await original(id, method, params, timeout);
+      }) as typeof backend.request;
+      const server = setup(backend),
+        { cx } = collectCx();
+      const result = await prompt(server, promptParams("retry prompt"), cx, 194);
+      expect(result.stopReason).toBe("end_turn");
+      expect(sendInputs).toHaveLength(2);
+      expect(typeof sendInputs[0]).toBe("string");
+      expect(sendInputs[1]).toBe(sendInputs[0]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
   it("sets the title from the first prompt before the turn runs, once", async () => {
     const server = setup(
       scriptedBackend(() => [

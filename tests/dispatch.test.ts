@@ -11,6 +11,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { dispatchEvent, resetSandboxEpermHintForTest } from "../src/handlers/dispatch.js";
+import { EventTranslator } from "../src/translators/event-translator.js";
 import { warn } from "../src/utils.js";
 import { ZcodeAcpServer } from "../src/server.js";
 import type { InternalEvent } from "../src/translators/types.js";
@@ -44,6 +45,73 @@ const SID = "sess_test";
 const CHUNK = "chunk-1";
 
 describe("dispatchEvent", () => {
+  it("retains native child identity on terminal output and exit updates", async () => {
+    const { cx, sent } = mockContext(),
+      server = makeServer(true);
+    await dispatchEvent(
+      server,
+      cx,
+      SID,
+      {
+        kind: "ToolCallUpdate",
+        callId: "tool",
+        tool: "Bash",
+        status: "completed",
+        rawResult: "done",
+        runtimeMeta: {
+          nativeTurnId: "turn_old",
+          childSessionId: "child",
+          childToolCallId: "native",
+          parentToolCallId: "parent",
+        },
+      },
+      CHUNK,
+    );
+    expect(sent).toHaveLength(2);
+    for (const update of sent)
+      expect(update).toMatchObject({
+        _meta: {
+          zcodeRuntime: {
+            nativeTurnId: "turn_old",
+            childSessionId: "child",
+            childToolCallId: "native",
+            parentToolCallId: "parent",
+          },
+        },
+      });
+  });
+  it("keeps a native mirrored child's source turn and original child tool ID on the ACP wire", async () => {
+    const { cx, sent } = mockContext(),
+      server = makeServer(false);
+    const event = new EventTranslator().translate({
+      type: "tool.updated",
+      turnId: "turn_old",
+      payload: {
+        kind: "scheduled",
+        toolCallId: "mirrored",
+        toolName: "Bash",
+        input: { command: "dd-flow work start W" },
+        source: "subagent",
+        childSessionId: "child",
+        childToolCallId: "native-call",
+        parentToolCallId: "parent",
+      },
+    })[0]!;
+    await dispatchEvent(server, cx, SID, event, CHUNK);
+    expect(sent[0]).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "mirrored",
+      rawInput: { command: "dd-flow work start W" },
+      _meta: {
+        zcodeRuntime: {
+          nativeTurnId: "turn_old",
+          childSessionId: "child",
+          childToolCallId: "native-call",
+          parentToolCallId: "parent",
+        },
+      },
+    });
+  });
   it("ToolCallNew emits tool_call with claudeCode toolName _meta", async () => {
     const { cx, sent } = mockContext();
     const server = makeServer(false);

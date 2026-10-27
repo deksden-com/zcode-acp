@@ -1777,10 +1777,19 @@ export async function runOneTurn(
       // Cold-start rejections recover in seconds (observed); a longer budget
       // would spin pointlessly when the model is PERMANENTLY unavailable.
       const WARMUP_RETRY_TIMEOUT_MS = 10_000;
-      const sendParams =
-        attachments.length > 0
-          ? { sessionId: zcodeSid, content: sendText, attachments }
-          : { sessionId: zcodeSid, content: sendText };
+      // Unlike ACP request IDs, native inputId is carried by the backend into
+      // turn.started. It binds an otherwise ambiguous live notification to
+      // this particular accepted send, without relying on event order.
+      const nativeInputId = process.env.DD_FLOW_RUNTIME_OWNER
+        ? (turn.nativeInputId ?? randomUUID())
+        : undefined;
+      turn.nativeInputId = nativeInputId;
+      const sendParams = {
+        sessionId: zcodeSid,
+        content: sendText,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        ...(nativeInputId ? { inputId: nativeInputId } : {}),
+      };
       const sendT0 = Date.now();
       let sendAttempt = 0;
       let queuedNoticeSent = false;
@@ -3570,6 +3579,7 @@ export async function runEventTurn(
   const translator = new EventTranslator();
   differ.resetTurn();
   const managedTurn = Boolean(process.env.DD_FLOW_RUNTIME_OWNER);
+  let foreignInputBeforeStart = false;
   const NO_PROGRESS_MS = 120_000;
   // Stall termination policy. Two candidate liveness signals were verified
   // against the Aug-28 app-server and both are unusable for kill decisions:
@@ -4027,23 +4037,68 @@ export async function runEventTurn(
     if (shouldDropEventForTurnAttribution(ev, translator.turnStarted, gateArmed)) {
       continue;
     }
-    if (ev.type === "turn.started") {
-      const nativeTurnId = ev.turnId ?? (ev.payload as { turnId?: unknown } | undefined)?.turnId;
-      if (typeof nativeTurnId === "string" && nativeTurnId.startsWith("turn_"))
-        turn.nativeTurnId = nativeTurnId;
-      // Remember the runtime's foreground execution id: the v4/command stop
-      // (see stopBackendTurn) targets it if the user cancels mid-turn.
+    if (server.backgroundListeners?.get(turn.zcodeSid)?.forwardedMirrored(ev)) continue;
+    // A different explicit native input is not ours. A legacy start without
+    // inputId can still proceed, but cannot create an authoritative binding.
+    const eventInputId = (ev.payload as { inputId?: unknown } | undefined)?.inputId;
+    if (managedTurn && !translator.turnStarted) {
+      if (ev.type === "turn.started") {
+        foreignInputBeforeStart = Boolean(
+          typeof eventInputId === "string" &&
+          turn.nativeInputId &&
+          eventInputId !== turn.nativeInputId,
+        );
+        if (foreignInputBeforeStart) continue;
+      } else if (foreignInputBeforeStart) continue;
+    }
+    const previouslyStarted = translator.turnStarted;
+    const internalEvents = translator.translate(ev);
+    if (ev.type === "turn.started" && !previouslyStarted && translator.turnStarted) {
+      const nativeTurnId = ev.turnId;
+      if (
+        typeof nativeTurnId === "string" &&
+        nativeTurnId.startsWith("turn_") &&
+        (!managedTurn || Boolean(turn.nativeInputId && eventInputId === turn.nativeInputId))
+      ) {
+        if (turn.nativeTurnId && turn.nativeTurnId !== nativeTurnId) {
+          warn("native turn binding changed within one ACP request; later turn is unbound");
+        } else if (!turn.nativeTurnId) {
+          turn.nativeTurnId = nativeTurnId;
+          const requestIds = [...(server.pendingTurns ?? new Map()).entries()]
+            .filter(([, value]) => value === turn)
+            .map(([id]) => id);
+          if (
+            managedTurn &&
+            requestIds.length === 1 &&
+            turn.nativeInputId &&
+            eventInputId === turn.nativeInputId
+          ) {
+            try {
+              await cx.notify(
+                "zcode/session/native_turn_started" as never,
+                { sessionId: acpSid, requestId: requestIds[0], nativeTurnId } as never,
+              );
+            } catch (error) {
+              warn(`native turn binding notification failed: ${String(error)}`);
+            }
+          }
+        }
+      }
+      // Remember the execution belonging to this accepted foreground turn.
       const fge = (ev.payload as { foregroundExecutionId?: string } | undefined)
         ?.foregroundExecutionId;
       if (fge) turn.foregroundExecutionId = fge;
     }
-    const internalEvents = translator.translate(ev);
     // Capture the turn-start timestamp for the thinking-phase hint above.
     // Done after translate so the flag flip on the turn.started event is
     // observed on the same iteration that processes it.
     if (turnStartedAt === null && translator.turnStarted) {
       turnStartedAt = Date.now();
     }
+    if (
+      internalEvents.some((item) => item.kind === "ToolCallNew" || item.kind === "ToolCallUpdate")
+    )
+      server.backgroundListeners?.get(turn.zcodeSid)?.noteForegroundMirrored(ev);
     for (const iev of internalEvents) {
       if (iev.kind === "TextDelta" || iev.kind === "ReasoningDelta") emittedText = true;
       if (iev.kind === "ToolCallNew" || iev.kind === "ToolCallUpdate") emittedOutput = true;

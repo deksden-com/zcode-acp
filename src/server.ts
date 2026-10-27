@@ -68,6 +68,8 @@ export interface PendingTurn {
    */
   foregroundExecutionId?: string;
   nativeTurnId?: string;
+  /** Client-issued input identity for qualifying the corresponding native turn. */
+  nativeInputId?: string;
   /**
    * Set when the turn was ended by the stall-recovery heuristic (backend
    * reported idle after a silence) rather than a real turn.completed event.

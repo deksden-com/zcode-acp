@@ -22,6 +22,21 @@ Tests: dd-harness, session-lazy, background tasks, adapter usage and cancellatio
 regressions, plus upstream CI checks. Native qualification remains a separate
 requirement before selecting this tuple for a scored run.
 
+### Managed native turn and late mirrored tools
+
+- Managed `session/send` uses a stable native `inputId`; only an exact echoed
+  `turn.started` publishes the ACP request/native-turn binding. Native tool
+  metadata carries the actual envelope turn and mirrored child/tool/parent IDs.
+  The session listener forwards late mirrored shell tools between prompts without
+  reattributing them to a newer turn, including source-bound terminal updates;
+  missing evidence remains unqualified.
+- Scoped regressions: `session-cancel`, `session-title`, `background-tasks`,
+  `dd-harness`, `event-translator`, and `dispatch`. These are offline bridge
+  checks, not native or E2E qualification.
+- Remove this downstream patch only when upstream supplies an equivalent
+  request-bound native turn and late-child event contract and it passes the
+  same consumer and lifecycle regressions.
+
 ### CP225 retained evidence repair
 
 - Forward documented `endedCursor` in retained topology reads; the 25-child
@@ -72,16 +87,16 @@ requirement before selecting this tuple for a scored run.
 
 The old experiment was reviewed by behavior, not transplanted by file:
 
-| Retained behavior | Implementation / regression | Upstream removal condition |
-| --- | --- | --- |
-| Bidirectional RPC correlation, causal errors and bounded late observation | `backend/jsonrpc-child.ts`, `backend/errors.ts`, `native-recovery.test.ts` | Equivalent routing and serialized errors, including pipe death and late create |
-| No duplicate allocation after unknown outcome or restart | `session-allocation.ts`, `ensureRealSession`, native-recovery/session-lazy tests | Native idempotency key or equivalent durable reconciliation |
-| No resume replay or model overlay on unknown outcome | Shared error classifier, existing resume single-flight; native-recovery tests | Equivalent outcome-aware native recovery |
-| Confirmed close settles only the captured turns, without stop/revival | harness close + PendingTurn flag, native-recovery tests | Equivalent upstream close primitive and turn settlement |
-| Cleanup checks process group, not just exited leader; idempotent teardown | shared transport close; native-recovery test | Equivalent owned-group teardown |
-| Native create has a 90-second budget and bounded late identity observation | `ensureRealSession`; native-recovery tests | Equivalent cold-start and outcome-safe create handling |
-| Managed silent turns stay unknown without native terminal evidence | `runEventTurn`; stale-running-recovery tests | Equivalent completion semantics, including frozen watermarks |
-| Distinguish inferred/failed completion from success | `_meta.zcodeCompletionEvidence`; stale-running-recovery tests | Standard completion-evidence representation |
+| Retained behavior                                                          | Implementation / regression                                                      | Upstream removal condition                                                     |
+| -------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Bidirectional RPC correlation, causal errors and bounded late observation  | `backend/jsonrpc-child.ts`, `backend/errors.ts`, `native-recovery.test.ts`       | Equivalent routing and serialized errors, including pipe death and late create |
+| No duplicate allocation after unknown outcome or restart                   | `session-allocation.ts`, `ensureRealSession`, native-recovery/session-lazy tests | Native idempotency key or equivalent durable reconciliation                    |
+| No resume replay or model overlay on unknown outcome                       | Shared error classifier, existing resume single-flight; native-recovery tests    | Equivalent outcome-aware native recovery                                       |
+| Confirmed close settles only the captured turns, without stop/revival      | harness close + PendingTurn flag, native-recovery tests                          | Equivalent upstream close primitive and turn settlement                        |
+| Cleanup checks process group, not just exited leader; idempotent teardown  | shared transport close; native-recovery test                                     | Equivalent owned-group teardown                                                |
+| Native create has a 90-second budget and bounded late identity observation | `ensureRealSession`; native-recovery tests                                       | Equivalent cold-start and outcome-safe create handling                         |
+| Managed silent turns stay unknown without native terminal evidence         | `runEventTurn`; stale-running-recovery tests                                     | Equivalent completion semantics, including frozen watermarks                   |
+| Distinguish inferred/failed completion from success                        | `_meta.zcodeCompletionEvidence`; stale-running-recovery tests                    | Standard completion-evidence representation                                    |
 
 The adapter decides whether inferred completion is acceptable. For managed turns,
 the bridge retains an unknown outcome until native terminal evidence arrives;
@@ -129,15 +144,15 @@ This is a historical source baseline, not a declaration that any checkout or
 installed binary is qualified. Uncommitted changes in the older main checkout
 are outside this inventory and must be reviewed separately before inclusion.
 
-| Overlay commit | Purpose and reason for bridge placement | Checks / removal condition |
-| --- | --- | --- |
-| `dbcf6d3` | Expose harness contract and build identity to callers. | Identity CLI and dd-harness checks; replace when upstream exposes equivalent identity/capabilities. |
-| `622faa3` | Expose native session resolution, read, subagents and usage evidence unavailable through standard ACP. | `tests/dd-harness.test.ts`; remove individual extensions when upstream offers equivalent data and semantics. |
-| `2cb9999` | Persist native-session/workspace aliases across bridge processes. | dd-harness session resolution tests; remove when upstream preserves equivalent routing. |
-| `f08f74d` | Handle background completion at the bridge's prompt/turn boundary. | `tests/background-tasks.test.ts` and session turn tests; remove when upstream completion semantics cover the same cases. |
-| `5939247` | Expose per-request usage and stable native identity. Usage aggregation currently remains in the bridge. | dd-harness usage tests; move aggregation to the consumer only once raw facts are available without losing detail. |
-| `027748a` | Provide close/residency checks without implicitly resuming the session being inspected. | dd-harness close/resident tests; replace with equivalent upstream primitives. |
-| `8c0a893` | Read retained subagent evidence without reviving closed native sessions. | dd-harness retained-subagent tests; replace when upstream exposes the same side-effect-free read. |
+| Overlay commit | Purpose and reason for bridge placement                                                                 | Checks / removal condition                                                                                               |
+| -------------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `dbcf6d3`      | Expose harness contract and build identity to callers.                                                  | Identity CLI and dd-harness checks; replace when upstream exposes equivalent identity/capabilities.                      |
+| `622faa3`      | Expose native session resolution, read, subagents and usage evidence unavailable through standard ACP.  | `tests/dd-harness.test.ts`; remove individual extensions when upstream offers equivalent data and semantics.             |
+| `2cb9999`      | Persist native-session/workspace aliases across bridge processes.                                       | dd-harness session resolution tests; remove when upstream preserves equivalent routing.                                  |
+| `f08f74d`      | Handle background completion at the bridge's prompt/turn boundary.                                      | `tests/background-tasks.test.ts` and session turn tests; remove when upstream completion semantics cover the same cases. |
+| `5939247`      | Expose per-request usage and stable native identity. Usage aggregation currently remains in the bridge. | dd-harness usage tests; move aggregation to the consumer only once raw facts are available without losing detail.        |
+| `027748a`      | Provide close/residency checks without implicitly resuming the session being inspected.                 | dd-harness close/resident tests; replace with equivalent upstream primitives.                                            |
+| `8c0a893`      | Read retained subagent evidence without reviving closed native sessions.                                | dd-harness retained-subagent tests; replace when upstream exposes the same side-effect-free read.                        |
 
 The desired boundary is native facts/control in the bridge and consumer policy
 in the adapter. The existing usage projection and background-turn handling

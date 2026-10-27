@@ -41,6 +41,13 @@ function self() {
   return identity;
 }
 function alive(owner, processes = snapshot()) { return same(owner, processes.find(p => p.pid === owner?.pid)); }
+function producerSettled(attempt) {
+  const owner = attempt.owner, processes = snapshot();
+  return !alive(owner, processes) && Number.isSafeInteger(owner?.pgid) && owner.pgid > 0
+    && Array.isArray(owner.groups) && !processes.some(p => !p.zombie && p.pgid === owner.pgid)
+    && owner.groups.every(group => Number.isSafeInteger(group.pgid) && group.pgid > 0
+      && !processes.some(p => !p.zombie && p.pgid === group.pgid));
+}
 function release(lock, owner) {
   // Only one reclaimer can remove this unique fence. A late reclaimer cannot
   // unlink the next owner's record after the directory has been reacquired.
@@ -86,16 +93,29 @@ export async function withContractAttempt(index, { rerun = false, failedOnly = f
   const lock = `${index}.claim`;
   const initial = optional(index);
   if (initial?.status === 'running' && (!rerun || failedOnly)) {
-    const result = await joinAttempt(initial, signal);
-    await validate?.(result.result, initial);
-    signal?.throwIfAborted();
-    return result;
+    try {
+      const result = await joinAttempt(initial, signal);
+      await validate?.(result.result, initial);
+      signal?.throwIfAborted();
+      return result;
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (!rerun || !producerSettled(initial)) throw error;
+    }
   }
   let joined = null;
   const owner = await claim(lock, signal);
   let attempt;
   try {
-    const current = optional(index); // Mandatory reread under claim.
+    let current = optional(index); // Mandatory reread under claim.
+    if (rerun && current?.status === 'running' && producerSettled(current)) {
+      const terminal = optional(current.report);
+      if (terminal && (terminal.attemptId !== current.attemptId || !['passed', 'failed', 'interrupted'].includes(terminal.status))) throw blocked('Invalid terminal producer evidence');
+      signal?.throwIfAborted();
+      if (!terminal) atomicJson(current.report, { attemptId: current.attemptId, status: 'interrupted', error: 'Producer exited without terminal evidence; owner and owned process groups are absent', reason });
+      current = { ...current, status: terminal?.status ?? 'interrupted' };
+      atomicJson(index, current);
+    }
     if (current?.status === 'running' && (!rerun || failedOnly)) { joined = current; }
     else if (current && (!rerun || failedOnly && current.status === 'passed')) {
       if (current.status !== 'passed') throw blocked(`Retained ${current.status} attempt requires explicit rerun: ${index}`);
